@@ -1,0 +1,45 @@
+{
+  "range": {
+    "min": 1,
+    "max": 1
+  },
+  "events": [
+    {
+      "seq": 4,
+      "ts": 1791000004,
+      "author": 42,
+      "scope": 7,
+      "tag": 1,
+      "text": "¿Alguien tiene luz?",
+      "media": null
+    },
+    {
+      "seq": 5,
+      "ts": 1791000005,
+      "author": 42,
+      "scope": 7,
+      "tag": 1,
+      "text": "foto del malecón",
+      "media": {
+        "id": 31,
+        "w": 1280,
+        "h": 960,
+        "thumbhash": {
+          "$hex": "1b080e0d8278778778877788778807780887878888"
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "ts": 1791000006,
+      "author": 42,
+      "scope": 7,
+      "tag": 2,
+      "parent": 4,
+      "text": "aquí sí",
+      "media": null
+    }
+  ],
+  "skipped": 0,
+  "more": true
+}

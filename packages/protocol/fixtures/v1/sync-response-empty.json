@@ -1,0 +1,11 @@
+{
+  "range": {
+    "min": 1,
+    "max": 1
+  },
+  "cursor": 12,
+  "more": false,
+  "events": [],
+  "skipped": 0,
+  "acks": []
+}

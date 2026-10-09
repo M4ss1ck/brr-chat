@@ -1,0 +1,26 @@
+{
+  "v": 1,
+  "cursor": 12,
+  "outbox": [
+    {
+      "cid": {
+        "$hex": "a1a2a3a4a5a6a7a8"
+      },
+      "scope": 7,
+      "tag": 1,
+      "text": "nuevo post",
+      "media": null
+    },
+    {
+      "cid": {
+        "$hex": "b1b2b3b4b5b6b7b8"
+      },
+      "scope": 0,
+      "tag": 3,
+      "peer": 43,
+      "text": "primer dm",
+      "media": null
+    }
+  ],
+  "rejected": []
+}

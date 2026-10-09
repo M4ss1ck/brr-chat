@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+docs/plans/
+apps/native/src-tauri/target/

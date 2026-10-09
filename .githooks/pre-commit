@@ -1,0 +1,4 @@
+#!/bin/sh
+# Gate: typecheck + deterministic tests. Keep the test lane under 2s.
+set -e
+bun run check

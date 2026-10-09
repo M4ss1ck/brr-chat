@@ -1,0 +1,144 @@
+{
+  "range": {
+    "min": 1,
+    "max": 1
+  },
+  "cursor": 12,
+  "more": true,
+  "events": [
+    {
+      "seq": 1,
+      "ts": 1791000001,
+      "author": 42,
+      "scope": 7,
+      "tag": 8,
+      "name": "La Habana",
+      "about": "Grupo abierto",
+      "open": true
+    },
+    {
+      "seq": 2,
+      "ts": 1791000002,
+      "author": 42,
+      "scope": 7,
+      "tag": 9,
+      "user": 42,
+      "role": 3
+    },
+    {
+      "seq": 3,
+      "ts": 1791000003,
+      "author": 42,
+      "scope": 0,
+      "tag": 6,
+      "username": "ana",
+      "displayName": "Ana 🌴",
+      "bio": "hola"
+    },
+    {
+      "seq": 4,
+      "ts": 1791000004,
+      "author": 42,
+      "scope": 7,
+      "tag": 1,
+      "text": "¿Alguien tiene luz?",
+      "media": null
+    },
+    {
+      "seq": 5,
+      "ts": 1791000005,
+      "author": 42,
+      "scope": 7,
+      "tag": 1,
+      "text": "foto del malecón",
+      "media": {
+        "id": 31,
+        "w": 1280,
+        "h": 960,
+        "thumbhash": {
+          "$hex": "1b080e0d8278778778877788778807780887878888"
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "ts": 1791000006,
+      "author": 42,
+      "scope": 7,
+      "tag": 2,
+      "parent": 4,
+      "text": "aquí sí",
+      "media": null
+    },
+    {
+      "seq": 7,
+      "ts": 1791000007,
+      "author": 42,
+      "scope": 7,
+      "tag": 4,
+      "target": 4,
+      "emoji": 2,
+      "on": true
+    },
+    {
+      "seq": 8,
+      "ts": 1791000008,
+      "author": 42,
+      "scope": 9,
+      "tag": 3,
+      "peer": 43,
+      "text": "psst",
+      "media": null
+    },
+    {
+      "seq": 9,
+      "ts": 1791000009,
+      "author": 42,
+      "scope": 7,
+      "tag": 5,
+      "target": 6
+    },
+    {
+      "seq": 10,
+      "ts": 1791000010,
+      "author": 42,
+      "scope": 7,
+      "tag": 10,
+      "user": 66,
+      "on": true
+    },
+    {
+      "seq": 11,
+      "ts": 1791000011,
+      "author": 1,
+      "scope": 7,
+      "tag": 11,
+      "purge": true
+    },
+    {
+      "seq": 12,
+      "ts": 1791000012,
+      "author": 0,
+      "scope": 7,
+      "tag": 12,
+      "after": 12,
+      "before": 900,
+      "count": 340
+    }
+  ],
+  "skipped": 0,
+  "acks": [
+    {
+      "cid": {
+        "$hex": "a1a2a3a4a5a6a7a8"
+      },
+      "seq": 4
+    },
+    {
+      "cid": {
+        "$hex": "b1b2b3b4b5b6b7b8"
+      },
+      "error": 2
+    }
+  ]
+}
