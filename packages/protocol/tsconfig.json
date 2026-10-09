@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Pure package: no DOM, no Bun, no Node. Only ES2022 globals exist here.
+    "lib": ["ES2022"],
+    "types": []
+  },
+  "include": ["src"]
+}

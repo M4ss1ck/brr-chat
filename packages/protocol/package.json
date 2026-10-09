@@ -1,0 +1,14 @@
+{
+  "name": "@brr-chat/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "freeze-fixtures": "bun scripts/freeze-fixtures.ts"
+  },
+  "dependencies": {
+    "@levischuck/tiny-cbor": "0.3.6"
+  }
+}

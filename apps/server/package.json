@@ -1,0 +1,13 @@
+{
+  "name": "@brr-chat/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@brr-chat/protocol": "workspace:*"
+  }
+}
