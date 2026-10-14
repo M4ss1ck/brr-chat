@@ -5,9 +5,9 @@
 - **Account**: a user on one server. The same person on two servers has two unrelated accounts.
 - **Scope**: what an event belongs to, either a **group** or a **DM** (two users). Scope 0
   means server-wide.
-- **Group**: a scope with members and roles (member, admin, owner). Open (anyone can join)
-  or invite-only. A **group admin** (role 2) is distinct from a **server admin**, the
-  server-wide admin role in BetterAuth.
+- **Group**: a scope with members and roles (member, group admin, owner). Open (anyone can join)
+  or invite-only. A **group admin** (`Role.Admin = 2`) is distinct from a **server admin**, the
+  server-wide `admin` role in BetterAuth.
 - **Event**: one entry in the server's append-only log, `[tag, seq, ts, author, scope, ...]`.
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.

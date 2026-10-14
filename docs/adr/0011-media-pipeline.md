@@ -17,11 +17,12 @@ native-library bloat to the single-binary server (ADR 0002).
   blurred ThumbHash and fetch `GET /m/{id}?w=<width>` only when they tap to load (`?w=` snaps to
   the nearest stored variant, `320` or `1280`).
 - Server validation without re-encoding: the server checks WebP magic bytes (`RIFF....WEBP`),
-  parses the WebP header to verify pixel dimensions (`<= 320` and `<= 1280`) and the `400 KB` byte
-  cap, and stores the bytes as-is without server-side re-encoding. Invalid uploads are rejected.
+  parses the WebP header to verify each variant's longest edge (`<= 320` px for the preview variant
+  and `<= 1280` px for the full variant) and the `400 KB` byte cap, and stores the bytes as-is
+  without server-side re-encoding.
 - Per-server storage quota: the server enforces a configurable total media byte quota across
-  stored files (evicting oldest blobs or rejecting uploads when full according to server policy)
-  so a single binary deployment cannot exhaust disk.
+  stored files so a single binary deployment cannot exhaust disk. Oversized, wrong-type, or
+  over-quota uploads are rejected with a clear ack.
 
 ## Consequences
 - Zero image-processing native dependencies (`libvips`/`sharp`) in the compiled server binary, and

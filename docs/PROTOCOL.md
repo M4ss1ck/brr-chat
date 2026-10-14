@@ -125,7 +125,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 6 | profile | `username, displayName, bio` | yes | `scope = 0`. Avatars are identicons from the user id |
 | 7 | *reserved* | | | never reuse |
 | 8 | group_meta | `name, about, open: bool` | yes | op with `scope = 0` creates a group |
-| 9 | membership | `user: uint, role: uint 0..3` | yes | 0 none (left), 1 member, 2 admin (group admin), 3 owner |
+| 9 | membership | `user: uint, role: uint 0..3` | yes | 0 none (left), 1 member, 2 group admin (`Role.Admin`), 3 owner (`Role.Owner`) |
 | 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), else group ban (group admin or owner) |
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |

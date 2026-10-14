@@ -24,9 +24,8 @@ without adding protocol round-trips.
   still reply in DMs opened by an older account.
 - Silent server-enforced per-user block: any user can block another user on the server. Blocking is
   silent: when a blocked user attempts to open a DM or send a DM to the blocker, the server returns
-  a normal success ack to the sender so the block is not revealed, drops delivery to the blocker,
-  and omits the blocked user's posts and replies from the blocker's `/sync` and `/history` responses
-  (or filters them on the blocker's devices).
+  a normal success ack to the sender so the block is not revealed, never delivers the DM to the
+  blocker, and hides the blocked user's posts in groups on the blocker's devices.
 
 ## Consequences
 - Server admins can contain signup raids with one switch or run invite-only communities without code

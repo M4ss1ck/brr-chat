@@ -8,10 +8,11 @@ creator leaves or is banned, without colliding with BetterAuth's server-wide `ad
 changing the v1 wire format (ADR 0004).
 
 ## Decision
-- Group roles are `0` none (left), `1` member, `2` admin (group admin), and `3` owner (`Role` in
-  `packages/protocol/src/events.ts`). Wire values `0..3` are unchanged from the initial v1 table,
-  so no protocol version bump is needed and v1 fixtures stay valid. We always write "group admin"
-  vs "server admin" (BetterAuth's server-wide `admin` role).
+- Group roles are `0` none (left), `1` member, `2` group admin (`Role.Admin`), and `3` owner
+  (`Role.Owner` in `packages/protocol/src/events.ts`). Because v1 has not shipped to any deployed
+  client or server yet (pre-launch prefactor) and wire values `0..3` are unchanged, no protocol
+  version bump is needed and frozen v1 fixtures stay valid. We always write "group admin" vs
+  "server admin" (BetterAuth's server-wide `admin` role).
 - Account age gate: creating a group (`group_meta` op with `scope = 0`) requires an account at
   least 24h old; younger accounts receive a `Forbidden` ack.
 - Visibility and invites: open groups (`open = true`) appear in the server's open group list and

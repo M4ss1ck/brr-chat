@@ -56,8 +56,9 @@ describe("events", () => {
     ] as const;
     for (const [role, wire] of cases) {
       const ev: Event = { ...hdr, tag: Tag.Membership, user: 42, role };
-      expect(encodeEvent(ev)).toEqual([Tag.Membership, 1000, 1_791_000_000, 42, 7, 42, wire]);
-      expect(decodeEvent([Tag.Membership, 1000, 1_791_000_000, 42, 7, 42, wire])).toEqual(ev);
+      const wireEvent = [Tag.Membership, hdr.seq, hdr.ts, hdr.author, hdr.scope, 42, wire];
+      expect(encodeEvent(ev)).toEqual(wireEvent);
+      expect(decodeEvent(wireEvent)).toEqual(ev);
     }
   });
 
