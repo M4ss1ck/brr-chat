@@ -8,5 +8,9 @@
   },
   "dependencies": {
     "@brr-chat/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.2.5"
   }
 }

@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
   },
   "dependencies": {
-    "@brr-chat/protocol": "workspace:*"
+    "@brr-chat/protocol": "workspace:*",
+    "better-auth": "^1.7.7"
   }
 }
