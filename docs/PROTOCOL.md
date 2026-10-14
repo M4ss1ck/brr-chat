@@ -121,12 +121,12 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 2 | reply | `parent: uint, text, ? media` | yes | one level: `parent` must be a post |
 | 3 | dm | `peer: uint, text, ? media` | yes | op with `scope = 0` opens a DM with `peer` |
 | 4 | reaction | `target: uint, emoji: uint 0..7, on: bool` | yes | fixed 8-emoji palette, toggled |
-| 5 | delete | `target: uint` | yes | the author, or a moderator/admin |
+| 5 | delete | `target: uint` | yes | the author, a group admin, or the owner |
 | 6 | profile | `username, displayName, bio` | yes | `scope = 0`. Avatars are identicons from the user id |
 | 7 | *reserved* | | | never reuse |
 | 8 | group_meta | `name, about, open: bool` | yes | op with `scope = 0` creates a group |
-| 9 | membership | `user: uint, role: uint 0..3` | yes | 0 none (left), 1 member, 2 moderator, 3 admin |
-| 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (admin), else group ban |
+| 9 | membership | `user: uint, role: uint 0..3` | yes | 0 none (left), 1 member, 2 admin (group admin), 3 owner |
+| 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), else group ban (group admin or owner) |
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
 

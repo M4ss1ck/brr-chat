@@ -22,7 +22,7 @@ export type Tag = (typeof Tag)[keyof typeof Tag];
 export const MAX_TEXT_BYTES = 4000;
 export const MAX_THUMBHASH_BYTES = 32;
 export const EMOJI_PALETTE_SIZE = 8;
-export const Role = { None: 0, Member: 1, Moderator: 2, Admin: 3 } as const;
+export const Role = { None: 0, Member: 1, Admin: 2, Owner: 3 } as const;
 
 export interface Media {
   id: number;
@@ -151,7 +151,7 @@ function decodeField(kind: Kind, v: unknown, what: string): unknown {
     }
     case "role": {
       const n = uint(v, what);
-      if (n > Role.Admin) throw new ProtocolError(`${what}: role out of range`);
+      if (n > Role.Owner) throw new ProtocolError(`${what}: role out of range`);
       return n;
     }
     case "media?":
