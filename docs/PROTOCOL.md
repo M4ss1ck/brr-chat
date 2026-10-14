@@ -14,7 +14,7 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
 | Empty sync payload (request + response) | 1 KB | 19 B |
 | 100 text posts in one response, uncompressed | 20 KB | 13,859 B (17.1 B/post framing) |
 | Image placeholder (whole media field) | 40 B | 39 B worst case |
-| App shell, compressed | 150 KB | 6,487 B (apps/web) |
+| App shell, compressed | 150 KB | 6,464 B (apps/web) |
 
 ## Transport
 

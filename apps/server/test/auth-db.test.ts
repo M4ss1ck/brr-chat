@@ -8,12 +8,15 @@ function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), "brr-chat-auth-db-"));
 }
 
+/** Every test that touches a real DB file gives its own key (ADR 0007). */
+const TEST_SECRET = "test-secret-0123456789abcdef0123456789abcdef";
+
 describe("Slice 1: SQLite DB + BetterAuth", () => {
   test("creates new SQLite DB file with mode 0600 (ADR 0007)", async () => {
     const dir = makeTempDir();
     try {
       const dbPath = join(dir, "nested", "chat.db");
-      const app = await createApp({ dbPath, host: "chat.local" });
+      const app = await createApp({ dbPath, host: "chat.local", secret: TEST_SECRET });
       try {
         expect(statSync(dbPath).mode & 0o777).toBe(0o600);
       } finally {
@@ -32,7 +35,7 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
       chmodSync(dbPath, 0o644);
       expect(statSync(dbPath).mode & 0o777).toBe(0o644);
 
-      const app = await createApp({ dbPath, host: "chat.local" });
+      const app = await createApp({ dbPath, host: "chat.local", secret: TEST_SECRET });
       try {
         expect(statSync(dbPath).mode & 0o777).toBe(0o600);
       } finally {
@@ -83,7 +86,7 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
 
     try {
       const dbPath = join(dir, "first-boot.db");
-      const app = await createApp({ dbPath, host: "chat.local" });
+      const app = await createApp({ dbPath, host: "chat.local", secret: TEST_SECRET });
       try {
         // Trigger a request to ensure any lazy schema check also resolves cleanly
         const res = await app.fetch(new Request("http://chat.local/api/auth/get-session"));
@@ -101,6 +104,48 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
 
     for (const line of captured) {
       expect(line).not.toMatch(/schema mismatch/i);
+    }
+  });
+
+  test("sessions carry a short sliding lifetime and a quiet token stops working (ADR 0007)", async () => {
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    try {
+      const signUp = await app.fetch(
+        new Request("http://chat.local/api/auth/sign-up/email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: "alice", password: "password1234" }),
+        }),
+      );
+      const { token } = (await signUp.json()) as { token: string };
+
+      const row = app.db.query("SELECT createdAt, expiresAt FROM session").get() as { createdAt: string; expiresAt: string } | null;
+      expect(row).not.toBeNull();
+      const window = new Date(row?.expiresAt ?? "").getTime() - new Date(row?.createdAt ?? "").getTime();
+      expect(window).toBeGreaterThanOrEqual(29 * 24 * 60 * 60 * 1000);
+      expect(window).toBeLessThanOrEqual(31 * 24 * 60 * 60 * 1000);
+
+      const synced = await app.fetch(
+        new Request("http://chat.local/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/cbor", Authorization: `Bearer ${token}` },
+          body: new Uint8Array([0x83, 0x01, 0x00, 0x80]),
+        }),
+      );
+      expect(synced.status).toBe(200);
+
+      // 31 quiet days: the token no longer speaks for anyone.
+      app.db.query("UPDATE session SET expiresAt = ?").run(new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString());
+      const stale = await app.fetch(
+        new Request("http://chat.local/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/cbor", Authorization: `Bearer ${token}` },
+          body: new Uint8Array([0x83, 0x01, 0x00, 0x80]),
+        }),
+      );
+      expect(stale.status).toBe(401);
+    } finally {
+      app.close();
     }
   });
 

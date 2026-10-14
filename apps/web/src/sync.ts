@@ -9,7 +9,7 @@ import {
   type SyncResponse,
   type VersionRange,
 } from "@brr-chat/protocol";
-import { getCursor, getRange, setCursor, setRange } from "./store.ts";
+import { getCursor, setCursor, setRange } from "./store.ts";
 
 export const SYNC_PATH = "/sync";
 
@@ -56,9 +56,4 @@ export async function syncAndPersist(base: string, token: string, outbox: Op[] =
   const outcome = classifySyncResponse(response);
   if (outcome.kind === "ok") await setCursor(response.cursor);
   return outcome;
-}
-
-/** Cached server range, or null before the first sync. */
-export async function cachedRange(): Promise<VersionRange | null> {
-  return getRange();
 }

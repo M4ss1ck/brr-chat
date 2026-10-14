@@ -44,6 +44,12 @@ export async function initAuth(db: Database, opts: AuthInitOptions) {
     telemetry: { enabled: false },
     emailAndPassword: { enabled: true },
     trustedOrigins,
+    // ADR 0007 mitigation: bare tokens, so a token in an old backup must stop working.
+    // Touching the app extends the session; 30 quiet days drop it.
+    session: {
+      expiresIn: 30 * 24 * 60 * 60,
+      updateAge: 24 * 60 * 60,
+    },
     plugins: [username(), bearer(), admin()],
     hooks: {
       before: createAuthMiddleware(async (ctx) => {

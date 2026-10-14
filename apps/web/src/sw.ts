@@ -1,37 +1,13 @@
 // Service worker for the PWA shell. Data saving is the point (docs/PROTOCOL.md): the shell is
 // precached once and served from cache afterwards, while auth and /sync always hit the network.
-// Only the DOM lib is declared for the shell (ADR 0014), so the service worker scope is
-// narrowed by hand instead of pulling in the WebWorker lib.
-
+// This file is checked with its own tsconfig (lib: WebWorker), so the DOM lib of the shell does
+// not need the service worker types hand-declared.
 const CACHE = "brr-shell-v1";
 const SHELL: readonly string[] = ["/", "/index.html", "/app.js", "/sw.js", "/manifest.webmanifest", "/icon.svg"];
 /** Never cached: credentials, sync payloads and media are always fresh from the server. */
 const NEVER_CACHE: readonly string[] = ["/api/auth/", "/sync", "/m/"];
 
-interface ServiceWorkerScope {
-  skipWaiting(): Promise<void>;
-  clients: { claim(): Promise<void> };
-}
-
-interface FetchHandled {
-  request: Request;
-  respondWith(response: Response | Promise<Response>): void;
-}
-
-/** The lifecycle events of a service worker; not in the DOM lib, so declared by hand. */
-interface ExtendableEvent extends Event {
-  waitUntil(promise: Promise<unknown>): void;
-}
-
-const scope = self as unknown as ServiceWorkerScope;
-
-function isShellPath(pathname: string): boolean {
-  return SHELL.includes(pathname);
-}
-
-function isNeverCached(pathname: string): boolean {
-  return NEVER_CACHE.some((prefix) => pathname.startsWith(prefix));
-}
+const scope: ServiceWorkerGlobalScope = self as unknown as ServiceWorkerGlobalScope;
 
 async function precache(): Promise<void> {
   const cache = await caches.open(CACHE);
@@ -46,12 +22,12 @@ async function precache(): Promise<void> {
   );
 }
 
-self.addEventListener("install", (event: Event) => {
-  (event as ExtendableEvent).waitUntil(precache().then(() => scope.skipWaiting()));
+scope.addEventListener("install", (event) => {
+  event.waitUntil(precache().then(() => scope.skipWaiting()));
 });
 
-self.addEventListener("activate", (event: Event) => {
-  (event as ExtendableEvent).waitUntil(
+scope.addEventListener("activate", (event) => {
+  event.waitUntil(
     caches
       .keys()
       .then((names) => Promise.all(names.filter((name) => name !== CACHE).map((name) => caches.delete(name))))
@@ -59,24 +35,22 @@ self.addEventListener("activate", (event: Event) => {
   );
 });
 
-self.addEventListener("fetch", (raw: Event) => {
-  const event = raw as unknown as FetchHandled;
+scope.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
 
   const url = new URL(request.url);
-  if (url.origin !== self.location.origin || isNeverCached(url.pathname)) return;
+  if (url.origin !== scope.location.origin) return;
+  if (NEVER_CACHE.some((prefix) => url.pathname.startsWith(prefix))) return;
 
   // Navigations: network first, so a new shell shows up as soon as it is deployed.
   if (request.mode === "navigate") {
-    event.respondWith(
-      fetch(request).catch(async () => (await caches.match("/index.html")) ?? Response.error()),
-    );
+    event.respondWith(fetch(request).catch(async () => (await caches.match("/index.html")) ?? Response.error()));
     return;
   }
 
   // Shell assets: cache first, refresh in the background. Never re-downloaded on every load.
-  if (isShellPath(url.pathname)) {
+  if (SHELL.includes(url.pathname)) {
     event.respondWith(
       (async () => {
         const cache = await caches.open(CACHE);
@@ -87,10 +61,7 @@ self.addEventListener("fetch", (raw: Event) => {
             return response;
           })
           .catch(() => null);
-        if (cached) {
-          void fresh;
-          return cached;
-        }
+        if (cached) return cached;
         return (await fresh) ?? Response.error();
       })(),
     );

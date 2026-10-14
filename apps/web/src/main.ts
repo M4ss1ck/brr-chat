@@ -2,7 +2,7 @@
 // app shell stays inside its byte budget (ADR 0014). Every element lookup is optional, so the
 // module also loads in a test or in a worker without a DOM.
 import { ResponseError } from "@brr-chat/protocol";
-import { authorizationHeader, signIn, signOut, signUp } from "./auth.ts";
+import { signIn, signOut, signUp } from "./auth.ts";
 import { syncAndPersist } from "./sync.ts";
 import { getCursor, getRange, getSession } from "./store.ts";
 
@@ -31,7 +31,7 @@ async function refresh(): Promise<void> {
   show("signed-out", session === null);
   show("signed-in", session !== null);
   setText("account", session?.username ?? "");
-  setText("token", session ? ((await authorizationHeader()) ?? "") : "");
+  setText("token", session ? "32-char bearer token, held on this device only" : "");
   setText("cursor", String(await getCursor()));
   const range = await getRange();
   setText("range", range ? `v${range.min}..v${range.max}` : "unknown");

@@ -11,9 +11,10 @@ import { request } from "node:http";
 import { decodeSyncResponse, encodeSyncRequest } from "@brr-chat/protocol";
 
 const SERVER_ROOT = resolve(import.meta.dir, "..");
-const REPO_ROOT = resolve(SERVER_ROOT, "..", "..");
-const SECRET = "compile-test-secret-0123456789abcdef0123456789abcdef";
 const KB = 1024;
+const SECRET = "compile-test-secret-0123456789abcdef0123456789abcdef";
+/** docs/PROTOCOL.md: the app shell budget, on the bytes a metered connection pays for. */
+const APP_SHELL_BUDGET = 150 * KB;
 
 interface Binary {
   proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -140,6 +141,28 @@ async function rawSync(
   return { status: res.status, headers: res.headers, wireBytes, cbor: new Uint8Array(res.raw) };
 }
 
+/** One GET over plain HTTP, so the bytes on the wire are the bytes measured. */
+async function rawGet(base: string, path: string): Promise<{ status: number; headers: Record<string, string>; raw: Buffer }> {
+  const url = new URL(path, base);
+  return new Promise((resolve_, reject) => {
+    const req = request(
+      { hostname: url.hostname, port: url.port, path: url.pathname, method: "GET", headers: { Host: url.host, "Accept-Encoding": "br" } },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const headers: Record<string, string> = {};
+          for (let i = 0; i < res.rawHeaders.length; i += 2) headers[(res.rawHeaders[i] ?? "").toLowerCase()] = res.rawHeaders[i + 1] ?? "";
+          resolve_({ status: res.statusCode ?? 0, headers, raw: Buffer.concat(chunks) });
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 describe("compiled single binary", () => {
   test("starts in an empty directory and serves the whole tracer path", async () => {
     const dir = mkdtempSync(join(tmpdir(), "brr-chat-compile-"));
@@ -161,9 +184,19 @@ describe("compiled single binary", () => {
       const html = await index.text();
       expect(html).toContain('<script type="module" src="/app.js"></script>');
       expect(html).toContain('id="empty"');
-      const bundle = await fetch(`${server.base}/app.js`);
+      // The shell goes out brotli-compressed: the 150 KB budget in docs/PROTOCOL.md is
+      // measured on these bytes, not on the raw bundle.
+      const document = await rawGet(server.base, "/");
+      expect(document.status).toBe(200);
+      expect(document.headers["content-encoding"]).toBe("br");
+      expect(document.headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(document.headers["vary"]).toBe("Accept-Encoding");
+      const bundle = await rawGet(server.base, "/app.js");
       expect(bundle.status).toBe(200);
-      expect((await bundle.text()).length).toBeGreaterThan(0);
+      expect(bundle.headers["content-encoding"]).toBe("br");
+      const shellBytes = document.raw.byteLength + bundle.raw.byteLength;
+      console.log(`compiled binary shell on the wire (brotli): index ${document.raw.byteLength} B + app.js ${bundle.raw.byteLength} B = ${shellBytes} B of ${APP_SHELL_BUDGET} B budget`);
+      expect(shellBytes).toBeLessThanOrEqual(APP_SHELL_BUDGET);
 
       // Sign up with a username only: no email, bare 32-char token.
       const signUp = await fetch(`${server.base}/api/auth/sign-up/email`, {

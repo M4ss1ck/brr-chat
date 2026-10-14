@@ -20,9 +20,11 @@ function buildShell(): void {
   if (proc.exitCode !== 0) throw new Error(`apps/web build failed:\n${proc.stderr.toString()}`);
 }
 
+/** Route list the server embeds. The drift test below keeps the generated file honest. */
 function shellRoutes(): string[] {
   const source = readFileSync(EMBEDDED, "utf8");
-  return [...source.matchAll(/^ {2}"([^"]+)": \{$/gm)].map((m) => m[1] ?? "");
+  const block = source.slice(source.indexOf("export const SHELL_ROUTES"));
+  return [...block.matchAll(/^ {2}"([^"]+)": "[^"]+",$/gm)].map((m) => m[1] ?? "");
 }
 
 describe("app shell budget", () => {

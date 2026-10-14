@@ -41,8 +41,8 @@ export function signIn(base: string, username: string, password: string): Promis
 }
 
 /**
- * Revokes the session on the server and drops the token locally either way: a failed
- * network call must not leave a live token on a shared phone.
+ * Revokes the session on the server. The token stays on the device until the server confirms:
+ * dropping it first would leave a live session this device can no longer revoke.
  */
 export async function signOut(base: string): Promise<void> {
   const session = await getSession();
@@ -51,8 +51,8 @@ export async function signOut(base: string): Promise<void> {
     method: "POST",
     headers: { Authorization: `Bearer ${session.token}` },
   });
-  await setSession(null);
   if (!res.ok) throw new Error(`${SIGN_OUT_PATH} failed with status ${res.status}`);
+  await setSession(null);
 }
 
 /** Authorization header for the bare token (ADR 0007), or null when signed out. */

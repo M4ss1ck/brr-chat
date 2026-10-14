@@ -17,6 +17,9 @@ import { closeStore, getCursor, getRange, getSession, getStoredCursor } from "..
 /** The DOM lib's BodyInit does not list Uint8Array; every runtime accepts it. */
 const cborBody = (bytes: Uint8Array): BodyInit => bytes as unknown as BodyInit;
 
+/** A real DB file gets its own signing key, never the environment (ADR 0007). */
+const TEST_SECRET = "pwa-test-secret-0123456789abcdef0123456789abcdef";
+
 let tempDir: string;
 let base: string;
 let server: ReturnType<typeof Bun.serve> | null = null;
@@ -25,7 +28,7 @@ let app: Awaited<ReturnType<typeof createApp>> | null = null;
 async function startServer(): Promise<void> {
   tempDir = mkdtempSync(join(tmpdir(), "brr-chat-web-pwa-"));
   const dbPath = join(tempDir, "chat.db");
-  app = await createApp({ dbPath, host: "127.0.0.1", baseURL: "http://127.0.0.1" });
+  app = await createApp({ dbPath, host: "127.0.0.1", baseURL: "http://127.0.0.1", secret: TEST_SECRET });
   server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => app!.fetch(req) });
   base = `http://127.0.0.1:${server.port}`;
 }
@@ -129,6 +132,21 @@ describe("PWA client (apps/web)", () => {
     expect(again.token).not.toBe(session.token);
     const outcome = await syncAndPersist(base, again.token);
     expect(outcome.kind).toBe("ok");
+  });
+
+  test("a sign-out the server refuses keeps the token, so the device can retry", async () => {
+    const session = await auth.signUp(base, "alice", "password1234");
+    const refusing = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Response("nope", { status: 500 }),
+    });
+    try {
+      await expect(auth.signOut(`http://127.0.0.1:${refusing.port}`)).rejects.toThrow("failed with status 500");
+      expect(await getSession()).toEqual(session);
+    } finally {
+      await refusing.stop(true);
+    }
   });
 
   test("syncs an empty server: cursor 0 stored, cached range, no events", async () => {

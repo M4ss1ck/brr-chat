@@ -22,13 +22,15 @@ Run the server and the PWA from source:
 
 ```sh
 bun run --cwd apps/web build          # build the app shell and regenerate the server's embedded copy
+export BETTER_AUTH_SECRET=$(openssl rand -hex 32)   # signs sessions; never defaulted (ADR 0007)
 bun run --cwd apps/server dev         # serve /, /sync and /api/auth on http://localhost:3000
 ```
 
 One binary, no files beside it:
 
 ```sh
-bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, DB_PATH, BETTER_AUTH_SECRET, BASE_URL)
+bun run --cwd apps/server compile     # build the shell, then compile to apps/server/dist/brr-chat
+bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, DB_PATH, BASE_URL, BETTER_AUTH_SECRET)
 ```
 
 Changing the protocol: read `docs/PROTOCOL.md` "Evolution rules", then run
