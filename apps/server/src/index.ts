@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
+import { handleSync } from "./sync.ts";
 
 export { SUPPORTED, headCursor, openDb };
 export const supported = SUPPORTED;
@@ -49,6 +50,9 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
       const url = new URL(req.url);
       if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
         return auth.handler(req);
+      }
+      if (url.pathname === "/sync" && req.method === "POST") {
+        return handleSync(req, db, auth);
       }
       return new Response("Not Found", { status: 404 });
     },
