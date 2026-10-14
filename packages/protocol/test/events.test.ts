@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   AckError,
+  Role,
   Tag,
   encodeEvent,
   decodeEvent,
@@ -44,6 +45,21 @@ describe("events", () => {
 
   test("layout is positional: [tag, seq, ts, author, scope, ...fields]", () => {
     expect(encodeEvent({ ...hdr, tag: Tag.Delete, target: 5 })).toEqual([Tag.Delete, 1000, 1_791_000_000, 42, 7, 5]);
+  });
+
+  test("membership roles encode as 0 none, 1 member, 2 admin, 3 owner", () => {
+    const cases = [
+      [Role.None, 0],
+      [Role.Member, 1],
+      [Role.Admin, 2],
+      [Role.Owner, 3],
+    ] as const;
+    for (const [role, wire] of cases) {
+      const ev: Event = { ...hdr, tag: Tag.Membership, user: 42, role };
+      const wireEvent = [Tag.Membership, hdr.seq, hdr.ts, hdr.author, hdr.scope, 42, wire];
+      expect(encodeEvent(ev)).toEqual(wireEvent);
+      expect(decodeEvent(wireEvent)).toEqual(ev);
+    }
   });
 
   test("trailing null optionals are dropped on the wire and restored on decode", () => {
