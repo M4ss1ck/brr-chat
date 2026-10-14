@@ -49,20 +49,25 @@ scope.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Shell assets: cache first, refresh in the background. Never re-downloaded on every load.
+  // Shell assets: cache first, refresh in the background. An offline revalidation would be a
+  // request the user pays for and that cannot succeed, so it is skipped.
   if (SHELL.includes(url.pathname)) {
     event.respondWith(
       (async () => {
         const cache = await caches.open(CACHE);
         const cached = await cache.match(request);
-        const fresh = fetch(request)
-          .then(async (response) => {
-            if (response.ok) await cache.put(request, response.clone());
-            return response;
-          })
-          .catch(() => null);
-        if (cached) return cached;
-        return (await fresh) ?? Response.error();
+        const refresh = () =>
+          fetch(request)
+            .then(async (response) => {
+              if (response.ok) await cache.put(request, response.clone());
+              return response;
+            })
+            .catch(() => null);
+        if (cached) {
+          if (scope.navigator.onLine) void refresh();
+          return cached;
+        }
+        return (await refresh()) ?? Response.error();
       })(),
     );
   }

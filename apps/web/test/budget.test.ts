@@ -71,7 +71,8 @@ describe("app shell budget", () => {
     if (tracked.exitCode === null) return; // no git available: freshness cannot be checked here
     expect(tracked.exitCode).toBe(0);
 
-    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "--", generated], cwd: WEB_ROOT });
+    // Against HEAD, not the index: a shell that was built but never staged fails too.
+    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", generated], cwd: WEB_ROOT });
     expect(diff.exitCode).toBe(0);
   });
 });
