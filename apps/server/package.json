@@ -3,8 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": { ".": "./src/index.ts" },
   "scripts": {
     "dev": "bun --watch src/index.ts",
+    "compile": "bun run --cwd ../web build && bun build --compile src/index.ts --outfile dist/brr-chat",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
   },
   "dependencies": {
