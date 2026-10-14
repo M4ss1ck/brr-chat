@@ -1,0 +1,19 @@
+name: CI
+
+# Same gate as .githooks/pre-commit (ADR 0005): typecheck every workspace, then
+# run all tests, including the byte budgets. Bun is pinned via .bun-version.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - run: bun run check
