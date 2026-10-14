@@ -2,7 +2,7 @@
 // shell assets are served from cache with a background refresh, and /api/auth, /sync and /m/
 // never touch the cache. Run against the real src/sw.ts with a fake service worker scope,
 // so the strategy is covered without a browser.
-import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 
 interface Handled {
@@ -118,6 +118,15 @@ async function settled(): Promise<void> {
 }
 
 describe("service worker (the built shell worker)", () => {
+  /** Bun runs every test file in one process: the faked globals must be put back. */
+  const originals = { fetch: globalThis.fetch, caches: globalThis.caches, self: globalThis.self };
+
+  afterAll(() => {
+    globalThis.fetch = originals.fetch;
+    globalThis.caches = originals.caches;
+    globalThis.self = originals.self;
+  });
+
   beforeAll(async () => {
     globalThis.self = scope as unknown as Window & typeof globalThis;
     globalThis.caches = {
