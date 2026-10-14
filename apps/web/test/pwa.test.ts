@@ -1,7 +1,7 @@
 // End-to-end proof for issue #5: the PWA client signs up, signs in, syncs an empty server
 // and lands on cursor 0, against a real server on a real socket, with a byte-counting
 // proxy in between so the wire budget is measured, not estimated.
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,6 +22,7 @@ const TEST_SECRET = "pwa-test-secret-0123456789abcdef0123456789abcdef";
 
 let tempDir: string;
 let base: string;
+/** One server for the whole suite: each test is a separate client, and a distinct account. */
 let server: ReturnType<typeof Bun.serve> | null = null;
 let app: Awaited<ReturnType<typeof createApp>> | null = null;
 
@@ -33,13 +34,10 @@ async function startServer(): Promise<void> {
   base = `http://127.0.0.1:${server.port}`;
 }
 
-async function stopServer(): Promise<void> {
-  await server?.stop(true);
-  server = null;
-  app?.close();
-  app = null;
-  if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+function username(): string {
+  return `alice${++account}`;
 }
+let account = 0;
 
 /** Forwards bytes verbatim between the client and the server and counts both directions. */
 async function startWireCounter(): Promise<{ base: string; totals(): number; stop(): void }> {
@@ -87,14 +85,20 @@ describe("PWA client (apps/web)", () => {
     globalThis.indexedDB = originalIndexedDB;
   });
 
+  beforeAll(startServer);
+
+  afterAll(async () => {
+    await server?.stop(true);
+    app?.close();
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+  });
+
   beforeEach(async () => {
     globalThis.indexedDB = new IDBFactory();
-    await startServer();
   });
 
   afterEach(async () => {
     await closeStore();
-    await stopServer();
   });
 
   test("the server keeps its DB at mode 0600 with an events table", () => {
@@ -102,8 +106,9 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("sign up with a username only stores a bare 32-char session", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
-    expect(session.username).toBe("alice");
+    const account = username();
+    const session = await auth.signUp(base, account, "password1234");
+    expect(session.username).toBe(account);
     expect(session.token).toHaveLength(32);
     expect(session.token.includes(".")).toBe(false);
     expect(await getSession()).toEqual(session);
@@ -111,38 +116,41 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("sign up with an existing username or a wrong password fails without storing a session", async () => {
-    await auth.signUp(base, "alice", "password1234");
+    const taken = username();
+    await auth.signUp(base, taken, "password1234");
     // A fresh device: same server, empty IndexedDB.
     await closeStore();
     globalThis.indexedDB = new IDBFactory();
-    await expect(auth.signUp(base, "alice", "password1234")).rejects.toThrow(/failed with status \d+/);
-    await expect(auth.signIn(base, "alice", "wrong-password")).rejects.toThrow(/failed with status \d+/);
+    await expect(auth.signUp(base, taken, "password1234")).rejects.toThrow(/failed with status \d+/);
+    await expect(auth.signIn(base, taken, "wrong-password")).rejects.toThrow(/failed with status \d+/);
     expect(await getSession()).toBeNull();
   });
 
   test("sign in after a restart returns the same account and clears nothing", async () => {
-    await auth.signUp(base, "alice", "password1234");
+    const account = username();
+    await auth.signUp(base, account, "password1234");
     await closeStore();
-    const session = await auth.signIn(base, "alice", "password1234");
-    expect(session.username).toBe("alice");
+    globalThis.indexedDB = new IDBFactory();
+    const session = await auth.signIn(base, account, "password1234");
+    expect(session.username).toBe(account);
     expect(session.token).toHaveLength(32);
   });
 
   test("sign out revokes the session: sign-in still works, the old token does not", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     expect(bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
     await auth.signOut(base);
     expect(await getSession()).toBeNull();
 
     await expect(postSyncRequest(base, session.token, buildSyncRequest(0))).rejects.toThrow("status 401");
-    const again = await auth.signIn(base, "alice", "password1234");
+    const again = await auth.signIn(base, session.username, "password1234");
     expect(again.token).not.toBe(session.token);
     const outcome = await syncAndPersist(base, again.token);
     expect(outcome.kind).toBe("ok");
   });
 
   test("a sign-out the server refuses keeps the token, so the device can retry", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     const refusing = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -157,7 +165,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("syncs an empty server: cursor 0 stored, cached range, no events", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     const outcome = await syncAndPersist(base, session.token);
 
     expect(outcome.kind).toBe("ok");
@@ -171,7 +179,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("an out-of-range version answers with the upgrade error and moves no cursor", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     expect(await getStoredCursor()).toBeNull();
 
     const old = await postSyncRequest(base, session.token, buildSyncRequest(0, [], 0));
@@ -192,7 +200,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("a server that moved on: the range is cached and the cursor is not advanced", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     const first = await syncAndPersist(base, session.token);
     expect(first.kind).toBe("ok");
     expect(await getCursor()).toBe(0);
@@ -229,7 +237,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("the empty sync round trip stays under 1 KB on the wire, bearer header included", async () => {
-    const session = await auth.signUp(base, "alice", "password1234");
+    const session = await auth.signUp(base, username(), "password1234");
     const counter = await startWireCounter();
     try {
       const outcome = await syncAndPersist(counter.base, session.token);

@@ -157,7 +157,15 @@ async function rawGet(base: string, path: string): Promise<{ status: number; hea
   });
 }
 
-describe("compiled single binary", () => {
+/** `bun build --compile` is far too slow for the 2s commit gate: CI runs this lane, the
+ *  pre-commit hook and a bare `bun test` skip it, and ci.test.ts keeps that wiring honest. */
+const slow = describe.skipIf(process.env.BRR_SLOW !== "1");
+
+if (process.env.BRR_SLOW !== "1") {
+  console.log("compiled binary gate skipped on this lane (bun run check:all runs it)");
+}
+
+slow("compiled single binary", () => {
   test("starts in an empty directory and serves the whole tracer path", async () => {
     const dir = mkdtempSync(join(tmpdir(), "brr-chat-compile-"));
     const cwd = join(dir, "run");
