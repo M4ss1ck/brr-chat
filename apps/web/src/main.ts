@@ -31,7 +31,7 @@ async function refresh(): Promise<void> {
   show("signed-out", session === null);
   show("signed-in", session !== null);
   setText("account", session?.username ?? "");
-  setText("token", session ? "32-char bearer token, held on this device only" : "");
+  setText("session", session ? "32-char bearer token, held on this device only" : "");
   setText("cursor", String(await getCursor()));
   const range = await getRange();
   setText("range", range ? `v${range.min}..v${range.max}` : "unknown");

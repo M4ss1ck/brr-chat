@@ -9,6 +9,7 @@ import {
   type SyncResponse,
   type VersionRange,
 } from "@brr-chat/protocol";
+import { bearerHeader } from "./auth.ts";
 import { getCursor, setCursor, setRange } from "./store.ts";
 
 export const SYNC_PATH = "/sync";
@@ -25,7 +26,7 @@ export async function postSyncRequest(base: string, token: string, body: Uint8Ar
       "Content-Type": "application/cbor",
       Accept: "application/cbor",
       "Accept-Encoding": "br",
-      Authorization: `Bearer ${token}`,
+      Authorization: bearerHeader(token),
     },
     // The DOM lib's BodyInit does not list Uint8Array; every runtime accepts it.
     body: body as unknown as BodyInit,

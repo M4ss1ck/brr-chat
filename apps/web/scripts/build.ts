@@ -101,7 +101,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
     <h2 id="account"></h2>
     <p id="empty" hidden>No messages yet. This server is empty.</p>
     <dl>
-      <dt>session</dt><dd id="token"></dd>
+      <dt>session</dt><dd id="session"></dd>
       <dt>last synced seq</dt><dd id="cursor">0</dd>
       <dt>server speaks</dt><dd id="range">unknown</dd>
     </dl>

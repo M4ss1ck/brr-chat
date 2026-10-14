@@ -2,6 +2,7 @@
 // 32-char session token (ADR 0007). No better-auth/client bundle in the app shell.
 import { getSession, setSession, type Session } from "./store.ts";
 
+
 export const SIGN_UP_PATH = "/api/auth/sign-up/email";
 export const SIGN_IN_PATH = "/api/auth/sign-in/username";
 export const SIGN_OUT_PATH = "/api/auth/sign-out";
@@ -49,14 +50,13 @@ export async function signOut(base: string): Promise<void> {
   if (!session) return;
   const res = await fetch(`${base}${SIGN_OUT_PATH}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${session.token}` },
+    headers: { Authorization: bearerHeader(session.token) },
   });
   if (!res.ok) throw new Error(`${SIGN_OUT_PATH} failed with status ${res.status}`);
   await setSession(null);
 }
 
-/** Authorization header for the bare token (ADR 0007), or null when signed out. */
-export async function authorizationHeader(): Promise<string | null> {
-  const session = await getSession();
-  return session ? `Bearer ${session.token}` : null;
+/** The one place the bare token becomes a header (ADR 0007). */
+export function bearerHeader(token: string): string {
+  return `Bearer ${token}`;
 }

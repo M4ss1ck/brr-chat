@@ -54,7 +54,7 @@ describe("shell contract", () => {
     expect(bundle).toContain(JSON.stringify("32-char bearer token, held on this device only"));
     const html = read("index.html");
     expect(html).not.toContain("Bearer ");
-    expect(html).toContain('<dd id="token"></dd>');
+    expect(html).toContain('<dd id="session"></dd>');
   });
 
   test("the document loads the bundle and the manifest, and the service worker path", () => {

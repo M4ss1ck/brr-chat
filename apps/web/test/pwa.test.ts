@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createApp } from "@brr-chat/server";
 import { PROTOCOL_VERSION, ResponseError, encodeSyncResponse } from "@brr-chat/protocol";
 import * as auth from "../src/auth.ts";
-import { authorizationHeader } from "../src/auth.ts";
+import { bearerHeader } from "../src/auth.ts";
 import { buildSyncRequest, classifySyncResponse, postSyncRequest, syncAndPersist } from "../src/sync.ts";
 import { closeStore, getCursor, getRange, getSession, getStoredCursor } from "../src/store.ts";
 
@@ -107,7 +107,7 @@ describe("PWA client (apps/web)", () => {
     expect(session.token).toHaveLength(32);
     expect(session.token.includes(".")).toBe(false);
     expect(await getSession()).toEqual(session);
-    expect(await authorizationHeader()).toBe(`Bearer ${session.token}`);
+    expect(await bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
   });
 
   test("sign up with an existing username or a wrong password fails without storing a session", async () => {
@@ -130,9 +130,9 @@ describe("PWA client (apps/web)", () => {
 
   test("sign out revokes the session: sign-in still works, the old token does not", async () => {
     const session = await auth.signUp(base, "alice", "password1234");
+    expect(bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
     await auth.signOut(base);
     expect(await getSession()).toBeNull();
-    expect(await authorizationHeader()).toBeNull();
 
     await expect(postSyncRequest(base, session.token, buildSyncRequest(0))).rejects.toThrow("status 401");
     const again = await auth.signIn(base, "alice", "password1234");
