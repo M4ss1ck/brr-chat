@@ -5,7 +5,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { brotliCompressSync } from "node:zlib";
 import { APP_SHELL_BUDGET } from "@brr-chat/protocol";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 
 const WEB_ROOT = resolve(import.meta.dir, "..");
 const DIST = resolve(WEB_ROOT, "dist");
@@ -71,12 +71,12 @@ describe("app shell budget", () => {
       console.log("git is unavailable: the embedded shell freshness check is skipped");
       return;
     }
-    const relative = generated.slice(WEB_ROOT.length + 1);
-    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", relative], cwd: WEB_ROOT });
+    const relativePath = relative(WEB_ROOT, generated);
+    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", relativePath], cwd: WEB_ROOT });
     expect(tracked.exitCode).toBe(0);
 
     // Against HEAD, not the index: a shell that was built but never committed fails too.
-    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", relative], cwd: WEB_ROOT });
+    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", relativePath], cwd: WEB_ROOT });
     expect(diff.exitCode).toBe(0);
   });
 });
