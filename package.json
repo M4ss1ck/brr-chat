@@ -7,7 +7,9 @@
     "prepare": "git config core.hooksPath .githooks",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun test",
-    "check": "bun run typecheck && bun test"
+    "check": "bun run typecheck && bun test",
+    "check:all": "bun run check && bun run test:slow",
+    "test:slow": "BRR_SLOW=1 bun test apps/server/test/compile.test.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.0",

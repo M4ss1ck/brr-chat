@@ -2,6 +2,8 @@ node_modules/
 dist/
 *.sqlite
 *.sqlite-*
+brr-chat.db
+brr-chat.db-*
 .env
 .env.*
 docs/plans/

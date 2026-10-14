@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "..", "..", "..");
 const WORKFLOW = join(ROOT, ".github", "workflows", "ci.yml");
+const PACKAGE_JSON = join(ROOT, "package.json");
 const BUDGET_TEST = join(ROOT, "packages", "protocol", "test", "budget.test.ts");
 
 // Explicit file argument only: this never discovers and re-runs ci.test.ts.
@@ -49,6 +50,20 @@ describe("ci workflow", () => {
     const yaml = read();
     expect(yaml).toContain("bun install --frozen-lockfile");
     expect(yaml).toContain("bun run check");
+  });
+});
+
+describe("ci runs the full check:all gate", () => {
+  test("CI invokes check:all, so the slow server tests run too", () => {
+    expect(readFileSync(WORKFLOW, "utf8")).toMatch(/run:\s*bun run check:all\s*$/m);
+  });
+
+  test("check:all chains the fast check with the slow compile test", () => {
+    const scripts = JSON.parse(readFileSync(PACKAGE_JSON, "utf8")).scripts;
+    expect(scripts["check:all"]).toContain("bun run check");
+    expect(scripts["check:all"]).toContain("bun run test:slow");
+    expect(scripts["test:slow"]).toContain("BRR_SLOW=1");
+    expect(scripts["test:slow"]).toContain("apps/server/test/compile.test.ts");
   });
 });
 
