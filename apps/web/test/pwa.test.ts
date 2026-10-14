@@ -1,7 +1,7 @@
 // End-to-end proof for issue #5: the PWA client signs up, signs in, syncs an empty server
 // and lands on cursor 0, against a real server on a real socket, with a byte-counting
 // proxy in between so the wire budget is measured, not estimated.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -80,6 +80,13 @@ async function startWireCounter(): Promise<{ base: string; totals(): number; sto
 }
 
 describe("PWA client (apps/web)", () => {
+  // Bun runs every test file in one process: put the global back when this file is done.
+  const originalIndexedDB = globalThis.indexedDB;
+
+  afterAll(() => {
+    globalThis.indexedDB = originalIndexedDB;
+  });
+
   beforeEach(async () => {
     globalThis.indexedDB = new IDBFactory();
     await startServer();

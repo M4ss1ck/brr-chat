@@ -30,14 +30,20 @@ export interface ServerApp {
  * not sign sessions with a key that is in the source (ADR 0007). An in-memory DB is a test
  * or a one-off, so it gets a random key instead.
  */
+/** BetterAuth needs a key it considers long enough; 32 characters is its own floor. */
+const MIN_SECRET_LENGTH = 32;
+
 function resolveSecret(secret: string | undefined, dbPath: string): string {
   const fromEnv = process.env.BETTER_AUTH_SECRET;
-  if (secret && secret.length > 0) return secret;
-  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  const candidate = secret ?? fromEnv;
+  if (candidate !== undefined && candidate.length >= MIN_SECRET_LENGTH) return candidate;
+  if (candidate !== undefined && candidate.length > 0) {
+    throw new Error(`BETTER_AUTH_SECRET is too short: expected at least ${MIN_SECRET_LENGTH} characters, got ${candidate.length}`);
+  }
   if (dbPath === ":memory:") return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
   throw new Error(
-    "BETTER_AUTH_SECRET is required: the session signing key must not come from a default. " +
-      "Set it to at least 32 random characters (e.g. BETTER_AUTH_SECRET=$(openssl rand -hex 32)).",
+    `BETTER_AUTH_SECRET is required: the session signing key must not come from a default. ` +
+      `Set it to at least ${MIN_SECRET_LENGTH} random characters (e.g. BETTER_AUTH_SECRET=$(openssl rand -hex 32)).`,
   );
 }
 

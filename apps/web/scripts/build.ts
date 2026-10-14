@@ -1,14 +1,11 @@
 // Builds the PWA shell with esbuild and hands it to the server as a generated module, so a
 // compiled binary serves the same shell with no files on disk (issue #5, ADR 0014).
 // Run from apps/web: `bun run build`.
+import { APP_SHELL_BUDGET } from "@brr-chat/protocol";
 import { brotliCompressSync } from "node:zlib";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { build } from "esbuild";
-
-const KB = 1024;
-/** Matches the app shell budget in docs/PROTOCOL.md; the gate lives in test/budget.test.ts. */
-const APP_SHELL_BUDGET = 150 * KB;
 
 const webRoot = join(import.meta.dir, "..");
 const distDir = join(webRoot, "dist");

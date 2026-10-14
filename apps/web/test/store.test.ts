@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import { closeStore, getCursor, getRange, getSession, getStoredCursor, setCursor, setRange, setSession } from "../src/store.ts";
 
@@ -36,6 +36,13 @@ async function rawStore(): Promise<{ put(key: string, value: unknown): Promise<v
 }
 
 describe("store (IndexedDB)", () => {
+  // Bun runs every test file in one process: put the global back when this file is done.
+  const originalIndexedDB = globalThis.indexedDB;
+
+  afterAll(() => {
+    globalThis.indexedDB = originalIndexedDB;
+  });
+
   beforeEach(() => {
     globalThis.indexedDB = new IDBFactory();
   });

@@ -4,8 +4,8 @@ import { describe, expect, test } from "bun:test";
 import { brotliCompressSync } from "node:zlib";
 import { SUPPORTED, Tag, encodeMedia, encodeSyncRequest, encodeSyncResponse, type Event } from "../src/index.ts";
 import { encode } from "../src/cbor.ts";
+import { EMPTY_SYNC_BUDGET, MEDIA_PLACEHOLDER_BUDGET, POSTS_BUDGET } from "../src/budgets.ts";
 
-const KB = 1024;
 const br = (b: Uint8Array) => brotliCompressSync(b).length;
 
 // Deterministic, realistic-ish Spanish/English chat text, 20..220 chars.
@@ -40,7 +40,7 @@ describe("byte budgets", () => {
     const total = req.length + res.length;
     console.log(`empty sync payload: ${req.length} + ${res.length} = ${total} B`);
     // Payload only. HTTP headers and the bearer token are measured in apps/server.
-    expect(total).toBeLessThanOrEqual(1 * KB);
+    expect(total).toBeLessThanOrEqual(EMPTY_SYNC_BUDGET);
     expect(total).toBeLessThanOrEqual(32); // tripwire: any growth here is a design change
   });
 
@@ -50,13 +50,13 @@ describe("byte budgets", () => {
     const bytes = encodeSyncResponse({ range: SUPPORTED, cursor: 1, more: false, events: posts, acks: [], skipped: 0 });
     const overhead = (bytes.length - textBytes) / 100;
     console.log(`100 posts: ${bytes.length} B raw, ${br(bytes)} B brotli, text ${textBytes} B, ${overhead.toFixed(1)} B/post overhead`);
-    expect(bytes.length).toBeLessThanOrEqual(20 * KB);
+    expect(bytes.length).toBeLessThanOrEqual(POSTS_BUDGET);
     expect(overhead).toBeLessThanOrEqual(20); // framing per post: tag+seq+ts+author+scope+text header
   });
 
   test("image placeholder (whole media field, max-size thumbhash) <= 40 B", () => {
     const media = encode(encodeMedia({ id: 4_000_000_000, w: 4096, h: 4096, thumbhash: new Uint8Array(25).fill(255) }));
     console.log(`media placeholder: ${media.length} B`);
-    expect(media.length).toBeLessThanOrEqual(40);
+    expect(media.length).toBeLessThanOrEqual(MEDIA_PLACEHOLDER_BUDGET);
   });
 });

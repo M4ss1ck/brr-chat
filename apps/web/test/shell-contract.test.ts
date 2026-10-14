@@ -8,23 +8,15 @@ import { resolve } from "node:path";
 const WEB_ROOT = resolve(import.meta.dir, "..");
 const DIST = resolve(WEB_ROOT, "dist");
 
-/** Ids main.ts wires up: elements that must exist in the document. */
-const ELEMENT_IDS = [
-  "username",
-  "password",
-  "sign-up",
-  "sign-in",
-  "sign-out",
-  "sync",
-  "signed-out",
-  "signed-in",
-  "account",
-  "token",
-  "cursor",
-  "range",
-  "empty",
-  "status",
-] as const;
+/**
+ * Element ids main.ts asks for. Read out of the source rather than by hand, so adding a
+ * lookup there is covered here without anyone remembering to update a list.
+ */
+function elementIds(): string[] {
+  const source = readFileSync(resolve(WEB_ROOT, "src", "main.ts"), "utf8");
+  const found = [...source.matchAll(/(?:el(?:<[^>]+>)?|setText|show)\(\s*"([a-z-]+)"/g)].map((m) => m[1] ?? "");
+  return [...new Set(found)].sort();
+}
 
 function read(file: string): string {
   return readFileSync(resolve(DIST, file), "utf8");
@@ -40,16 +32,29 @@ describe("shell contract", () => {
     const html = read("index.html");
     expect(html.startsWith("<!doctype html>")).toBe(true);
     expect(html).toContain("</html>");
-    for (const id of ELEMENT_IDS) {
+    const ids = elementIds();
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) {
       expect(html).toContain(`id="${id}"`);
     }
   });
 
-  test("the bundle looks up every element it declares", () => {
+  test("the bundle looks up every element the document declares", () => {
+    const ids = elementIds();
     const bundle = read("app.js");
-    for (const id of ELEMENT_IDS) {
+    for (const id of ids) {
       expect(bundle).toContain(JSON.stringify(id));
     }
+  });
+
+  test("the session token never reaches the document", () => {
+    // The bearer token is held in IndexedDB and put on the wire, never rendered: a shared
+    // phone shows that a session exists, not what it is.
+    const bundle = read("app.js");
+    expect(bundle).toContain(JSON.stringify("32-char bearer token, held on this device only"));
+    const html = read("index.html");
+    expect(html).not.toContain("Bearer ");
+    expect(html).toContain('<dd id="token"></dd>');
   });
 
   test("the document loads the bundle and the manifest, and the service worker path", () => {

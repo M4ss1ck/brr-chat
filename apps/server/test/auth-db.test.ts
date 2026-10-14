@@ -74,6 +74,8 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
 
   test("does not log a false schema mismatch on first boot (ADR 0002)", async () => {
     const dir = makeTempDir();
+    // BetterAuth logs the mismatch through console before we assert on it, so the console is
+    // captured here and restored in the finally below.
     const captured: string[] = [];
     const origError = console.error;
     const origWarn = console.warn;
@@ -104,6 +106,24 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
 
     for (const line of captured) {
       expect(line).not.toMatch(/schema mismatch/i);
+    }
+  });
+
+  test("a real DB refuses to start without a signing key, and rejects a short one (ADR 0007)", async () => {
+    const dir = makeTempDir();
+    const previous = process.env.BETTER_AUTH_SECRET;
+    delete process.env.BETTER_AUTH_SECRET;
+    try {
+      await expect(createApp({ dbPath: join(dir, "chat.db"), host: "chat.local" })).rejects.toThrow(/BETTER_AUTH_SECRET is required/);
+      await expect(createApp({ dbPath: join(dir, "chat.db"), host: "chat.local", secret: "too-short" })).rejects.toThrow(
+        /BETTER_AUTH_SECRET is too short: expected at least 32 characters, got 9/,
+      );
+      // An in-memory DB is a test or a one-off: it draws a random key instead of failing.
+      const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+      app.close();
+    } finally {
+      if (previous !== undefined) process.env.BETTER_AUTH_SECRET = previous;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

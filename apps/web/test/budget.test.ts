@@ -3,12 +3,9 @@
 // embedded shell fails here instead of shipping.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { brotliCompressSync } from "node:zlib";
+import { APP_SHELL_BUDGET } from "@brr-chat/protocol";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-
-const KB = 1024;
-/** docs/PROTOCOL.md: "App shell, compressed | 150 KB". Do not raise without an ADR. */
-const APP_SHELL_BUDGET = 150 * KB;
 
 const WEB_ROOT = resolve(import.meta.dir, "..");
 const DIST = resolve(WEB_ROOT, "dist");
@@ -24,7 +21,10 @@ function buildShell(): void {
 function shellRoutes(): string[] {
   const source = readFileSync(EMBEDDED, "utf8");
   const block = source.slice(source.indexOf("export const SHELL_ROUTES"));
-  return [...block.matchAll(/^ {2}"([^"]+)": "[^"]+",$/gm)].map((m) => m[1] ?? "");
+  const routes = [...block.matchAll(/^ {2}"([^"]+)": "[^"]+",$/gm)].map((m) => m[1] ?? "");
+  // An empty list would make the route checks below pass on nothing, so it must not be empty.
+  expect(routes.length).toBeGreaterThan(0);
+  return routes;
 }
 
 describe("app shell budget", () => {
@@ -59,20 +59,24 @@ describe("app shell budget", () => {
   test("every shell route the server serves is precached by the service worker", () => {
     const sw = readFileSync(resolve(DIST, "sw.js"), "utf8");
     for (const route of shellRoutes()) {
+      // "/" is a navigation target, answered from the cached document by the navigation branch.
       if (route === "/") continue;
-      // "/" is a navigation target, served from the cache by the navigation branch.
       expect(sw).toContain(JSON.stringify(route));
     }
   });
 
   test("the embedded shell the server embeds matches this build", () => {
-    const generated = "../server/src/pwa-assets.generated.ts";
-    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", generated], cwd: WEB_ROOT });
-    if (tracked.exitCode === null) return; // no git available: freshness cannot be checked here
+    const generated = resolve(WEB_ROOT, "..", "server", "src", "pwa-assets.generated.ts");
+    if (Bun.which("git") === null) {
+      console.log("git is unavailable: the embedded shell freshness check is skipped");
+      return;
+    }
+    const relative = generated.slice(WEB_ROOT.length + 1);
+    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", relative], cwd: WEB_ROOT });
     expect(tracked.exitCode).toBe(0);
 
-    // Against HEAD, not the index: a shell that was built but never staged fails too.
-    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", generated], cwd: WEB_ROOT });
+    // Against HEAD, not the index: a shell that was built but never committed fails too.
+    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", relative], cwd: WEB_ROOT });
     expect(diff.exitCode).toBe(0);
   });
 });

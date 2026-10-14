@@ -45,7 +45,9 @@ scope.addEventListener("fetch", (event) => {
 
   // Navigations: network first, so a new shell shows up as soon as it is deployed.
   if (request.mode === "navigate") {
-    event.respondWith(fetch(request).catch(async () => (await caches.match("/index.html")) ?? Response.error()));
+    // Both "/" and "/index.html" are in the precache list; either one is the same document.
+    const offlineFallback = async () => (await caches.match("/index.html")) ?? (await caches.match("/")) ?? Response.error();
+    event.respondWith(fetch(request).catch(offlineFallback));
     return;
   }
 

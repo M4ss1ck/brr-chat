@@ -8,13 +8,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { request } from "node:http";
-import { decodeSyncResponse, encodeSyncRequest } from "@brr-chat/protocol";
+import { APP_SHELL_BUDGET, EMPTY_SYNC_BUDGET, decodeSyncResponse, encodeSyncRequest } from "@brr-chat/protocol";
 
 const SERVER_ROOT = resolve(import.meta.dir, "..");
 const KB = 1024;
 const SECRET = "compile-test-secret-0123456789abcdef0123456789abcdef";
-/** docs/PROTOCOL.md: the app shell budget, on the bytes a metered connection pays for. */
-const APP_SHELL_BUDGET = 150 * KB;
 
 interface Binary {
   proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -23,24 +21,20 @@ interface Binary {
   stop(): Promise<void>;
 }
 
-function waitFor(fn: () => boolean, timeoutMs = 15_000, stepMs = 25): Promise<void> {
+/** Waits until the compiled server prints its listening line, or gives up. */
+function waitForListening(check: () => boolean, timeoutMs = 15_000): Promise<void> {
   return new Promise((resolve_, reject) => {
     const started = Date.now();
     const tick = () => {
-      try {
-        if (fn()) {
-          resolve_();
-          return;
-        }
-      } catch (err) {
-        reject(err);
+      if (check()) {
+        resolve_();
         return;
       }
       if (Date.now() - started > timeoutMs) {
         reject(new Error("timed out waiting for the compiled server"));
         return;
       }
-      setTimeout(tick, stepMs);
+      setTimeout(tick, 25);
     };
     tick();
   });
@@ -79,7 +73,7 @@ async function startCompiled(dir: string, cwd: string): Promise<Binary> {
   void drain(proc.stdout);
   void drain(proc.stderr);
 
-  await waitFor(() => output.join("\n").includes("listening on"));
+  await waitForListening(() => output.join("\n").includes("listening on"));
   const port = Number(/listening on http:\/\/[^:]+:(\d+)/.exec(output.join("\n"))?.[1]);
   expect(Number.isInteger(port)).toBe(true);
 
@@ -229,7 +223,7 @@ describe("compiled single binary", () => {
       expect(decoded.events).toEqual([]);
       expect(decoded.error).toBeUndefined();
       console.log(`compiled binary empty /sync wire bytes: ${synced.wireBytes} B of ${KB} B budget`);
-      expect(synced.wireBytes).toBeLessThanOrEqual(KB);
+      expect(synced.wireBytes).toBeLessThanOrEqual(EMPTY_SYNC_BUDGET);
 
       // An out-of-range version is answered instead of being parsed: trailing fields no
       // longer known to the client (ADR 0004).
