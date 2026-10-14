@@ -12,19 +12,18 @@ const WORKFLOW = join(ROOT, ".github", "workflows", "ci.yml");
 const BUDGET_TEST = join(ROOT, "packages", "protocol", "test", "budget.test.ts");
 
 // Explicit file argument only: this never discovers and re-runs ci.test.ts.
-function runTest(file: string): { exitCode: number; stdout: string; stderr: string } {
+function runTest(file: string): { exitCode: number; stdout: string } {
   const proc = Bun.spawnSync({ cmd: ["bun", "test", file], cwd: ROOT, stdout: "pipe", stderr: "pipe" });
   return {
     exitCode: proc.exitCode,
     stdout: proc.stdout.toString(),
-    stderr: proc.stderr.toString(),
   };
 }
 
 describe("bun version pin", () => {
-  test(".bun-version pins Bun 1.4.0", () => {
+  test(".bun-version pins a semver 1.4.x release per ADR 0002", () => {
     const pinned = readFileSync(join(ROOT, ".bun-version"), "utf8").trim();
-    expect(pinned).toBe("1.4.0");
+    expect(pinned).toMatch(/^1\.4\.\d+$/);
   });
 });
 
