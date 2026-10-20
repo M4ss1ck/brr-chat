@@ -5,6 +5,7 @@ import {
   applyEvents,
   closeStore,
   enqueueOp,
+  getBans,
   getCursor,
   getDmMessages,
   getDmScopes,
@@ -287,6 +288,50 @@ describe("store (IndexedDB)", () => {
     expect(await getGroups("alice")).toEqual([]);
   });
 
+  test("a group ban removes the member and records the ban", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.GroupMeta, seq: 50, ts: 500, author: 1, scope: 50, name: "G", about: "", open: true },
+      { tag: Tag.Membership, seq: 51, ts: 501, author: 1, scope: 50, user: 1, role: Role.Owner },
+      { tag: Tag.Membership, seq: 52, ts: 502, author: 2, scope: 50, user: 2, role: Role.Member },
+      { tag: Tag.Ban, seq: 53, ts: 503, author: 1, scope: 50, user: 2, on: true },
+    ]);
+    expect(await getMembers("alice", 50)).toEqual([{ group: 50, user: 1, role: Role.Owner, seq: 51 }]);
+    expect(await getBans("alice", 50)).toEqual([{ group: 50, user: 2, banned: true, seq: 53 }]);
+
+    // Unban keeps the row but no longer lists the account as banned.
+    await applyEvents("alice", [{ tag: Tag.Ban, seq: 54, ts: 504, author: 1, scope: 50, user: 2, on: false }]);
+    expect(await getBans("alice", 50)).toEqual([]);
+  });
+
+  test("a ban's scope_left purge clears the banned client's posts and group cache", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.GroupMeta, seq: 60, ts: 600, author: 1, scope: 60, name: "Gone", about: "", open: false },
+      { tag: Tag.Membership, seq: 61, ts: 601, author: 2, scope: 60, user: 2, role: Role.Owner },
+      { tag: Tag.Post, seq: 62, ts: 602, author: 2, scope: 60, text: "cached", media: null },
+      { tag: Tag.Ban, seq: 63, ts: 603, author: 1, scope: 60, user: 2, on: true },
+      { tag: Tag.ScopeLeft, seq: 64, ts: 604, author: 0, scope: 60, purge: true },
+    ]);
+    expect(await getPosts("alice", 60)).toEqual([]);
+    expect(await getMembers("alice", 60)).toEqual([]);
+    expect(await getBans("alice", 60)).toEqual([]);
+    expect(await getGroups("alice")).toEqual([]);
+  });
+
+  test("a delete removes the target post and its reactions", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.Post, seq: 70, ts: 700, author: 1, scope: 10, text: "parent", media: null },
+      { tag: Tag.Reply, seq: 71, ts: 701, author: 2, scope: 10, parent: 70, text: "child", media: null },
+      { tag: Tag.Reaction, seq: 72, ts: 702, author: 2, scope: 10, target: 70, emoji: 1, on: true },
+      { tag: Tag.Reaction, seq: 73, ts: 703, author: 2, scope: 10, target: 71, emoji: 1, on: true },
+      { tag: Tag.Delete, seq: 74, ts: 704, author: 1, scope: 10, target: 70 },
+      { tag: Tag.Post, seq: 75, ts: 705, author: 1, scope: 10, text: "still here", media: null },
+    ]);
+    expect(await getPosts("alice", 10)).toEqual([
+      { seq: 75, ts: 705, author: 1, scope: 10, text: "still here", parent: 0 },
+    ]);
+    expect(await getReactions("alice", 10)).toEqual([]);
+  });
+
   test("self is scoped to the account and rejected when it is not a positive uint", async () => {
     expect(await getSelf("alice")).toBeNull();
     await setSelf("alice", 7);
@@ -332,6 +377,14 @@ describe("store (IndexedDB)", () => {
     expect(toWireOp(reply)).toMatchObject({ tag: Tag.Reply, scope: 5, parent: 9, text: "re", media: null });
     expect(toWireOp(reaction)).toMatchObject({ tag: Tag.Reaction, scope: 5, target: 9, emoji: 7, on: false });
     expect(new Uint8Array(toWireOp(reaction).cid)).toEqual(new Uint8Array(reaction.cid));
+  });
+
+  test("the outbox round-trips a delete and a ban", async () => {
+    const remove = await enqueueOp("alice", { tag: Tag.Delete, scope: 5, target: 9 });
+    const ban = await enqueueOp("alice", { tag: Tag.Ban, scope: 5, user: 2, on: true });
+    expect(toWireOp(remove)).toMatchObject({ tag: Tag.Delete, scope: 5, target: 9 });
+    expect(toWireOp(ban)).toMatchObject({ tag: Tag.Ban, scope: 5, user: 2, on: true });
+    expect(new Uint8Array(toWireOp(ban).cid)).toEqual(new Uint8Array(ban.cid));
   });
 
   test("a corrupt group row reads back as absent", async () => {

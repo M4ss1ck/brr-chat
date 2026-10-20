@@ -13,6 +13,7 @@ const KEY_RANGE = "range";
 const postsKey = (username: string, scope: number): string => `posts:${username}:${scope}`;
 const membersKey = (username: string, scope: number): string => `members:${username}:${scope}`;
 const reactionsKey = (username: string, scope: number): string => `reactions:${username}:${scope}`;
+const bansKey = (username: string, scope: number): string => `bans:${username}:${scope}`;
 const outboxKey = (username: string): string => `outbox:${username}`;
 const cursorKey = (username: string): string => `cursor:${username}`;
 const groupsKey = (username: string): string => `groups:${username}`;
@@ -237,6 +238,14 @@ export interface StoredMember {
   seq: number;
 }
 
+/** Current ban state for one account in one group. Unbans keep the row with `banned = false`. */
+export interface StoredBan {
+  group: number;
+  user: number;
+  banned: boolean;
+  seq: number;
+}
+
 /** A DM conversation. `a` is the opener (event author) and `b` the peer it was opened with. */
 export interface StoredDm {
   id: number;
@@ -300,6 +309,13 @@ function asMember(value: unknown): StoredMember | null {
   return { group: row.group, user: row.user, role: row.role, seq: row.seq };
 }
 
+function asBan(value: unknown): StoredBan | null {
+  const row = asObject(value);
+  if (!isUint(row.group) || row.group === 0 || !isUint(row.user) || row.user === 0) return null;
+  if (typeof row.banned !== "boolean" || !isUint(row.seq) || row.seq === 0) return null;
+  return { group: row.group, user: row.user, banned: row.banned, seq: row.seq };
+}
+
 function asProfile(value: unknown): StoredProfile | null {
   const row = asObject(value);
   if (!isUint(row.user) || row.user === 0 || !isUint(row.seq) || row.seq === 0) return null;
@@ -331,15 +347,18 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   const posts = new Map<number, Record<string, StoredPost>>();
   const members = new Map<number, Record<string, StoredMember>>();
   const reactions = new Map<number, Record<string, StoredReaction>>();
+  const bans = new Map<number, Record<string, StoredBan>>();
   for (const scope of scopes) {
     posts.set(scope, await readMap(postsKey(username, scope), asPost));
     members.set(scope, await readMap(membersKey(username, scope), asMember));
     reactions.set(scope, await readMap(reactionsKey(username, scope), asReaction));
+    bans.set(scope, await readMap(bansKey(username, scope), asBan));
   }
 
   const touchedPosts = new Set<number>();
   const touchedMembers = new Set<number>();
   const touchedReactions = new Set<number>();
+  const touchedBans = new Set<number>();
   let touchedDms = false;
 
   for (const event of events) {
@@ -405,6 +424,43 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
         touchedReactions.add(event.scope);
         break;
       }
+      case Tag.Delete: {
+        // One level, like replies: deleting a root post takes its direct replies with it.
+        const removed = new Set<number>([event.target]);
+        const postMap = posts.get(event.scope);
+        if (postMap) {
+          for (const row of Object.values(postMap)) {
+            if (row.parent === event.target) removed.add(row.seq);
+          }
+          for (const seq of removed) delete postMap[String(seq)];
+        }
+        const reactionMap = reactions.get(event.scope);
+        if (reactionMap) {
+          for (const [key, row] of Object.entries(reactionMap)) {
+            if (removed.has(row.target)) delete reactionMap[key];
+          }
+        }
+        touchedPosts.add(event.scope);
+        touchedReactions.add(event.scope);
+        break;
+      }
+      case Tag.Ban: {
+        // A server-wide ban is about the account, not this group cache.
+        if (event.scope === 0) break;
+        const map = bans.get(event.scope);
+        if (!map) break;
+        const key = String(event.user);
+        const prior = map[key];
+        if (prior && prior.seq > event.seq) break;
+        map[key] = { group: event.scope, user: event.user, banned: event.on, seq: event.seq };
+        if (event.on) {
+          const memberMap = members.get(event.scope);
+          if (memberMap) delete memberMap[key];
+          touchedMembers.add(event.scope);
+        }
+        touchedBans.add(event.scope);
+        break;
+      }
       case Tag.Profile:
         profiles[String(event.author)] = {
           user: event.author,
@@ -422,6 +478,8 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           if (memberMap) for (const key of Object.keys(memberMap)) delete memberMap[key];
           const reactionMap = reactions.get(event.scope);
           if (reactionMap) for (const key of Object.keys(reactionMap)) delete reactionMap[key];
+          const banMap = bans.get(event.scope);
+          if (banMap) for (const key of Object.keys(banMap)) delete banMap[key];
           if (groups[String(event.scope)]?.open !== true) delete groups[String(event.scope)];
           if (dms[String(event.scope)]) {
             delete dms[String(event.scope)];
@@ -430,6 +488,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           touchedPosts.add(event.scope);
           touchedMembers.add(event.scope);
           touchedReactions.add(event.scope);
+          touchedBans.add(event.scope);
         }
         break;
       default:
@@ -443,6 +502,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   for (const scope of touchedPosts) writes.push(write(postsKey(username, scope), posts.get(scope) ?? {}));
   for (const scope of touchedMembers) writes.push(write(membersKey(username, scope), members.get(scope) ?? {}));
   for (const scope of touchedReactions) writes.push(write(reactionsKey(username, scope), reactions.get(scope) ?? {}));
+  for (const scope of touchedBans) writes.push(write(bansKey(username, scope), bans.get(scope) ?? {}));
   await Promise.all(writes);
 }
 
@@ -524,6 +584,13 @@ export async function getDmMessages(username: string, scope: number): Promise<St
 
 export async function getMembers(username: string, scope: number): Promise<StoredMember[]> {
   return Object.values(await readMap(membersKey(username, scope), asMember)).sort((a, b) => a.user - b.user);
+}
+
+/** Accounts currently banned from one group. Unban rows are kept but filtered out here. */
+export async function getBans(username: string, scope: number): Promise<StoredBan[]> {
+  return Object.values(await readMap(bansKey(username, scope), asBan))
+    .filter((row) => row.banned)
+    .sort((a, b) => a.seq - b.seq);
 }
 
 export async function getProfiles(username: string): Promise<Map<number, StoredProfile>> {
@@ -647,6 +714,10 @@ export function toWireOp(op: StoredOp): Op {
         emoji: op.emoji ?? 0,
         on: op.on === true,
       };
+    case Tag.Delete:
+      return { cid, tag: Tag.Delete, scope: op.scope, target: op.target ?? 0 };
+    case Tag.Ban:
+      return { cid, tag: Tag.Ban, scope: op.scope, user: op.user ?? 0, on: op.on === true };
     case Tag.Dm:
       return {
         cid,

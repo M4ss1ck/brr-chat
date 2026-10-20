@@ -21,13 +21,17 @@ changing the v1 wire format (ADR 0004).
   which immediately invalidates the old link while keeping existing members in the group.
 - Moderation and single owner: group admins and the owner can delete any post in the group
   (`delete` op, tag 5) and ban or unban members (`ban` op, tag 10, which kicks the user, sends
-  `scope_left` with `purge = true`, and blocks rejoin). Every group has at most one owner at any
-  time. Only the owner can promote or demote group admins and transfer ownership (sending a
-  `membership` op with `role = 3` promotes the target to owner and demotes the previous owner to
-  group admin in the same transaction).
+  `scope_left` with `purge = true`, and blocks rejoin). A group admin moderates plain members;
+  only the owner can ban another group admin, and nobody can group-ban the owner. Every group has
+  at most one owner at any time. Only the owner can promote or demote group admins and transfer
+  ownership (sending a `membership` op with `role = 3` promotes the target to owner and demotes
+  the previous owner to group admin in the same transaction; the target's owner event is written
+  first, then the old owner's admin event, so a commit that sees either sees both).
 - Auto-succession: if a group's owner is banned server-wide (or leaves without transferring),
   ownership passes automatically to the longest-serving group admin; if the group has no group
-  admins, ownership falls back to a server admin.
+  admins, ownership falls back to a server admin. A server ban removes every group membership
+  the account holds (passing owned groups on), so lifting the ban restores no group powers
+  without a new join.
 
 ## Consequences
 - Every group always has an accountable owner without requiring server-admin intervention when an

@@ -9,6 +9,7 @@ import { qrSvg } from "./qr.ts";
 import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import {
   enqueueOp,
+  getBans,
   getCursor,
   getDmScopes,
   getGroups,
@@ -26,8 +27,10 @@ import {
   tallyReactions,
   toWireOp,
   type ReactionTally,
+  type StoredBan,
   type StoredDm,
   type StoredGroup,
+  type StoredMember,
   type StoredPost,
   type StoredProfile,
 } from "./store.ts";
@@ -57,6 +60,10 @@ function inviteTokenFromLocation(): string | null {
 interface ViewContext {
   profiles: Map<number, StoredProfile>;
   reactions: Map<number, ReactionTally[]>;
+  /** This account's wire id, so it can delete its own posts without being an admin. */
+  self: number | null;
+  /** This account's role in the open group; Role.None in a DM. */
+  role: number;
 }
 
 function el<T extends HTMLElement>(id: string): T | null {
@@ -267,6 +274,15 @@ function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] 
       });
       actions.append(reply);
     }
+    // The author can always delete; in a group, a group admin or the owner can too.
+    if (context.role >= Role.Admin || (context.self !== null && context.self === post.author)) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "delete";
+      remove.textContent = "Delete";
+      remove.addEventListener("click", () => void deletePost(post));
+      actions.append(remove);
+    }
     body.append(actions);
   }
   if (replies.length > 0) {
@@ -296,6 +312,82 @@ function cancelReply(): void {
   setText("reply-label", "");
 }
 
+async function setMemberRole(user: number, role: number): Promise<void> {
+  const session = await getSession();
+  const scope = currentGroup;
+  if (!session || scope === null) return;
+  await enqueueOp(session.username, { tag: Tag.Membership, scope, user, role });
+  await syncNow();
+}
+
+async function setMemberBan(user: number, on: boolean): Promise<void> {
+  const session = await getSession();
+  const scope = currentGroup;
+  if (!session || scope === null) return;
+  await enqueueOp(session.username, { tag: Tag.Ban, scope, user, on });
+  await syncNow();
+}
+
+async function deletePost(post: StoredPost): Promise<void> {
+  const session = await getSession();
+  if (!session) return;
+  await enqueueOp(session.username, { tag: Tag.Delete, scope: post.scope, target: post.seq });
+  await syncNow();
+}
+
+function memberItem(
+  member: StoredMember,
+  name: string,
+  myRole: number,
+  self: number | null,
+): HTMLLIElement {
+  const item = document.createElement("li");
+  const label = document.createElement("span");
+  const roleName = member.role === Role.Owner ? "owner" : member.role === Role.Admin ? "group admin" : "member";
+  label.textContent = `${name} · ${roleName}`;
+  item.append(label);
+
+  // The owner changes roles; admins moderate plain members. Nobody changes the owner here.
+  if (self !== null && member.user !== self && member.role !== Role.Owner) {
+    if (myRole === Role.Owner) {
+      const toggleRole = document.createElement("button");
+      toggleRole.type = "button";
+      toggleRole.textContent = member.role === Role.Admin ? "Demote" : "Make admin";
+      toggleRole.addEventListener("click", () =>
+        void setMemberRole(member.user, member.role === Role.Admin ? Role.Member : Role.Admin),
+      );
+      const transfer = document.createElement("button");
+      transfer.type = "button";
+      transfer.textContent = "Make owner";
+      transfer.addEventListener("click", () => void setMemberRole(member.user, Role.Owner));
+      item.append(toggleRole, transfer);
+    }
+    if (myRole >= Role.Admin && (myRole === Role.Owner || member.role === Role.Member)) {
+      const ban = document.createElement("button");
+      ban.type = "button";
+      ban.textContent = "Ban";
+      ban.addEventListener("click", () => void setMemberBan(member.user, true));
+      item.append(ban);
+    }
+  }
+  return item;
+}
+
+function banItem(ban: StoredBan, name: string, myRole: number): HTMLLIElement {
+  const item = document.createElement("li");
+  const label = document.createElement("span");
+  label.textContent = `${name} · banned`;
+  item.append(label);
+  if (myRole >= Role.Admin) {
+    const unban = document.createElement("button");
+    unban.type = "button";
+    unban.textContent = "Unban";
+    unban.addEventListener("click", () => void setMemberBan(ban.user, false));
+    item.append(unban);
+  }
+  return item;
+}
+
 async function renderGroup(): Promise<void> {
   const view = el("group-view");
   if (!view) return;
@@ -314,9 +406,41 @@ async function renderGroup(): Promise<void> {
   setText("group-members", `${members.length} ${members.length === 1 ? "member" : "members"}`);
 
   const self = await getSelf(session.username);
+  const profiles = await getProfiles(session.username);
+  const myRole = members.find((member) => member.user === self)?.role ?? Role.None;
+  const memberList = el("member-list");
+  if (memberList) {
+    memberList.replaceChildren(
+      ...members.map((member) =>
+        memberItem(
+          member,
+          profiles.get(member.user)?.displayName || profiles.get(member.user)?.username || `user #${member.user}`,
+          myRole,
+          self,
+        ),
+      ),
+    );
+  }
+  const bans = await getBans(session.username, group.id);
+  const bannedList = el("banned-list");
+  if (bannedList) {
+    bannedList.replaceChildren(
+      ...bans.map((ban) =>
+        banItem(
+          ban,
+          profiles.get(ban.user)?.displayName || profiles.get(ban.user)?.username || `user #${ban.user}`,
+          myRole,
+        ),
+      ),
+    );
+  }
+  show("banned-label", bans.length > 0);
+
   const context: ViewContext = {
-    profiles: await getProfiles(session.username),
+    profiles,
     reactions: tallyReactions(await getReactions(session.username, group.id), self),
+    self,
+    role: myRole,
   };
   const posts = await getPosts(session.username, group.id);
   const roots = posts.filter((post) => post.parent === 0);
@@ -488,7 +612,8 @@ async function renderDm(): Promise<void> {
   show("dm-view", true);
   setText("dm-title", `Direct message · ${name}`);
 
-  const context: ViewContext = { profiles, reactions: new Map() };
+  const self = await getSelf(session.username);
+  const context: ViewContext = { profiles, reactions: new Map(), self, role: Role.None };
   const messages = scope === null ? [] : await getPosts(session.username, scope);
   const list = el("dm-messages");
   if (list) list.replaceChildren(...messages.map((message) => postItem(message, context, [], false)));
@@ -520,7 +645,7 @@ function explainAck(error: number): string {
     case 1:
       return "This server does not support that action yet.";
     case 2:
-      return "Not allowed. Creating a group needs an account at least 24 hours old; posting needs membership.";
+      return "Not allowed. Creating a group needs an account at least 24 hours old; posting and moderation need the right role in the group.";
     case 3:
       return "The server rejected that request as invalid.";
     case 4:

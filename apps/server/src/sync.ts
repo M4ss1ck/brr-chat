@@ -12,7 +12,15 @@ import {
   type SyncResponse,
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
-import { actorFor, applyOutbox, mergeEvents, stateEvents, visibleEvents, visibleFrom } from "./events.ts";
+import {
+  actorFor,
+  applyOutbox,
+  mergeEvents,
+  moderationDeltas,
+  stateEvents,
+  visibleEvents,
+  visibleFrom,
+} from "./events.ts";
 import type { AuthInstance } from "./index.ts";
 import { isRecoveryConfirmed } from "./recovery.ts";
 
@@ -86,10 +94,15 @@ export async function handleSync(req: Request, db: Database, auth: AuthInstance)
   if (decoded.cursor === 0 || applied.state) {
     // Fresh device or a join/create in this batch: current state (profiles, groups, DM scopes)
     // and the head, never old posts or DM messages (ADR 0009). Events created by this batch
-    // still come back, so the actor sees what it just did.
+    // still come back, so the actor sees what it just did. Moderation tombstones since the
+    // old cursor ride along, because a state snapshot cannot express "this is gone".
     const fresh = applied.firstSeq === null ? [] : visibleFrom(db, actor.wireId, applied.firstSeq);
-    events = mergeEvents(stateEvents(db, actor.wireId), fresh);
-    cursor = headCursor(db);
+    const deltas = moderationDeltas(db, actor.wireId, decoded.cursor);
+    events = mergeEvents(stateEvents(db, actor.wireId), deltas.events, fresh);
+    // Keep the cursor at the last delivered delta when more remain; jumping to the head
+    // would silently drop the rest. The next call is a normal paged catch-up.
+    cursor = deltas.more ? deltas.cursor : headCursor(db);
+    more = deltas.more;
   } else {
     const page = visibleEvents(db, actor.wireId, decoded.cursor);
     events = page.events;

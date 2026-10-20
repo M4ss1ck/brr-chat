@@ -47,6 +47,42 @@ CREATE TABLE IF NOT EXISTS group_members (
 )
 `.trim();
 
+// Current ban state per group and user. `banned` flips to 0 on unban instead of deleting the
+// row, so an unban has an event seq to answer with. A banned user cannot join the group
+// (ADR 0010).
+const CREATE_GROUP_BANS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS group_bans (
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  banned INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (group_id, user_id)
+)
+`.trim();
+
+// Deleted posts and replies. The log stays append-only, but this small map lets a reply or
+// reaction reject a target that was already deleted without decoding every delete event.
+const CREATE_DELETED_EVENTS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS deleted_events (
+  scope INTEGER NOT NULL,
+  target INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (scope, target)
+)
+`.trim();
+
+// A user who lost a scope needs the server-generated `scope_left` event even though they are
+// no longer a member, so normal visibility cannot find it. This small map is the one exception:
+// event seq -> the one viewer allowed to see it (ADR 0010).
+const CREATE_SCOPE_LEFTS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS scope_lefts (
+  user_id INTEGER NOT NULL,
+  scope INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (user_id, scope)
+)
+`.trim();
+
 // A DM scope is the unordered pair of its two participants. Its id is the seq of the
 // `dm_scope` event that created it (ADR 0015), so one log position names the conversation.
 // The unique pair index is what makes two concurrent first messages create exactly one scope.
@@ -119,6 +155,9 @@ export function openDb(dbPath: string): Database {
     db.exec("ALTER TABLE chat_groups ADD COLUMN invite_token TEXT;");
   }
   db.exec(CREATE_GROUP_MEMBERS_TABLE_SQL);
+  db.exec(CREATE_GROUP_BANS_TABLE_SQL);
+  db.exec(CREATE_DELETED_EVENTS_TABLE_SQL);
+  db.exec(CREATE_SCOPE_LEFTS_TABLE_SQL);
   db.exec(CREATE_DM_SCOPES_TABLE_SQL);
   db.exec(CREATE_OUTBOX_TABLE_SQL);
   db.exec("CREATE INDEX IF NOT EXISTS events_scope_seq ON events(scope, seq);");
