@@ -125,6 +125,40 @@ All four require a bearer session. A group admin or owner may read or rotate; a 
 gets `403`; a non-member gets `404` for a group they cannot see, and an unknown or rotated
 token gets `404`.
 
+## Server administration
+
+Registration is server policy, not a group rule (ADR 0012, ADR 0017). It is read on every
+signup, so a change takes effect immediately.
+
+- `open` admits anyone, `invite` requires the current server invite token, and `closed` admits
+  nobody. The independent `frozen` switch rejects every signup regardless of mode.
+- `GET /api/server/registration` is public and returns `{ mode, frozen }`, so a sign-in screen
+  can explain why signup is unavailable.
+- `GET /api/server/settings` returns `{ mode, frozen, admin, invite }` to a signed-in account.
+  `invite` is `{ token, link, qr }` for a server admin and `null` for everyone else.
+- `POST /api/server/settings` (server admin) changes `mode` and/or `frozen`.
+- `POST /api/server/invite/rotate` (server admin) replaces the live server invite and returns
+  the same settings shape. The old link stops working before the response. Selecting `invite`
+  mode issues a link when the server has none yet.
+- `GET /api/server/users` (server admin) returns every account with the wire id a server ban
+  needs: `{ users: [ { user, username, banned, admin } ] }`. An account that has never synced
+  gets a wire id at this point, so it can still be banned.
+
+The BetterAuth admin plugin's own `/api/auth/admin/*` routes are not exposed; registration and
+bans have exactly one path, described here.
+
+A server invite is an ordinary URL, `/signup/<token>`. The app shell answers that path, reads
+the token from it, and sends it as the optional `invite` field in the signup JSON body. The
+token is a capability and never enters the event log. It is consumed by the recovery service
+before the body is forwarded to BetterAuth.
+
+A server ban (`ban` op with `scope = 0`) revokes every session for the account in the same
+transaction, removes every group membership (handing owned groups on per ADR 0010), and records
+`scope_left` with `purge = true` for every group and DM scope the account was in. DM scope rows
+stay, so the other participant keeps their side of the history. A banned account cannot sign
+in, redeem a recovery code, or sync until an admin lifts the ban; lifting it clears the pending
+DM purges (a DM has no join) but not the revoked sessions or the old group roles.
+
 ## Events
 
 ```
@@ -150,7 +184,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 7 | *reserved* | | | never reuse |
 | 8 | group_meta | `name, about, open: bool` | yes | op with `scope = 0` creates a group |
 | 9 | membership | `user: uint, role: uint 0..3, ? invite: text` | yes | 0 none (left), 1 member, 2 group admin (`Role.Admin`), 3 owner (`Role.Owner`). `invite` exists only in an **op**, never in an event: it is the current token for an invite-only group's link |
-| 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), else group ban (group admin or owner) |
+| 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), which revokes sessions and purges every group and DM scope; else group ban (group admin or owner) |
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
 | 13 | dm_scope | `peer: uint` | no | server-generated when a DM is first opened; `scope` is the new DM id |

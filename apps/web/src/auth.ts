@@ -73,9 +73,11 @@ async function exchange(
 /**
  * Create an account. The server also returns the one recovery code it will ever show; the
  * session stays pending until the last group is typed back, so the caller must confirm.
+ * `invite` is the server invite token on an invite-only server (ADR 0012).
  */
-export function signUp(base: string, username: string, password: string): Promise<Exchange> {
-  return exchange(base, SIGN_UP_PATH, { username, password }, username, { pending: true });
+export function signUp(base: string, username: string, password: string, invite?: string): Promise<Exchange> {
+  const body = invite === undefined || invite.length === 0 ? { username, password } : { username, password, invite };
+  return exchange(base, SIGN_UP_PATH, body, username, { pending: true });
 }
 
 /** Username + password sign-in on the same device, returning the stored session. */
