@@ -3,42 +3,123 @@
 import { getSession, setSession, type Session } from "./store.ts";
 
 
-export const SIGN_UP_PATH = "/api/auth/sign-up/email";
+export const SIGN_UP_PATH = "/api/recovery/sign-up";
 export const SIGN_IN_PATH = "/api/auth/sign-in/username";
 export const SIGN_OUT_PATH = "/api/auth/sign-out";
+export const CONFIRM_PATH = "/api/recovery/confirm";
+export const REGENERATE_PATH = "/api/recovery/regenerate";
+export const REDEEM_PATH = "/api/recovery/redeem";
+export const STATUS_PATH = "/api/recovery/status";
 
 interface AuthPayload {
   token?: unknown;
   user?: { username?: unknown } | null;
+  recoveryCode?: unknown;
+  error?: unknown;
 }
 
-async function postCredentials(base: string, path: string, username: string, password: string): Promise<Session> {
-  const res = await fetch(`${base}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
+interface Exchange {
+  session: Session;
+  recoveryCode: string;
+}
+
+async function postJson(
+  base: string,
+  path: string,
+  body: unknown,
+  token?: string,
+): Promise<{ res: Response; payload: AuthPayload | null }> {
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
+  if (token !== undefined) headers.Authorization = bearerHeader(token);
+  const res = await fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
   const payload = (await res.json().catch(() => null)) as AuthPayload | null;
+  return { res, payload };
+}
+
+function failure(res: Response, payload: AuthPayload | null, path: string): Error {
+  const detail = typeof payload?.error === "string" && payload.error.length > 0 ? payload.error : `status ${res.status}`;
+  return new Error(`${path}: ${detail}`);
+}
+
+function codeFrom(payload: AuthPayload | null, res: Response, path: string): string {
+  if (!res.ok) throw failure(res, payload, path);
+  const code = typeof payload?.recoveryCode === "string" ? payload.recoveryCode : "";
+  if (code.length === 0) throw new Error(`${path}: the server returned no recovery code`);
+  return code;
+}
+
+function sessionFrom(payload: AuthPayload | null, res: Response, path: string, username: string): Session {
+  if (!res.ok) throw failure(res, payload, path);
   const token = typeof payload?.token === "string" ? payload.token : "";
-  if (!res.ok || token.length === 0) {
-    throw new Error(`${path} failed with status ${res.status}`);
-  }
-  const session: Session = {
-    token,
-    username: typeof payload?.user?.username === "string" ? payload.user.username : username,
-  };
+  if (token.length === 0) throw new Error(`${path}: the server returned no session token`);
+  return { token, username: typeof payload?.user?.username === "string" ? payload.user.username : username };
+}
+
+async function exchange(
+  base: string,
+  path: string,
+  body: unknown,
+  username: string,
+  options: { token?: string; pending?: boolean } = {},
+): Promise<Exchange> {
+  const { res, payload } = await postJson(base, path, body, options.token);
+  const session = sessionFrom(payload, res, path, username);
+  const recoveryCode = codeFrom(payload, res, path);
+  if (options.pending === true) session.recoveryPending = true;
+  await setSession(session);
+  return { session, recoveryCode };
+}
+
+/**
+ * Create an account. The server also returns the one recovery code it will ever show; the
+ * session stays pending until the last group is typed back, so the caller must confirm.
+ */
+export function signUp(base: string, username: string, password: string): Promise<Exchange> {
+  return exchange(base, SIGN_UP_PATH, { username, password }, username, { pending: true });
+}
+
+/** Username + password sign-in on the same device, returning the stored session. */
+export async function signIn(base: string, username: string, password: string): Promise<Session> {
+  const { res, payload } = await postJson(base, SIGN_IN_PATH, { username, password });
+  const session = sessionFrom(payload, res, SIGN_IN_PATH, username);
+  // A signup that never finished can still be signed in to; say so, so the UI asks for the
+  // type-back instead of hiding it behind a sync that always 403s.
+  if (!(await recoveryConfirmed(base, session.token))) session.recoveryPending = true;
   await setSession(session);
   return session;
 }
 
-/** Username + password sign-up. The server fills the placeholder email (ADR 0002). */
-export function signUp(base: string, username: string, password: string): Promise<Session> {
-  return postCredentials(base, SIGN_UP_PATH, username, password);
+/** True unless the server says otherwise; a failed check must not block signing in. */
+async function recoveryConfirmed(base: string, token: string): Promise<boolean> {
+  const res = await fetch(`${base}${STATUS_PATH}`, { headers: { Authorization: bearerHeader(token) } }).catch(() => null);
+  if (!res?.ok) return true;
+  const payload = (await res.json().catch(() => null)) as { confirmed?: unknown } | null;
+  return payload?.confirmed !== false;
 }
 
-/** Username + password sign-in on the same device, returning the stored session. */
-export function signIn(base: string, username: string, password: string): Promise<Session> {
-  return postCredentials(base, SIGN_IN_PATH, username, password);
+/** Finish signup by typing back the last group of the code (ADR 0006). */
+export async function confirmRecovery(base: string, group: string): Promise<void> {
+  const session = await getSession();
+  if (!session) throw new Error("Sign in first.");
+  const { res, payload } = await postJson(base, CONFIRM_PATH, { group }, session.token);
+  if (!res.ok) throw failure(res, payload, CONFIRM_PATH);
+  await setSession({ ...session, recoveryPending: false });
+}
+
+/** Issue a new code; the old one dies. Needs a signed-in session. */
+export async function regenerateRecovery(base: string): Promise<string> {
+  const session = await getSession();
+  if (!session) throw new Error("Sign in first.");
+  const { res, payload } = await postJson(base, REGENERATE_PATH, {}, session.token);
+  return codeFrom(payload, res, REGENERATE_PATH);
+}
+
+/**
+ * Sign in with a recovery code. The server rotates the code and revokes every other session,
+ * so the caller must show the new code before the user can lose it.
+ */
+export function redeemRecovery(base: string, username: string, code: string): Promise<Exchange> {
+  return exchange(base, REDEEM_PATH, { username, code }, username);
 }
 
 /**

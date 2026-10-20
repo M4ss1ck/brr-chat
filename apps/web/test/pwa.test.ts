@@ -39,6 +39,15 @@ function username(): string {
 }
 let account = 0;
 
+/** Sign up, then finish the type-back so the account can sync (ADR 0006). */
+async function signUpConfirmed(): Promise<{ session: NonNullable<Awaited<ReturnType<typeof getSession>>>; recoveryCode: string }> {
+  const exchange = await auth.signUp(base, username(), "password1234");
+  await auth.confirmRecovery(base, exchange.recoveryCode.slice(-5));
+  const session = await getSession();
+  if (!session) throw new Error("signup confirmed without a stored session");
+  return { session, recoveryCode: exchange.recoveryCode };
+}
+
 /** Forwards bytes verbatim between the client and the server and counts both directions. */
 async function startWireCounter(): Promise<{ base: string; totals(): number; stop(): void }> {
   const target = server!;
@@ -105,12 +114,14 @@ describe("PWA client (apps/web)", () => {
     expect(statSync(join(tempDir, "chat.db")).mode & 0o777).toBe(0o600);
   });
 
-  test("sign up with a username only stores a bare 32-char session", async () => {
+  test("sign up with a username only stores a bare 32-char session and shows one recovery code", async () => {
     const account = username();
-    const session = await auth.signUp(base, account, "password1234");
+    const { session, recoveryCode } = await auth.signUp(base, account, "password1234");
     expect(session.username).toBe(account);
     expect(session.token).toHaveLength(32);
     expect(session.token.includes(".")).toBe(false);
+    expect(session.recoveryPending).toBe(true);
+    expect(recoveryCode).toMatch(/^[0-9A-Z]{5}(-[0-9A-Z]{5}){3}$/);
     expect(await getSession()).toEqual(session);
     expect(await bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
   });
@@ -121,8 +132,8 @@ describe("PWA client (apps/web)", () => {
     // A fresh device: same server, empty IndexedDB.
     await closeStore();
     globalThis.indexedDB = new IDBFactory();
-    await expect(auth.signUp(base, taken, "password1234")).rejects.toThrow(/failed with status \d+/);
-    await expect(auth.signIn(base, taken, "wrong-password")).rejects.toThrow(/failed with status \d+/);
+    await expect(auth.signUp(base, taken, "password1234")).rejects.toThrow(/status \d+/);
+    await expect(auth.signIn(base, taken, "wrong-password")).rejects.toThrow(/status \d+/);
     expect(await getSession()).toBeNull();
   });
 
@@ -137,7 +148,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("sign out revokes the session: sign-in still works, the old token does not", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     expect(bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
     await auth.signOut(base);
     expect(await getSession()).toBeNull();
@@ -150,7 +161,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("a sign-out the server refuses keeps the token, so the device can retry", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     const refusing = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -165,7 +176,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("syncs an empty server: cursor 0 stored, cached range, no events", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     const outcome = await syncAndPersist(base, session.token);
 
     expect(outcome.kind).toBe("ok");
@@ -179,7 +190,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("an out-of-range version answers with the upgrade error and moves no cursor", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     expect(await getStoredCursor()).toBeNull();
 
     const old = await postSyncRequest(base, session.token, buildSyncRequest(0, [], 0));
@@ -200,7 +211,7 @@ describe("PWA client (apps/web)", () => {
   });
 
   test("a server that moved on: the range is cached and the cursor is not advanced", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     const first = await syncAndPersist(base, session.token);
     expect(first.kind).toBe("ok");
     expect(await getCursor()).toBe(0);
@@ -236,8 +247,46 @@ describe("PWA client (apps/web)", () => {
     await expect(postSyncRequest(base, "", buildSyncRequest(0))).rejects.toThrow();
   });
 
+  test("signing in to a signup that never finished still asks for the type-back", async () => {
+    const account = username();
+    const { recoveryCode } = await auth.signUp(base, account, "password1234");
+    await closeStore();
+    globalThis.indexedDB = new IDBFactory();
+
+    const pending = await auth.signIn(base, account, "password1234");
+    expect(pending.recoveryPending).toBe(true);
+    await auth.confirmRecovery(base, recoveryCode.slice(-5));
+    await auth.signOut(base);
+
+    const finished = await auth.signIn(base, account, "password1234");
+    expect(finished.recoveryPending).toBeUndefined();
+  });
+
+  test("recovery: confirm finishes signup, regenerate rotates, redeem signs back in", async () => {
+    const account = username();
+    const { session: pending, recoveryCode } = await auth.signUp(base, account, "password1234");
+    expect(pending.recoveryPending).toBe(true);
+    await expect(postSyncRequest(base, pending.token, buildSyncRequest(0))).rejects.toThrow("status 403");
+
+    await auth.confirmRecovery(base, recoveryCode.slice(-5));
+    expect((await getSession())?.recoveryPending).toBeUndefined();
+    expect((await syncAndPersist(base, pending.token)).kind).toBe("ok");
+
+    const next = await auth.regenerateRecovery(base);
+    expect(next).not.toBe(recoveryCode);
+
+    // A lost device comes back with the newest code only.
+    await closeStore();
+    globalThis.indexedDB = new IDBFactory();
+    await expect(auth.redeemRecovery(base, account, recoveryCode)).rejects.toThrow(/invalid/);
+    const redeemed = await auth.redeemRecovery(base, account, next);
+    expect(redeemed.session.username).toBe(account);
+    expect(await getSession()).toEqual(redeemed.session);
+    expect((await syncAndPersist(base, redeemed.session.token)).kind).toBe("ok");
+  });
+
   test("the empty sync round trip stays under 1 KB on the wire, bearer header included", async () => {
-    const session = await auth.signUp(base, username(), "password1234");
+    const { session } = await signUpConfirmed();
     const counter = await startWireCounter();
     try {
       const outcome = await syncAndPersist(counter.base, session.token);

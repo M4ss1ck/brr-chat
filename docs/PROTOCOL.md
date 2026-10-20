@@ -21,6 +21,8 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
 - `POST /sync` and `POST /history`. Body and response are a single CBOR value
   (`Content-Type: application/cbor`).
 - `Authorization: Bearer <32-char session token>` (bare token, ADR 0007).
+- `/sync` answers `401` without a valid session, and `403` while a signup's recovery code has
+  not been confirmed (ADR 0006).
 - Responses are brotli-compressed, or `dcz` (shared-dictionary) where the client supports it.
 - Media is never inline. `GET /m/{id}?w=<width>` fetches an image, and only when the user taps.
 

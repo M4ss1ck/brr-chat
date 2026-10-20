@@ -13,6 +13,19 @@ CREATE TABLE IF NOT EXISTS events (
 )
 `.trim();
 
+// ADR 0006: only hashes ever reach the disk. `tail_hash` lets signup check the last group
+// without keeping the full code anywhere.
+const CREATE_RECOVERY_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS recovery_codes (
+  user_id TEXT PRIMARY KEY,
+  code_hash BLOB NOT NULL,
+  tail_hash BLOB NOT NULL,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+`.trim();
+
 export function enforceDbFilePermissions(dbPath: string): void {
   if (!dbPath || dbPath === ":memory:") return;
   for (const suffix of ["", "-wal", "-shm"]) {
@@ -38,6 +51,7 @@ export function openDb(dbPath: string): Database {
     enforceDbFilePermissions(dbPath);
   }
   db.exec(CREATE_EVENTS_TABLE_SQL);
+  db.exec(CREATE_RECOVERY_TABLE_SQL);
   return db;
 }
 

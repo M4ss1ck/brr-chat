@@ -14,6 +14,14 @@ import { getCursor, setCursor, setRange } from "./store.ts";
 
 export const SYNC_PATH = "/sync";
 
+/** A refused sync, carrying the HTTP status so the UI can explain 401 and 403 differently. */
+export class SyncHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`${SYNC_PATH} failed with status ${status}`);
+    this.name = "SyncHttpError";
+  }
+}
+
 export function buildSyncRequest(cursor: number, outbox: Op[] = [], v: number = PROTOCOL_VERSION): Uint8Array {
   return encodeSyncRequest({ v, cursor, outbox });
 }
@@ -31,7 +39,7 @@ export async function postSyncRequest(base: string, token: string, body: Uint8Ar
     // The DOM lib's BodyInit does not list Uint8Array; every runtime accepts it.
     body: body as unknown as BodyInit,
   });
-  if (!res.ok) throw new Error(`${SYNC_PATH} failed with status ${res.status}`);
+  if (!res.ok) throw new SyncHttpError(res.status);
   return decodeSyncResponse(new Uint8Array(await res.arrayBuffer()));
 }
 

@@ -23,8 +23,11 @@ Run the server and the PWA from source:
 ```sh
 bun run --cwd apps/web build          # build the app shell and regenerate the server's embedded copy
 export BETTER_AUTH_SECRET=$(openssl rand -hex 32)   # signs sessions; never defaulted (ADR 0007)
-bun run --cwd apps/server dev         # serve /, /sync and /api/auth on http://localhost:3000
+bun run --cwd apps/server dev         # serve /, /sync and auth + recovery on http://localhost:3000
 ```
+
+Signup shows one recovery code, once, and will not finish until its last group is typed back.
+Keep it: there is no email recovery and no admin reset (ADR 0006).
 
 One binary, no files beside it:
 

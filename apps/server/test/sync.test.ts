@@ -22,8 +22,17 @@ async function signUpAlice(app: ServerApp): Promise<string> {
     }),
   );
   expect(res.status).toBe(200);
-  const body = (await res.json()) as { token: string };
+  const body = (await res.json()) as { token: string; recoveryCode: string };
   expect(body.token).toHaveLength(32);
+  // Signup is finished only after the last recovery group is typed back (ADR 0006).
+  const confirm = await app.fetch(
+    new Request("http://chat.local/api/recovery/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${body.token}` },
+      body: JSON.stringify({ group: body.recoveryCode.slice(-5) }),
+    }),
+  );
+  expect(confirm.status).toBe(200);
   return body.token;
 }
 

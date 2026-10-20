@@ -3,6 +3,7 @@ import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
 import { serveShell } from "./pwa.ts";
+import { DEFAULT_RECOVERY_LIMITS, createRecoveryService, type RecoveryLimits } from "./recovery.ts";
 import { handleSync } from "./sync.ts";
 
 export { SUPPORTED, headCursor, openDb };
@@ -14,12 +15,14 @@ export interface AppOptions {
   baseURL?: string;
   /** Absent means the environment, then a fail-fast for anything but an in-memory DB. */
   secret?: string | undefined;
+  /** Recovery redeem limits; tests use it to reach the gate without a hundred requests. */
+  recoveryLimits?: Partial<RecoveryLimits>;
 }
 
 export type AuthInstance = Awaited<ReturnType<typeof initAuth>>;
 
 export interface ServerApp {
-  fetch(req: Request): Promise<Response>;
+  fetch(req: Request, ip?: string): Promise<Response>;
   db: Database;
   auth: AuthInstance;
   close(): void;
@@ -65,11 +68,15 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     enforceDbFilePermissions(dbPath);
   }
 
+  const recovery = createRecoveryService(db, auth, { ...DEFAULT_RECOVERY_LIMITS, ...opts.recoveryLimits });
+
   return {
     db,
     auth,
-    async fetch(req: Request): Promise<Response> {
+    async fetch(req: Request, ip?: string): Promise<Response> {
       const url = new URL(req.url);
+      const recovered = await recovery.handle(req, url.pathname, ip);
+      if (recovered) return recovered;
       if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
         return auth.handler(req);
       }
@@ -156,7 +163,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   const server = Bun.serve({
     port: opts.port,
     hostname: opts.host,
-    fetch: (req) => app.fetch(req),
+    fetch: (req, server) => app.fetch(req, server.requestIP(req)?.address),
     // Sync is a single CBOR body; no request should hog a connection.
     idleTimeout: 30,
   });
