@@ -137,7 +137,15 @@ describe("Slice 1: SQLite DB + BetterAuth", () => {
           body: JSON.stringify({ username: "alice", password: "password1234" }),
         }),
       );
-      const { token } = (await signUp.json()) as { token: string };
+      const { token, recoveryCode } = (await signUp.json()) as { token: string; recoveryCode: string };
+      const confirm = await app.fetch(
+        new Request("http://chat.local/api/recovery/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ group: recoveryCode.slice(-5) }),
+        }),
+      );
+      expect(confirm.status).toBe(200);
 
       const row = app.db.query("SELECT createdAt, expiresAt FROM session").get() as { createdAt: string; expiresAt: string } | null;
       expect(row).not.toBeNull();

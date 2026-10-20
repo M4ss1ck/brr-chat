@@ -11,6 +11,7 @@ import {
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
 import type { AuthInstance } from "./index.ts";
+import { isRecoveryConfirmed } from "./recovery.ts";
 
 function respondCborBrotli(res: SyncResponse): Response {
   const encoded = encodeSyncResponse(res);
@@ -28,6 +29,10 @@ export async function handleSync(req: Request, db: Database, auth: AuthInstance)
   const session = await auth.api.getSession({ headers: req.headers });
   if (!session || session.user.banned) {
     return new Response("Unauthorized", { status: 401 });
+  }
+  // Signup is not finished until the recovery code's last group is typed back (ADR 0006).
+  if (!isRecoveryConfirmed(db, session.user.id)) {
+    return new Response("Recovery code not confirmed", { status: 403 });
   }
 
   const bytes = new Uint8Array(await req.arrayBuffer());

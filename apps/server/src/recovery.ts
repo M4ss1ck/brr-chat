@@ -1,0 +1,322 @@
+import type { Database } from "bun:sqlite";
+import { createHash, timingSafeEqual } from "node:crypto";
+import type { AuthInstance } from "./index.ts";
+
+// Account recovery by code only (ADR 0006). The code is 4 groups of 5 Crockford base32
+// characters: 100 bits, shown once, stored as hashes. Signing up is not finished until the
+// user types the last group back; redeeming signs in, rotates the code and revokes every
+// other session. There is no email recovery and no admin reset.
+
+/** Crockford base32: no I, L, O or U, so the code cannot spell unfortunate words. */
+const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+export const RECOVERY_CODE_LENGTH = 20;
+export const RECOVERY_GROUP_LENGTH = 5;
+const RECOVERY_GROUPS = RECOVERY_CODE_LENGTH / RECOVERY_GROUP_LENGTH;
+const HASH_BYTES = 32;
+
+/** A fresh code, unformatted. Each of the 20 characters carries 5 bits. */
+export function generateRecoveryCode(bytes: Uint8Array = crypto.getRandomValues(new Uint8Array(RECOVERY_CODE_LENGTH))): string {
+  if (bytes.length < RECOVERY_CODE_LENGTH) throw new RangeError("recovery code: not enough random bytes");
+  let code = "";
+  for (let i = 0; i < RECOVERY_CODE_LENGTH; i++) {
+    code += ALPHABET[(bytes[i] ?? 0) % ALPHABET.length];
+  }
+  return code;
+}
+
+/** `XXXXX-XXXXX-XXXXX-XXXXX`, the shape a person reads out and writes down. */
+export function formatRecoveryCode(code: string): string {
+  const groups: string[] = [];
+  for (let i = 0; i < code.length; i += RECOVERY_GROUP_LENGTH) {
+    groups.push(code.slice(i, i + RECOVERY_GROUP_LENGTH));
+  }
+  return groups.slice(0, RECOVERY_GROUPS).join("-");
+}
+
+/**
+ * Accept what a person actually types: lower case, spaces, hyphens, and the Crockford
+ * lookalikes O, I and L. Anything else outside the alphabet stays, and then fails to match.
+ */
+export function normalizeRecoveryCode(input: string): string {
+  return input
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "")
+    .replace(/O/g, "0")
+    .replace(/[IL]/g, "1");
+}
+
+function hashCode(code: string): Uint8Array {
+  return new Uint8Array(createHash("sha256").update(code, "utf8").digest());
+}
+
+function matchesCode(code: string, expected: Uint8Array): boolean {
+  const actual = hashCode(code);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/** The last group is what signup asks the user to type back. */
+function tail(code: string): string {
+  return code.slice(-RECOVERY_GROUP_LENGTH);
+}
+
+interface RecoveryRow {
+  user_id: string;
+  code_hash: Uint8Array;
+  tail_hash: Uint8Array;
+  confirmed: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface RecoveryLimits {
+  /** One fixed window per key. */
+  windowMs: number;
+  /** Redeem attempts allowed from one IP per window. */
+  perIp: number;
+  /** Redeem attempts allowed for one username per window. */
+  perUsername: number;
+}
+
+/** Redeeming is the only unauthenticated endpoint that touches an account, so it is tight. */
+export const DEFAULT_RECOVERY_LIMITS: RecoveryLimits = {
+  windowMs: 15 * 60 * 1000,
+  perIp: 10,
+  perUsername: 5,
+};
+
+/** Fixed-window counters. Kept in memory: a restart forgets attempts, but never a code. */
+class RateLimiter {
+  private readonly buckets = new Map<string, { count: number; resetAt: number }>();
+
+  constructor(private readonly limits: RecoveryLimits) {}
+
+  private hit(key: string, max: number, now: number): { allowed: boolean; retryAfter: number } {
+    const bucket = this.buckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      this.buckets.set(key, { count: 1, resetAt: now + this.limits.windowMs });
+      return { allowed: true, retryAfter: 0 };
+    }
+    bucket.count += 1;
+    return {
+      allowed: bucket.count <= max,
+      retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
+    };
+  }
+
+  check(ip: string, username: string, now: number = Date.now()): { allowed: boolean; retryAfter: number } {
+    if (this.buckets.size > 10_000) {
+      for (const [key, bucket] of this.buckets) {
+        if (bucket.resetAt <= now) this.buckets.delete(key);
+      }
+    }
+    const byIp = this.hit(`ip:${ip}`, this.limits.perIp, now);
+    const byUsername = this.hit(`user:${username}`, this.limits.perUsername, now);
+    return {
+      allowed: byIp.allowed && byUsername.allowed,
+      retryAfter: Math.max(byIp.retryAfter, byUsername.retryAfter, 1),
+    };
+  }
+}
+
+function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store", ...headers },
+  });
+}
+
+function rowFor(db: Database, userId: string): RecoveryRow | null {
+  return db
+    .query("SELECT user_id, code_hash, tail_hash, confirmed, created_at, updated_at FROM recovery_codes WHERE user_id = ?")
+    .get(userId) as RecoveryRow | null;
+}
+
+/** A DB from before recovery codes has no row: those accounts are already usable. */
+export function isRecoveryConfirmed(db: Database, userId: string): boolean {
+  const row = rowFor(db, userId);
+  return row === null || row.confirmed === 1;
+}
+
+function saveCode(db: Database, userId: string, code: string, confirmed: boolean): void {
+  const now = Date.now();
+  db.query(
+    `INSERT INTO recovery_codes (user_id, code_hash, tail_hash, confirmed, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       code_hash = excluded.code_hash,
+       tail_hash = excluded.tail_hash,
+       confirmed = excluded.confirmed,
+       updated_at = excluded.updated_at`,
+  ).run(userId, hashCode(code), hashCode(tail(code)), confirmed ? 1 : 0, now, now);
+}
+
+/** Issues a code and stores only its hashes. The return value is the one chance to show it. */
+export function createRecoveryCode(db: Database, userId: string, confirmed = false): string {
+  const code = generateRecoveryCode();
+  saveCode(db, userId, code, confirmed);
+  return code;
+}
+
+/** Replaces an existing code; the old one stops working in the same write. */
+export function rotateRecoveryCode(db: Database, userId: string, confirmed = true): string {
+  return createRecoveryCode(db, userId, confirmed);
+}
+
+function confirmsLastGroup(input: string, row: RecoveryRow): boolean {
+  const normalized = normalizeRecoveryCode(input);
+  if (normalized.length === RECOVERY_CODE_LENGTH) return matchesCode(normalized, row.code_hash);
+  return normalized.length === RECOVERY_GROUP_LENGTH && matchesCode(normalized, row.tail_hash);
+}
+
+function ipFrom(req: Request): string {
+  const forwarded = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  if (forwarded) return forwarded;
+  return req.headers.get("x-real-ip")?.trim() || "local";
+}
+
+async function readJson(req: Request): Promise<Record<string, unknown> | null> {
+  const body = await req.json().catch(() => null);
+  return typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+}
+
+function field(body: Record<string, unknown> | null, name: string): string {
+  const value = body?.[name];
+  return typeof value === "string" ? value : "";
+}
+
+function usernameKey(username: string): string {
+  return username.trim().toLowerCase();
+}
+
+export interface RecoveryService {
+  /** Handles every recovery route, including the sign-up path. Null means "not mine". */
+  handle(req: Request, pathname: string, ip?: string): Promise<Response | null>;
+}
+
+export function createRecoveryService(db: Database, auth: AuthInstance, limits: RecoveryLimits = DEFAULT_RECOVERY_LIMITS): RecoveryService {
+  const limiter = new RateLimiter(limits);
+
+  /** Sign-up goes through BetterAuth, then the new account gets its one recovery code. */
+  async function signUp(req: Request): Promise<Response> {
+    const raw = await req.arrayBuffer();
+    // Our path is an alias; BetterAuth only knows its own sign-up route.
+    const authURL = new URL(req.url);
+    authURL.pathname = "/api/auth/sign-up/email";
+    const upstream = await auth.handler(
+      new Request(authURL.toString(), {
+        method: "POST",
+        headers: req.headers,
+        body: raw,
+      }),
+    );
+    if (!upstream.ok) return upstream;
+
+    const payload = (await upstream.json().catch(() => null)) as
+      | { token?: unknown; user?: { id?: unknown } | null }
+      | null;
+    const userId = typeof payload?.user?.id === "string" ? payload.user.id : "";
+    if (typeof payload?.token !== "string" || userId.length === 0) {
+      return json(500, { error: "sign-up did not return a session" });
+    }
+
+    const code = createRecoveryCode(db, userId, false);
+    const headers = new Headers(upstream.headers);
+    headers.delete("content-length");
+    headers.set("Content-Type", "application/json");
+    headers.set("Cache-Control", "no-store");
+    return new Response(JSON.stringify({ ...payload, recoveryCode: formatRecoveryCode(code), recoveryConfirmed: false }), {
+      status: 200,
+      headers,
+    });
+  }
+
+  async function confirm(req: Request): Promise<Response> {
+    const session = await auth.api.getSession({ headers: req.headers });
+    if (!session) return json(401, { error: "sign in first" });
+
+    const body = await readJson(req);
+    const typed = field(body, "group") || field(body, "code");
+    if (normalizeRecoveryCode(typed).length === 0) return json(400, { error: "type the last group of your code" });
+
+    const row = rowFor(db, session.user.id);
+    if (!row) return json(409, { error: "this account has no recovery code; regenerate one" });
+    if (!confirmsLastGroup(typed, row)) return json(400, { error: "that is not the last group of your code" });
+
+    db.query("UPDATE recovery_codes SET confirmed = 1, updated_at = ? WHERE user_id = ?").run(Date.now(), session.user.id);
+    return json(200, { confirmed: true });
+  }
+
+  async function regenerate(req: Request): Promise<Response> {
+    const session = await auth.api.getSession({ headers: req.headers });
+    if (!session) return json(401, { error: "sign in first" });
+
+    const existing = rowFor(db, session.user.id);
+    const confirmed = existing === null ? true : existing.confirmed === 1;
+    const code = rotateRecoveryCode(db, session.user.id, confirmed);
+    return json(200, { recoveryCode: formatRecoveryCode(code), recoveryConfirmed: confirmed });
+  }
+
+  async function redeem(req: Request, ip: string): Promise<Response> {
+    const body = await readJson(req);
+    const username = field(body, "username");
+    const code = field(body, "code");
+    const key = usernameKey(username);
+    if (key.length === 0 || normalizeRecoveryCode(code).length === 0) {
+      return json(400, { error: "username and recovery code are both required" });
+    }
+
+    const gate = limiter.check(ip, key);
+    if (!gate.allowed) {
+      return json(429, { error: "too many attempts; try again later" }, { "Retry-After": String(gate.retryAfter) });
+    }
+
+    const user = db.query("SELECT id FROM user WHERE lower(username) = ?").get(key) as { id: string } | null;
+    const row = user ? rowFor(db, user.id) : null;
+    // Hash even when there is no row, so an unknown username costs the same as a wrong code.
+    const expected = row?.code_hash ?? new Uint8Array(HASH_BYTES);
+    const normalized = normalizeRecoveryCode(code);
+    const valid =
+      row !== null &&
+      user !== null &&
+      normalized.length === RECOVERY_CODE_LENGTH &&
+      matchesCode(normalized, expected);
+    if (!valid || user === null) return json(401, { error: "invalid username or recovery code" });
+
+    const nextCode = rotateRecoveryCode(db, user.id, true);
+    const ctx = await auth.$context;
+    // Every old session dies before the new one is issued: a stolen session cannot survive
+    // the recovery it was taken from.
+    await ctx.internalAdapter.deleteUserSessions(user.id);
+    const session = await ctx.internalAdapter.createSession(user.id, false);
+    // The username plugin's column is not in the base User type BetterAuth exports.
+    const account = (await ctx.internalAdapter.findUserById(user.id)) as Record<string, unknown> | null;
+    const name = typeof account?.name === "string" ? account.name : username;
+    const email = typeof account?.email === "string" ? account.email : "";
+    const accountUsername = typeof account?.username === "string" ? account.username : username;
+
+    return json(200, {
+      token: session.token,
+      user: { id: user.id, username: accountUsername, name, email },
+      recoveryCode: formatRecoveryCode(nextCode),
+      recoveryConfirmed: true,
+    });
+  }
+
+  async function status(req: Request): Promise<Response> {
+    const session = await auth.api.getSession({ headers: req.headers });
+    if (!session) return json(401, { error: "sign in first" });
+    return json(200, { confirmed: isRecoveryConfirmed(db, session.user.id) });
+  }
+
+  return {
+    async handle(req, pathname, ip = ipFrom(req)): Promise<Response | null> {
+      if (pathname === "/api/auth/sign-up/email" && req.method === "POST") return signUp(req);
+      if (pathname === "/api/recovery/sign-up" && req.method === "POST") return signUp(req);
+      if (pathname === "/api/recovery/confirm" && req.method === "POST") return confirm(req);
+      if (pathname === "/api/recovery/regenerate" && req.method === "POST") return regenerate(req);
+      if (pathname === "/api/recovery/redeem" && req.method === "POST") return redeem(req, ip);
+      if (pathname === "/api/recovery/status" && req.method === "GET") return status(req);
+      return null;
+    },
+  };
+}

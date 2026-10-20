@@ -15,6 +15,8 @@ export interface Session {
   /** Bare 32-char session token (ADR 0007). */
   token: string;
   username: string;
+  /** True until the signup code's last group is typed back (ADR 0006). */
+  recoveryPending?: boolean;
 }
 
 let dbHandle: Promise<IDBDatabase> | null = null;
@@ -100,10 +102,12 @@ function asCursor(value: unknown): number | null {
 
 function asSession(value: unknown): Session | null {
   if (typeof value !== "object" || value === null) return null;
-  const row = value as { token?: unknown; username?: unknown };
+  const row = value as { token?: unknown; username?: unknown; recoveryPending?: unknown };
   if (typeof row.token !== "string" || row.token.length === 0) return null;
   if (typeof row.username !== "string" || row.username.length === 0) return null;
-  return { token: row.token, username: row.username };
+  const session: Session = { token: row.token, username: row.username };
+  if (row.recoveryPending === true) session.recoveryPending = true;
+  return session;
 }
 
 function asRange(value: unknown): VersionRange | null {

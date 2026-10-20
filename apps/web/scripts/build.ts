@@ -77,6 +77,14 @@ dl { display: grid; grid-template-columns: auto 1fr; gap: .1rem .75rem; margin: 
 dt { color: #a9a49a; }
 dd { margin: 0; overflow-wrap: anywhere; }
 #empty { color: #d8c56a; }
+.note { color: #a9a49a; font-size: .85rem; }
+output {
+  display: block; margin: .6rem 0; padding: .6rem;
+  border: 1px dashed #6d6a5e; border-radius: .4rem;
+  font: 600 1.15rem/1.4 ui-monospace, monospace; letter-spacing: .08em;
+  overflow-wrap: anywhere; color: #d8c56a;
+}
+#recover-code { letter-spacing: .08em; }
 </style>
 </head>
 <body>
@@ -94,6 +102,30 @@ dd { margin: 0; overflow-wrap: anywhere; }
       <button type="button" id="sign-up">Create account</button>
       <button type="button" id="sign-in">Sign in</button>
     </form>
+    <button type="button" id="show-recovery">Use a recovery code</button>
+    <form id="recover-panel" hidden autocomplete="off">
+      <h2>Recovery code</h2>
+      <label>Username
+        <input id="recover-username" autocapitalize="none" spellcheck="false">
+      </label>
+      <label>Recovery code
+        <input id="recover-code" autocapitalize="characters" spellcheck="false" placeholder="XXXXX-XXXXX-XXXXX-XXXXX">
+      </label>
+      <button type="button" id="recover">Sign in with code</button>
+    </form>
+    <p class="note">No email recovery, no admin reset. If you lose your recovery code and every signed-in device, the account is gone.</p>
+  </section>
+
+  <section id="confirm-panel" hidden>
+    <h1>Save your recovery code</h1>
+    <p>This is the only time it is shown. Write it down somewhere safe.</p>
+    <output id="recovery-code"></output>
+    <label>Type the last group to finish
+      <input id="recovery-group" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="XXXXX">
+    </label>
+    <button type="button" id="confirm">Finish sign-up</button>
+    <button type="button" id="refresh-code">Show a new code</button>
+    <p class="note">Losing this code and every signed-in device means losing the account. There is no email recovery and no admin reset.</p>
   </section>
 
   <section id="signed-in" hidden>
@@ -107,6 +139,10 @@ dd { margin: 0; overflow-wrap: anywhere; }
     </dl>
     <button type="button" id="sync">Sync</button>
     <button type="button" id="sign-out">Sign out</button>
+    <h2>Recovery code</h2>
+    <p class="note">If you lose every signed-in device, this code is the only way back in. Losing both means losing the account: there is no email recovery and no admin reset.</p>
+    <button type="button" id="regenerate">New recovery code</button>
+    <div id="code-panel" hidden><output id="new-code"></output></div>
   </section>
 
   <p id="status" role="status" aria-live="polite"></p>

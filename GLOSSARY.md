@@ -3,6 +3,8 @@
 - **Server**: one isolated brr-chat community, a single binary plus one SQLite file. Never talks
   to other servers.
 - **Account**: a user on one server. The same person on two servers has two unrelated accounts.
+- **Recovery code**: 4×5 Crockford base32 characters shown once at signup and stored hashed. It is
+  the only way back in without a session; losing it and every session loses the account (ADR 0006).
 - **Scope**: what an event belongs to, either a **group** or a **DM** (two users). Scope 0
   means server-wide.
 - **Group**: a scope with members and roles (member, group admin, owner). Open (anyone can join)

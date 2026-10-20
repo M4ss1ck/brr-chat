@@ -207,10 +207,17 @@ slow("compiled single binary", () => {
         body: JSON.stringify({ username: "alice", password: "password1234" }),
       });
       expect(signUp.status).toBe(200);
-      const signedUp = (await signUp.json()) as { token: string; user: { username: string; email: string } };
+      const signedUp = (await signUp.json()) as { token: string; recoveryCode: string; user: { username: string; email: string } };
       expect(signedUp.user.username).toBe("alice");
       expect(signedUp.user.email).toBe("alice@127.0.0.1.invalid");
       expect(signedUp.token).toHaveLength(32);
+      // Finish signup by typing the last group back (ADR 0006).
+      const confirm = await fetch(`${server.base}/api/recovery/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${signedUp.token}` },
+        body: JSON.stringify({ group: signedUp.recoveryCode.slice(-5) }),
+      });
+      expect(confirm.status).toBe(200);
 
       // Sign back in, then /sync the empty server: brotli on the wire, cursor 0.
       const signIn = await fetch(`${server.base}/api/auth/sign-in/username`, {
