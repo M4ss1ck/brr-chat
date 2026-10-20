@@ -21,7 +21,9 @@ export type Tag = (typeof Tag)[keyof typeof Tag];
 
 export const MAX_TEXT_BYTES = 4000;
 export const MAX_THUMBHASH_BYTES = 32;
-export const EMOJI_PALETTE_SIZE = 8;
+/** The fixed reaction palette. The wire carries only the index, never the glyph. */
+export const EMOJI_PALETTE = ["👍", "❤️", "😂", "😮", "😢", "😡", "🔥", "👏"] as const;
+export const EMOJI_PALETTE_SIZE = EMOJI_PALETTE.length;
 export const Role = { None: 0, Member: 1, Admin: 2, Owner: 3 } as const;
 
 export interface Media {

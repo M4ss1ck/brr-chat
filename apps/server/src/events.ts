@@ -112,6 +112,25 @@ function memberFor(db: Database, groupId: number, wireId: number): MemberRow | n
     .get(groupId, wireId) as MemberRow | null;
 }
 
+/** A group op needs a real group scope and current membership; null means allowed. */
+function groupAccessError(db: Database, actor: Actor, scope: number): AckError | null {
+  if (scope === 0) return AckError.Invalid;
+  if (!groupFor(db, scope)) return AckError.NotFound;
+  if (!memberFor(db, scope, actor.wireId)) return AckError.Forbidden;
+  return null;
+}
+
+interface EventHeaderRow {
+  tag: number;
+  scope: number;
+}
+
+/** Tag and scope of an existing event, or null when the seq is unknown. */
+function headerFor(db: Database, seq: number): EventHeaderRow | null {
+  const row = db.query("SELECT tag, scope FROM events WHERE seq = ?").get(seq) as EventHeaderRow | null;
+  return row ? { tag: Number(row.tag), scope: Number(row.scope) } : null;
+}
+
 function rememberOp(db: Database, actor: Actor, op: Op, tag: number, seq: number, now: number): void {
   db.query("INSERT INTO outbox_ops (user_id, cid, tag, seq, created_at) VALUES (?, ?, ?, ?, ?)").run(
     actor.id,
@@ -190,10 +209,8 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
     }
     case Tag.Post: {
       // Group scopes only: DMs have their own tag and their own slice.
-      if (op.scope === 0) return { error: AckError.Invalid };
-      const group = groupFor(db, op.scope);
-      if (!group) return { error: AckError.NotFound };
-      if (!memberFor(db, op.scope, actor.wireId)) return { error: AckError.Forbidden };
+      const denied = groupAccessError(db, actor, op.scope);
+      if (denied !== null) return { error: denied };
       if (op.text.trim().length === 0) return { error: AckError.Invalid };
       // Media needs the upload pipeline (ADR 0011); accepting it here would silently drop it.
       if (op.media !== null) return { error: AckError.Unsupported };
@@ -205,6 +222,49 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
         scope: op.scope,
         text: op.text,
         media: null,
+      }));
+      return { seq, firstSeq: seq, state: false };
+    }
+    case Tag.Reply: {
+      // One level only: a reply's parent must be a post in the same group.
+      const denied = groupAccessError(db, actor, op.scope);
+      if (denied !== null) return { error: denied };
+      if (op.text.trim().length === 0) return { error: AckError.Invalid };
+      if (op.media !== null) return { error: AckError.Unsupported };
+      const parent = headerFor(db, op.parent);
+      if (!parent) return { error: AckError.NotFound };
+      // A reply is not a valid parent, even in the right scope: that is Invalid, not NotFound.
+      if (parent.tag !== Tag.Post) return { error: AckError.Invalid };
+      if (parent.scope !== op.scope) return { error: AckError.NotFound };
+      const seq = insertEvent(db, (next) => ({
+        tag: Tag.Reply,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope: op.scope,
+        parent: op.parent,
+        text: op.text,
+        media: null,
+      }));
+      return { seq, firstSeq: seq, state: false };
+    }
+    case Tag.Reaction: {
+      // The palette range (0..7) is already enforced by the op decoder.
+      const denied = groupAccessError(db, actor, op.scope);
+      if (denied !== null) return { error: denied };
+      const target = headerFor(db, op.target);
+      if (!target || target.scope !== op.scope) return { error: AckError.NotFound };
+      if (target.tag !== Tag.Post && target.tag !== Tag.Reply) return { error: AckError.Invalid };
+      // Toggling is append-only: each press writes on/off, and clients keep the latest one.
+      const seq = insertEvent(db, (next) => ({
+        tag: Tag.Reaction,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope: op.scope,
+        target: op.target,
+        emoji: op.emoji,
+        on: op.on,
       }));
       return { seq, firstSeq: seq, state: false };
     }
@@ -224,8 +284,8 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       return { seq, firstSeq: seq, state: false };
     }
     default:
-      // Reply, reaction, delete, DM and ban arrive in later slices. The tag is known, but this
-      // server does not implement it yet, so the device gets a nack instead of a silent drop.
+      // Delete, DM and ban arrive in later slices. The tag is known, but this server does not
+      // implement it yet, so the device gets a nack instead of a silent drop.
       return { error: AckError.Unsupported };
   }
 }

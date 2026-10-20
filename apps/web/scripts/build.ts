@@ -96,6 +96,19 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 .avatar { border-radius: .35rem; background: #17170f; }
 .post .meta { margin: 0; font-size: .78rem; color: #a9a49a; }
 .post .text { margin: .1rem 0 0; overflow-wrap: anywhere; }
+.post .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .2rem; margin: .35rem 0 0; }
+.post .reactions { display: flex; flex-wrap: wrap; gap: .15rem; }
+.post .reaction {
+  min-width: 2rem; margin: 0; padding: .2rem .35rem;
+  font-size: .85rem; line-height: 1.2;
+}
+.post .reaction[aria-pressed="true"] { border-color: #d8c56a; background: #2b2a20; }
+.post .reply { margin: 0 0 0 .2rem; padding: .2rem .5rem; font-size: .8rem; }
+.post .reply[aria-pressed="true"] { border-color: #d8c56a; }
+.post.reply { margin-left: 1.1rem; padding-left: .55rem; border-left: 2px solid #2f2e25; }
+.post .replies { display: grid; gap: .5rem; margin: .5rem 0 0; }
+#reply-note { display: flex; align-items: center; gap: .4rem; }
+#reply-note button { margin: 0; padding: .2rem .5rem; font-size: .8rem; }
 </style>
 </head>
 <body>
@@ -153,6 +166,7 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <p id="group-about" class="note"></p>
       <p id="group-members" class="note"></p>
       <ul id="posts" class="posts"></ul>
+      <p id="reply-note" class="note" hidden><span id="reply-label"></span> <button type="button" id="cancel-reply">Cancel</button></p>
       <label>Message
         <input id="post-text" autocomplete="off" autocapitalize="sentences">
       </label>
