@@ -4,6 +4,8 @@
 import { EMOJI_PALETTE, ResponseError, Role, Tag, type SyncResponse } from "@brr-chat/protocol";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
 import { identicon } from "./identicon.ts";
+import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
+import { qrSvg } from "./qr.ts";
 import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import {
   enqueueOp,
@@ -40,6 +42,17 @@ let pendingDmPeer: number | null = null;
 let replyingTo: number | null = null;
 /** Taps are serialized, so the second tap sees the first one's new state. */
 let reactionQueue: Promise<void> = Promise.resolve();
+/** The invite link currently shown for this group, if any. */
+let currentInvite: InviteLink | null = null;
+/** Group whose invite request is in flight, so two renders do not fetch twice. */
+let loadingInviteGroup: number | null = null;
+/** A link token from /join/<token>, kept until the account can join. */
+let pendingInvite: string | null = inviteTokenFromLocation();
+
+function inviteTokenFromLocation(): string | null {
+  if (typeof location === "undefined") return null;
+  return /^\/join\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
+}
 
 interface ViewContext {
   profiles: Map<number, StoredProfile>;
@@ -331,6 +344,116 @@ async function renderGroup(): Promise<void> {
     const input = el<HTMLInputElement>("post-text");
     if (input) input.placeholder = replyingTo === null ? `Message ${group.name}` : "Write a reply";
   }
+
+  // Invite-only groups are managed from their link. Open groups have nothing to share, so
+  // the panel stays out of the way (ADR 0010).
+  const mine = self === null ? undefined : members.find((member) => member.user === self);
+  const canManage = !group.open && mine !== undefined && mine.role >= Role.Admin;
+  show("invite-panel", canManage);
+  if (!canManage) {
+    currentInvite = null;
+    return;
+  }
+  if (currentInvite?.group === group.id) {
+    paintInvite(currentInvite);
+  } else if (loadingInviteGroup !== group.id) {
+    // Never leave the previous group's link on screen while the new one loads.
+    currentInvite = null;
+    setText("invite-link", "Loading…");
+    const qr = el("invite-qr");
+    if (qr) qr.replaceChildren();
+    await loadInvite(group.id);
+  }
+}
+
+function paintInvite(invite: InviteLink): void {
+  setText("invite-link", invite.link);
+  const qr = el("invite-qr");
+  if (qr) qr.innerHTML = qrSvg(invite.qr);
+}
+
+async function loadInvite(group: number): Promise<void> {
+  const session = await getSession();
+  if (!session) return;
+  loadingInviteGroup = group;
+  try {
+    const invite = await getInvite(location.origin, session.token, group);
+    // The user may have switched groups while this was in flight.
+    if (currentGroup !== group) return;
+    currentInvite = invite;
+    paintInvite(invite);
+  } catch (err) {
+    if (currentGroup === group) message(err instanceof Error ? err.message : "Could not load the invite link.");
+  } finally {
+    if (loadingInviteGroup === group) loadingInviteGroup = null;
+  }
+}
+
+async function rotateCurrentInvite(): Promise<void> {
+  const session = await getSession();
+  const group = currentGroup;
+  if (!session || group === null) {
+    message("Open an invite-only group first.");
+    return;
+  }
+  try {
+    const invite = await rotateInvite(location.origin, session.token, group);
+    if (currentGroup !== group) return;
+    currentInvite = invite;
+    paintInvite(invite);
+    message("New invite link ready. The old link no longer works.");
+  } catch (err) {
+    message(err instanceof Error ? err.message : "Could not rotate the invite link.");
+  }
+}
+
+async function copyInvite(): Promise<void> {
+  if (currentInvite === null) {
+    message("The invite link is still loading.");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(currentInvite.link);
+    message("Invite link copied.");
+  } catch {
+    message("Copying is not available here. Select the link instead.");
+  }
+}
+
+/** Resolves /join/<token> after sign-in, then joins through the normal outbox. */
+async function completeInvite(): Promise<void> {
+  const invite = pendingInvite;
+  if (invite === null) return;
+  const session = await getSession();
+  if (!session || session.recoveryPending === true) return;
+
+  try {
+    const resolved = await resolveInvite(location.origin, session.token, invite);
+    const self = await getSelf(session.username);
+    if (self === null) return;
+    if (!resolved.joined) {
+      await enqueueOp(session.username, {
+        tag: Tag.Membership,
+        scope: resolved.group,
+        user: self,
+        role: Role.Member,
+        invite,
+      });
+      message(`Joining ${resolved.name}…`);
+    }
+    pendingInvite = null;
+    cancelReply();
+    currentGroup = resolved.group;
+    if (location.pathname.startsWith("/join/")) history.replaceState({}, "", "/");
+    const response = await syncNow();
+    const refused = response?.acks.find((row) => "error" in row);
+    if (refused && "error" in refused) message(explainAck(refused.error));
+    else message(resolved.joined ? `You are already in ${resolved.name}.` : `Joined ${resolved.name}.`);
+  } catch (err) {
+    // A rotated or mistyped link is a dead end; say so instead of retrying forever.
+    pendingInvite = null;
+    message(err instanceof Error ? err.message : "That invite link is no longer valid.");
+  }
 }
 
 /** Renders the DM thread from cache only, so it opens offline exactly like a group. */
@@ -373,6 +496,13 @@ async function renderDm(): Promise<void> {
 
   const input = el<HTMLInputElement>("dm-text");
   if (input) input.placeholder = `Message ${name}`;
+}
+
+/** Everything that follows a successful sign-up/in/recovery, including a pending link. */
+async function afterAuth(): Promise<void> {
+  await refresh();
+  await syncNow();
+  await completeInvite();
 }
 
 async function identifySelf(username: string): Promise<void> {
@@ -479,8 +609,7 @@ async function submit(mode: Mode): Promise<void> {
     message(err instanceof Error ? err.message : "Sign in failed.");
     return;
   }
-  await refresh();
-  await syncNow();
+  await afterAuth();
 }
 
 async function finishSignup(): Promise<void> {
@@ -497,8 +626,7 @@ async function finishSignup(): Promise<void> {
     message(err instanceof Error ? err.message : "That code did not match.");
     return;
   }
-  await refresh();
-  await syncNow();
+  await afterAuth();
 }
 
 async function newCode(): Promise<void> {
@@ -535,8 +663,7 @@ async function recover(): Promise<void> {
     message(err instanceof Error ? err.message : "Recovery failed.");
     return;
   }
-  await refresh();
-  await syncNow();
+  await afterAuth();
 }
 
 async function createGroup(): Promise<void> {
@@ -550,16 +677,19 @@ async function createGroup(): Promise<void> {
     message("Give the group a name.");
     return;
   }
+  const privateGroup = el<HTMLInputElement>("create-private")?.checked === true;
   const queued = await enqueueOp(session.username, {
     tag: Tag.GroupMeta,
     scope: 0,
     name,
     about: value("create-about"),
-    // This slice creates open groups; invite-only groups arrive with their join link (#10).
-    open: true,
+    open: !privateGroup,
   });
   clear("create-name");
   clear("create-about");
+  const privateBox = el<HTMLInputElement>("create-private");
+  if (privateBox) privateBox.checked = false;
+  currentInvite = null;
   const response = await syncNow();
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
   if (ack && "seq" in ack) {
@@ -756,6 +886,8 @@ function wire(): void {
   el<HTMLButtonElement>("recover")?.addEventListener("click", () => void recover());
   el<HTMLButtonElement>("create")?.addEventListener("click", () => void createGroup());
   el<HTMLButtonElement>("post")?.addEventListener("click", () => void postMessage());
+  el<HTMLButtonElement>("copy-invite")?.addEventListener("click", () => void copyInvite());
+  el<HTMLButtonElement>("rotate-invite")?.addEventListener("click", () => void rotateCurrentInvite());
   el<HTMLButtonElement>("cancel-reply")?.addEventListener("click", () => {
     cancelReply();
     void renderGroup();
@@ -773,9 +905,9 @@ function boot(): void {
     });
   }
   void (async () => {
-    await refresh();
     const session = await getSession();
-    if (session && session.recoveryPending !== true) await syncNow();
+    if (session && session.recoveryPending !== true) await afterAuth();
+    else await refresh();
   })();
 }
 

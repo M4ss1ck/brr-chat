@@ -34,10 +34,11 @@ export interface Media {
   thumbhash: Uint8Array;
 }
 
-type Kind = "uint" | "text" | "bool" | "emoji" | "role" | "media?";
+type Kind = "uint" | "text" | "text?" | "bool" | "emoji" | "role" | "media?";
 interface KindType {
   uint: number;
   text: string;
+  "text?": string | null;
   bool: boolean;
   emoji: number;
   role: number;
@@ -56,7 +57,9 @@ const SCHEMA = {
   [Tag.Delete]: [["target", "uint"]],
   [Tag.Profile]: [["username", "text"], ["displayName", "text"], ["bio", "text"]],
   [Tag.GroupMeta]: [["name", "text"], ["about", "text"], ["open", "bool"]],
-  [Tag.Membership]: [["user", "uint"], ["role", "role"]],
+  // `invite` is an op-only field: the current invite token for an invite-only group. The
+  // server never writes it into an event (ADR 0016). Appended optional, per ADR 0004.
+  [Tag.Membership]: [["user", "uint"], ["role", "role"], ["invite", "text?"]],
   [Tag.Ban]: [["user", "uint"], ["on", "bool"]],
   [Tag.ScopeLeft]: [["purge", "bool"]],
   [Tag.Gap]: [["after", "uint"], ["before", "uint"], ["count", "uint"]],
@@ -68,8 +71,14 @@ const OP_TAGS: ReadonlySet<number> = new Set<Tag>([
   Tag.Post, Tag.Reply, Tag.Dm, Tag.Reaction, Tag.Delete, Tag.Profile, Tag.GroupMeta, Tag.Membership, Tag.Ban,
 ]);
 
+// `media?` is a required field whose value may be null (a post without media). Only an
+// appended text field (`text?`, today just the membership invite) is optional on the object.
 type Fields<F> = F extends readonly (readonly [string, Kind])[]
-  ? { [P in F[number] as P[0]]: KindType[P[1]] }
+  ? {
+      [P in F[number] as P[1] extends "text?" ? never : P[0]]: KindType[P[1]];
+    } & {
+      [P in F[number] as P[1] extends "text?" ? P[0] : never]?: KindType[P[1]];
+    }
   : never;
 type BodyOf<T extends Tag> = { tag: T } & Fields<(typeof SCHEMA)[T]>;
 export type Body = { [T in Tag]: BodyOf<T> }[Tag];
@@ -145,6 +154,7 @@ function decodeField(kind: Kind, v: unknown, what: string): unknown {
     case "bool":
       return bool(v, what);
     case "text":
+    case "text?":
       if (typeof v !== "string") throw new ProtocolError(`${what}: expected text`);
       if (utf8Length(v) > MAX_TEXT_BYTES) throw new ProtocolError(`${what}: text too long`);
       return v;
@@ -168,7 +178,9 @@ function encodeFields(body: Body): Wire[] {
   const rec = body as unknown as Record<string, unknown>;
   const out: Wire[] = schema.map(([name, kind]) => {
     const v = rec[name];
-    return kind === "media?" ? (v ? encodeMedia(v as Media) : null) : (v as Wire);
+    if (kind === "media?") return v ? encodeMedia(v as Media) : null;
+    if (kind === "text?") return typeof v === "string" ? v : null;
+    return v as Wire;
   });
   // Drop trailing nulls in optional slots: decoders treat a missing optional as null.
   for (let i = out.length - 1; i >= 0 && out[i] === null && schema[i]![1].endsWith("?"); i--) out.pop();
@@ -182,7 +194,13 @@ function decodeFields(tag: number, a: unknown[], from: number, what: string): Bo
   const body: Record<string, unknown> = { tag };
   schema.forEach(([name, kind], i) => {
     const v = a[from + i];
-    if (v === undefined && !kind.endsWith("?")) throw new ProtocolError(`${what}.${name}: missing`);
+    if (v === undefined || v === null) {
+      // A missing optional field decodes as null (docs/PROTOCOL.md), whether it is a media
+      // placeholder or an appended text field.
+      if (!kind.endsWith("?")) throw new ProtocolError(`${what}.${name}: missing`);
+      body[name] = null;
+      return;
+    }
     body[name] = decodeField(kind, v, `${what}.${name}`);
   });
   return body as Body;

@@ -71,6 +71,7 @@ button {
   border: 1px solid #6d6a5e; border-radius: .4rem;
   background: #22211a; color: inherit; font: inherit;
 }
+input[type="checkbox"] { display: inline; width: auto; margin: 0 .4rem 0 0; }
 #sign-up { background: #f2efe6; color: #10100e; font-weight: 600; }
 #status { min-height: 1.4rem; margin: .75rem 0; font-size: .9rem; }
 dl { display: grid; grid-template-columns: auto 1fr; gap: .1rem .75rem; margin: .5rem 0; font-size: .9rem; }
@@ -91,6 +92,9 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 #groups-list button[aria-current="true"], #dm-list button[aria-current="true"] { border-color: #f2efe6; background: #2b2a20; }
 #group-view { margin: .5rem 0 1rem; }
 #group-title { margin: .5rem 0 .1rem; }
+#invite-panel { margin: .6rem 0; padding: .6rem; border: 1px solid #4a4740; border-radius: .4rem; }
+#invite-link { font: .78rem/1.4 ui-monospace, monospace; }
+#invite-qr svg { width: 8rem; height: 8rem; background: #f2efe6; padding: .2rem; border-radius: .3rem; }
 .posts { display: grid; gap: .6rem; margin: .8rem 0; }
 .post { display: grid; grid-template-columns: 32px 1fr; gap: .55rem; align-items: start; }
 .avatar { border-radius: .35rem; background: #17170f; }
@@ -165,6 +169,14 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <h3 id="group-title"></h3>
       <p id="group-about" class="note"></p>
       <p id="group-members" class="note"></p>
+      <section id="invite-panel" hidden>
+        <h4>Invite link</h4>
+        <output id="invite-link"></output>
+        <div id="invite-qr"></div>
+        <button type="button" id="copy-invite">Copy link</button>
+        <button type="button" id="rotate-invite">Rotate link</button>
+        <p class="note">Anyone with this link or its QR code can join. Rotating it stops the old link from working.</p>
+      </section>
       <ul id="posts" class="posts"></ul>
       <p id="reply-note" class="note" hidden><span id="reply-label"></span> <button type="button" id="cancel-reply">Cancel</button></p>
       <label>Message
@@ -197,13 +209,14 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
     <ul id="open-list" class="list"></ul>
     <p id="no-open-groups" class="note" hidden>No open groups to join right now.</p>
 
-    <h2>New open group</h2>
+    <h2>New group</h2>
     <label>Name
       <input id="create-name" autocomplete="off">
     </label>
     <label>About
       <input id="create-about" autocomplete="off">
     </label>
+    <label><input type="checkbox" id="create-private"> Invite-only (join by link or QR code)</label>
     <button type="button" id="create">Create group</button>
 
     <dl>

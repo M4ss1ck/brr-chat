@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
+import { createInviteService } from "./invites.ts";
 import { serveShell } from "./pwa.ts";
 import { DEFAULT_RECOVERY_LIMITS, createRecoveryService, type RecoveryLimits } from "./recovery.ts";
 import { handleSync } from "./sync.ts";
@@ -69,6 +70,7 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
   }
 
   const recovery = createRecoveryService(db, auth, { ...DEFAULT_RECOVERY_LIMITS, ...opts.recoveryLimits });
+  const invites = createInviteService(db, auth, baseURL);
 
   return {
     db,
@@ -77,6 +79,8 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
       const url = new URL(req.url);
       const recovered = await recovery.handle(req, url.pathname, ip);
       if (recovered) return recovered;
+      const invited = await invites.handle(req, url.pathname);
+      if (invited) return invited;
       if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
         return auth.handler(req);
       }

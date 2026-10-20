@@ -567,6 +567,8 @@ export interface StoredOp {
   user?: number;
   role?: number;
   peer?: number;
+  /** Current invite token, for joining an invite-only group from its link. */
+  invite?: string;
   username?: string;
   displayName?: string;
   bio?: string;
@@ -589,6 +591,7 @@ function asStoredOp(value: unknown): StoredOp | null {
   if (isUint(row.user)) op.user = row.user;
   if (isUint(row.role)) op.role = row.role;
   if (isUint(row.peer)) op.peer = row.peer;
+  if (typeof row.invite === "string") op.invite = row.invite;
   if (typeof row.username === "string") op.username = row.username;
   if (typeof row.displayName === "string") op.displayName = row.displayName;
   if (typeof row.bio === "string") op.bio = row.bio;
@@ -662,14 +665,17 @@ export function toWireOp(op: StoredOp): Op {
         about: op.about ?? "",
         open: op.open === true,
       };
-    case Tag.Membership:
-      return {
+    case Tag.Membership: {
+      const membership: Op = {
         cid,
         tag: Tag.Membership,
         scope: op.scope,
         user: op.user ?? 0,
         role: (op.role ?? Role.Member) as typeof Role.Member,
       };
+      // exactOptionalPropertyTypes: only present when the link carried a token.
+      return op.invite === undefined ? membership : { ...membership, invite: op.invite };
+    }
     case Tag.Profile:
       return {
         cid,

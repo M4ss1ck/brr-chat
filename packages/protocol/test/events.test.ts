@@ -29,7 +29,7 @@ export const samples: Event[] = [
   { ...hdr, tag: Tag.Delete, target: 999 },
   { ...hdr, scope: 0, tag: Tag.Profile, username: "ana", displayName: "Ana", bio: "" },
   { ...hdr, tag: Tag.GroupMeta, name: "Habana", about: "", open: true },
-  { ...hdr, tag: Tag.Membership, user: 42, role: 2 },
+  { ...hdr, tag: Tag.Membership, user: 42, role: 2, invite: null },
   { ...hdr, tag: Tag.Ban, user: 66, on: true },
   { ...hdr, tag: Tag.ScopeLeft, purge: true },
   { ...hdr, author: 0, tag: Tag.Gap, after: 10, before: 900, count: 340 },
@@ -69,7 +69,7 @@ describe("events", () => {
       [Role.Owner, 3],
     ] as const;
     for (const [role, wire] of cases) {
-      const ev: Event = { ...hdr, tag: Tag.Membership, user: 42, role };
+      const ev: Event = { ...hdr, tag: Tag.Membership, user: 42, role, invite: null };
       const wireEvent = [Tag.Membership, hdr.seq, hdr.ts, hdr.author, hdr.scope, 42, wire];
       expect(encodeEvent(ev)).toEqual(wireEvent);
       expect(decodeEvent(wireEvent)).toEqual(ev);
@@ -118,6 +118,7 @@ describe("ops (outbox items)", () => {
     { cid, scope: 0, tag: Tag.Dm, peer: 43, text: "new dm", media: null },
     { cid, scope: 7, tag: Tag.Reaction, target: 1, emoji: 0, on: false },
     { cid, scope: 0, tag: Tag.GroupMeta, name: "new group", about: "x", open: false },
+    { cid, scope: 7, tag: Tag.Membership, user: 42, role: Role.Member, invite: "tok_123" },
   ];
 
   test.each(ops.map((o) => [o.tag, o] as const))("op tag %d round-trips", (_t, op) => {
@@ -126,6 +127,39 @@ describe("ops (outbox items)", () => {
 
   test("layout is positional: [cid, tag, scope, ...fields]", () => {
     expect(encodeOp({ cid, scope: 7, tag: Tag.Delete, target: 5 })).toEqual([cid, Tag.Delete, 7, 5]);
+  });
+
+  test("the membership invite token is appended and optional", () => {
+    expect(encodeOp({ cid, scope: 7, tag: Tag.Membership, user: 42, role: Role.Member, invite: "tok" })).toEqual([
+      cid,
+      Tag.Membership,
+      7,
+      42,
+      Role.Member,
+      "tok",
+    ]);
+    // An older client's join has no token; the missing optional decodes as null.
+    expect(decodeOp([cid, Tag.Membership, 7, 42, Role.Member])).toEqual({
+      ok: true,
+      op: { cid, scope: 7, tag: Tag.Membership, user: 42, role: Role.Member, invite: null },
+    });
+    expect(encodeOp({ cid, scope: 7, tag: Tag.Membership, user: 42, role: Role.Member })).toEqual([
+      cid,
+      Tag.Membership,
+      7,
+      42,
+      Role.Member,
+    ]);
+  });
+
+  test("the invite token is op-only: a membership event carries a null optional", () => {
+    expect(decodeEvent([Tag.Membership, 1000, 1_791_000_000, 42, 7, 42, Role.Member])).toEqual({
+      ...hdr,
+      tag: Tag.Membership,
+      user: 42,
+      role: Role.Member,
+      invite: null,
+    });
   });
 
   test("server-only tags cannot be sent as ops", () => {
