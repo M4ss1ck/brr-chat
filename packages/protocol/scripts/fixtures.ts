@@ -47,6 +47,12 @@ export const fixtures: Record<string, Uint8Array> = {
       { cid: cidB, scope: 0, tag: Tag.Dm, peer: 43, text: "primer dm", media: null },
     ],
   }),
+  // Appended optional field: joining an invite-only group with its current link token.
+  "sync-request-invite": encodeSyncRequest({
+    v: 1,
+    cursor: 12,
+    outbox: [{ cid: cidA, scope: 7, tag: Tag.Membership, user: 42, role: 1, invite: "tok_123" }],
+  }),
   "sync-response-empty": encodeSyncResponse({ range: SUPPORTED, cursor: 12, more: false, events: [], acks: [], skipped: 0 }),
   "sync-response-every-event": encodeSyncResponse({
     range: SUPPORTED,

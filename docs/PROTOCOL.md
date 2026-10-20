@@ -104,6 +104,27 @@ HistoryResponse = [vMin: uint, vMax: uint, events: [* Event], more: bool, ? erro
 Returns visible events in `scope` with `seq < before`, newest first. `more` means older events
 exist.
 
+## Invite links
+
+Invite links are ordinary URLs (`/join/<token>`), so a QR code is just the same URL encoded.
+They are managed over JSON beside `/sync`, not as events: a token in the log would be visible
+to every member (ADR 0016).
+
+- `GET /api/groups/{id}/invite` returns `{ group, token, link, qr }` for an invite-only group's
+  admin or owner. `qr` is the link itself.
+- `POST /api/groups/{id}/invite/rotate` returns the same shape with a new token and invalidates
+  the old link immediately. Existing members stay. `POST /api/groups/{id}/invite` is accepted
+  as a shorthand for the same rotation.
+- Open groups have no invite link: `GET`/`POST` on their invite route returns `404`.
+- `GET /api/invites/{token}` returns group basics for a link holder, so the join screen can say
+  what they are joining.
+- `POST /api/invites/{token}/join` joins in one call. The PWA sends a `membership` op with
+  `invite` instead, so the join and its state snapshot arrive in one `/sync` response.
+
+All four require a bearer session. A group admin or owner may read or rotate; a plain member
+gets `403`; a non-member gets `404` for a group they cannot see, and an unknown or rotated
+token gets `404`.
+
 ## Events
 
 ```
@@ -128,7 +149,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 6 | profile | `username, displayName, bio` | yes | `scope = 0`. Avatars are identicons from the user id |
 | 7 | *reserved* | | | never reuse |
 | 8 | group_meta | `name, about, open: bool` | yes | op with `scope = 0` creates a group |
-| 9 | membership | `user: uint, role: uint 0..3` | yes | 0 none (left), 1 member, 2 group admin (`Role.Admin`), 3 owner (`Role.Owner`) |
+| 9 | membership | `user: uint, role: uint 0..3, ? invite: text` | yes | 0 none (left), 1 member, 2 group admin (`Role.Admin`), 3 owner (`Role.Owner`). `invite` exists only in an **op**, never in an event: it is the current token for an invite-only group's link |
 | 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), else group ban (group admin or owner) |
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
@@ -158,6 +179,11 @@ A scope is either a **group** or a **DM** between two users. There is no friends
   client can list it before joining. Its memberships and posts stay members-only. A user joins
   with a `membership` op naming themselves; the join is a new scope, so it gets state and no
   back history (ADR 0009).
+- An **invite-only** group's events are invisible to non-members, including its `group_meta`,
+  so it never appears in the open list. Its single link is a URL whose token names the group.
+  A client joins with the same `membership` op plus `invite = <token>`. The server compares the
+  token with the group's current one; a rotated token gets `Forbidden`. The token is never
+  appended to the membership event (ADR 0016).
 - The server works out the viewer's scope set once per request and filters the log by it.
 - When a user is kicked or banned from a scope, they get `scope_left` with `purge = true`, and
   the client deletes its cached posts from that scope.

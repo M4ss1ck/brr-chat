@@ -8,7 +8,8 @@
     "build": "bun scripts/build.ts"
   },
   "dependencies": {
-    "@brr-chat/protocol": "workspace:*"
+    "@brr-chat/protocol": "workspace:*",
+    "qrcode-generator": "1.4.4"
   },
   "devDependencies": {
     "@brr-chat/server": "workspace:*",

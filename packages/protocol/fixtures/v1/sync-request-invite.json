@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "cursor": 12,
+  "outbox": [
+    {
+      "cid": {
+        "$hex": "a1a2a3a4a5a6a7a8"
+      },
+      "scope": 7,
+      "tag": 9,
+      "user": 42,
+      "role": 1,
+      "invite": "tok_123"
+    }
+  ],
+  "rejected": []
+}

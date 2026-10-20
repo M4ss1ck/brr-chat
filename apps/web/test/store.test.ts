@@ -298,16 +298,32 @@ describe("store (IndexedDB)", () => {
   test("outbox round-trips a cid and drops only the acknowledged op", async () => {
     const first = await enqueueOp("alice", { tag: Tag.GroupMeta, scope: 0, name: "G", about: "", open: true });
     const second = await enqueueOp("alice", { tag: Tag.Post, scope: 5, text: "hi" });
+    const third = await enqueueOp("alice", {
+      tag: Tag.Membership,
+      scope: 5,
+      user: 7,
+      role: Role.Member,
+      invite: "tok_123",
+    });
     expect(first.cid).toHaveLength(8);
-    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([first.cid, second.cid]);
+    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([first.cid, second.cid, third.cid]);
     // Another account on the same device has its own queue.
     expect(await getOutbox("bob")).toEqual([]);
 
     expect(toWireOp(first)).toMatchObject({ tag: Tag.GroupMeta, scope: 0, name: "G", open: true });
     expect(toWireOp(second)).toMatchObject({ tag: Tag.Post, scope: 5, text: "hi" });
+    // The invite token survives a store round-trip and reaches the membership op.
+    expect(toWireOp(third)).toEqual({
+      cid: new Uint8Array(third.cid),
+      tag: Tag.Membership,
+      scope: 5,
+      user: 7,
+      role: Role.Member,
+      invite: "tok_123",
+    });
 
     await removeOutbox("alice", [new Uint8Array(first.cid)]);
-    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([second.cid]);
+    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([second.cid, third.cid]);
   });
 
   test("the outbox round-trips a reply and a reaction toggle", async () => {

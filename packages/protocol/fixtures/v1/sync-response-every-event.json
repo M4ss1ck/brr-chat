@@ -23,7 +23,8 @@
       "scope": 7,
       "tag": 9,
       "user": 42,
-      "role": 3
+      "role": 3,
+      "invite": null
     },
     {
       "seq": 3,

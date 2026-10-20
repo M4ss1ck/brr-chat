@@ -24,12 +24,14 @@ CREATE TABLE IF NOT EXISTS wire_users (
 
 // Group id is the seq of its group_meta event (docs/PROTOCOL.md: a seq is the id of the
 // thing the event creates). The open flag is duplicated from the metadata so visibility
-// can be decided without decoding every event.
+// can be decided without decoding every event. `invite_token` is the current secret in the
+// group's single invite link; rotating it is one UPDATE (ADR 0016).
 const CREATE_GROUPS_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS chat_groups (
   id INTEGER PRIMARY KEY,
   open INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  invite_token TEXT
 )
 `.trim();
 
@@ -110,6 +112,12 @@ export function openDb(dbPath: string): Database {
   db.exec(CREATE_EVENTS_TABLE_SQL);
   db.exec(CREATE_WIRE_USERS_TABLE_SQL);
   db.exec(CREATE_GROUPS_TABLE_SQL);
+  // A database created before invite links has no column to ALTER in CREATE TABLE IF NOT
+  // EXISTS. SQLite has no ADD COLUMN IF NOT EXISTS, so check the schema first.
+  const groupColumns = db.query("PRAGMA table_info(chat_groups)").all() as { name: string }[];
+  if (!groupColumns.some((column) => column.name === "invite_token")) {
+    db.exec("ALTER TABLE chat_groups ADD COLUMN invite_token TEXT;");
+  }
   db.exec(CREATE_GROUP_MEMBERS_TABLE_SQL);
   db.exec(CREATE_DM_SCOPES_TABLE_SQL);
   db.exec(CREATE_OUTBOX_TABLE_SQL);
@@ -118,6 +126,8 @@ export function openDb(dbPath: string): Database {
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS dm_scopes_pair ON dm_scopes(user_a, user_b);");
   db.exec("CREATE INDEX IF NOT EXISTS dm_scopes_user_a ON dm_scopes(user_a);");
   db.exec("CREATE INDEX IF NOT EXISTS dm_scopes_user_b ON dm_scopes(user_b);");
+  // One live token per group, and no two groups may share one. SQLite allows many NULLs.
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS chat_groups_invite_token ON chat_groups(invite_token);");
   db.exec("CREATE INDEX IF NOT EXISTS outbox_created ON outbox_ops(created_at);");
   db.exec(CREATE_RECOVERY_TABLE_SQL);
   return db;

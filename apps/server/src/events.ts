@@ -2,6 +2,7 @@
 // current membership, appended as canonical event bytes, and projected into the small tables
 // that make the next sync cheap. See docs/PROTOCOL.md and ADR 0010.
 import type { Database } from "bun:sqlite";
+import { timingSafeEqual } from "node:crypto";
 import {
   AckError,
   Role,
@@ -34,6 +35,23 @@ export interface Actor {
 interface GroupRow {
   id: number;
   open: number;
+  invite_token: string | null;
+}
+
+/** Bytes of randomness in one invite token. 128 bits, URL-safe, one per invite-only group. */
+export const INVITE_TOKEN_BYTES = 16;
+
+/** A fresh invite token. Base64url keeps it copy-pasteable and safe in a URL or QR code. */
+export function newInviteToken(): string {
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(INVITE_TOKEN_BYTES))).toString("base64url");
+}
+
+/** Constant-time comparison: a wrong token must not reveal how much of it was right. */
+export function inviteMatches(group: Pick<GroupRow, "invite_token">, token: string | null | undefined): boolean {
+  if (group.invite_token === null || typeof token !== "string" || token.length === 0) return false;
+  const expected = Buffer.from(group.invite_token, "utf8");
+  const actual = Buffer.from(token, "utf8");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 interface MemberRow {
@@ -115,11 +133,16 @@ function insertEvent(db: Database, build: (seq: number) => Event): number {
   return insertEventAt(db, nextSeq(db), build);
 }
 
-function groupFor(db: Database, id: number): GroupRow | null {
-  return db.query("SELECT id, open FROM chat_groups WHERE id = ?").get(id) as GroupRow | null;
+export function groupFor(db: Database, id: number): GroupRow | null {
+  return db.query("SELECT id, open, invite_token FROM chat_groups WHERE id = ?").get(id) as GroupRow | null;
 }
 
-function memberFor(db: Database, groupId: number, wireId: number): MemberRow | null {
+/** Resolves the one live token to its group; a rotated token finds nothing. */
+export function groupForInviteToken(db: Database, token: string): GroupRow | null {
+  return db.query("SELECT id, open, invite_token FROM chat_groups WHERE invite_token = ?").get(token) as GroupRow | null;
+}
+
+export function memberFor(db: Database, groupId: number, wireId: number): MemberRow | null {
   return db
     .query("SELECT group_id, user_id, role, seq FROM group_members WHERE group_id = ? AND user_id = ?")
     .get(groupId, wireId) as MemberRow | null;
@@ -188,7 +211,13 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
         about: op.about,
         open: op.open,
       }));
-      db.query("INSERT INTO chat_groups (id, open, created_at) VALUES (?, ?, ?)").run(groupId, op.open ? 1 : 0, now);
+      db.query("INSERT INTO chat_groups (id, open, created_at, invite_token) VALUES (?, ?, ?, ?)").run(
+        groupId,
+        op.open ? 1 : 0,
+        now,
+        // Only an invite-only group needs a secret link; open groups have the open list.
+        op.open ? null : newInviteToken(),
+      );
       const memberSeq = insertEvent(db, (seq) => ({
         tag: Tag.Membership,
         seq,
@@ -218,7 +247,10 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
           ? { seq: Number(existing.seq), firstSeq: Number(existing.seq), state: true }
           : { error: AckError.Forbidden };
       }
-      if (!group.open) return { error: AckError.Forbidden };
+      // An invite-only group is joinable only with its current link token (ADR 0010). Open
+      // groups ignore any token the client happens to send. The token is an op field and is
+      // never copied into the membership event.
+      if (!group.open && !inviteMatches(group, op.invite)) return { error: AckError.Forbidden };
       if (op.role !== Role.Member) return { error: AckError.Forbidden };
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Membership,
