@@ -80,7 +80,8 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
   (`/history`).
 - **Fresh device or new join:** the server sends current state (profiles, group metadata,
   memberships) and a cursor at the head of the log. **No posts.** Older posts load only when the
-  user asks.
+  user asks. A state snapshot may repeat an event at or below the device's previous cursor; the
+  client applies it by `seq` and then moves to the returned cursor.
 - **Outbox:** each op carries a `cid`, 8 random bytes chosen by the device. A retry resends the
   same `cid`. The server remembers `cid → seq` for 30 days and returns the original seq instead of
   creating a duplicate. Every op gets exactly one ack. An op with an unknown
@@ -146,6 +147,10 @@ A scope is either a **group** or a **DM** between two users. There is no friends
 - A user sees an event if they currently have access to its scope: they are a member of the
   group (or the group is open and they joined), or they are one of the two DM participants.
   Scope-0 events are visible to everyone on the server.
+- An **open** group's `group_meta` event is visible to every account, member or not, so the
+  client can list it before joining. Its memberships and posts stay members-only. A user joins
+  with a `membership` op naming themselves; the join is a new scope, so it gets state and no
+  back history (ADR 0009).
 - The server works out the viewer's scope set once per request and filters the log by it.
 - When a user is kicked or banned from a scope, they get `scope_left` with `purge = true`, and
   the client deletes its cached posts from that scope.

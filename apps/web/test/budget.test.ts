@@ -65,18 +65,27 @@ describe("app shell budget", () => {
     }
   });
 
-  test("the embedded shell the server embeds matches this build", () => {
+  test("the embedded shell the server embeds matches this build and is not left unstaged", () => {
     const generated = resolve(WEB_ROOT, "..", "server", "src", "pwa-assets.generated.ts");
     if (Bun.which("git") === null) {
       console.log("git is unavailable: the embedded shell freshness check is skipped");
       return;
     }
-    const relativePath = relative(WEB_ROOT, generated);
-    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", relativePath], cwd: WEB_ROOT });
+    // Git commands run from the repository root: during a pre-commit hook Git may export a
+    // relative GIT_INDEX_FILE, which breaks when the child process changes directory.
+    const repoRoot = resolve(WEB_ROOT, "..", "..");
+    const relativePath = relative(repoRoot, generated);
+    const tracked = Bun.spawnSync({ cmd: ["git", "ls-files", "--error-unmatch", "--", relativePath], cwd: repoRoot });
     expect(tracked.exitCode).toBe(0);
 
-    // Against HEAD, not the index: a shell that was built but never committed fails too.
-    const diff = Bun.spawnSync({ cmd: ["git", "diff", "--quiet", "--exit-code", "HEAD", "--", relativePath], cwd: WEB_ROOT });
-    expect(diff.exitCode).toBe(0);
+    // The build above just rewrote the file. It is honest when git has nothing fresh to say:
+    // either it is already committed, or it is staged for the commit being made right now.
+    // An unstaged modification or an untracked file means the build never made it into a
+    // commit, which is what this gate is for.
+    const status = Bun.spawnSync({ cmd: ["git", "status", "--porcelain", "--", relativePath], cwd: repoRoot });
+    const line = status.stdout.toString().trim();
+    if (line.length > 0) {
+      expect(line.startsWith("M ") || line.startsWith("A ")).toBe(true);
+    }
   });
 });

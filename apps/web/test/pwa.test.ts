@@ -156,7 +156,7 @@ describe("PWA client (apps/web)", () => {
     await expect(postSyncRequest(base, session.token, buildSyncRequest(0))).rejects.toThrow("status 401");
     const again = await auth.signIn(base, session.username, "password1234");
     expect(again.token).not.toBe(session.token);
-    const outcome = await syncAndPersist(base, again.token);
+    const outcome = await syncAndPersist(base, again.token, again.username);
     expect(outcome.kind).toBe("ok");
   });
 
@@ -177,21 +177,21 @@ describe("PWA client (apps/web)", () => {
 
   test("syncs an empty server: cursor 0 stored, cached range, no events", async () => {
     const { session } = await signUpConfirmed();
-    const outcome = await syncAndPersist(base, session.token);
+    const outcome = await syncAndPersist(base, session.token, session.username);
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind !== "ok") return;
     expect(outcome.response.cursor).toBe(0);
     expect(outcome.response.events).toEqual([]);
     expect(outcome.response.more).toBe(false);
-    expect(await getStoredCursor()).toBe(0);
-    expect(await getCursor()).toBe(0);
+    expect(await getStoredCursor(session.username)).toBe(0);
+    expect(await getCursor(session.username)).toBe(0);
     expect(await getRange()).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
   });
 
   test("an out-of-range version answers with the upgrade error and moves no cursor", async () => {
     const { session } = await signUpConfirmed();
-    expect(await getStoredCursor()).toBeNull();
+    expect(await getStoredCursor(session.username)).toBeNull();
 
     const old = await postSyncRequest(base, session.token, buildSyncRequest(0, [], 0));
     expect(classifySyncResponse(old)).toEqual({
@@ -207,14 +207,14 @@ describe("PWA client (apps/web)", () => {
       range: { min: 1, max: 1 },
     });
 
-    expect(await getStoredCursor()).toBeNull();
+    expect(await getStoredCursor(session.username)).toBeNull();
   });
 
   test("a server that moved on: the range is cached and the cursor is not advanced", async () => {
     const { session } = await signUpConfirmed();
-    const first = await syncAndPersist(base, session.token);
+    const first = await syncAndPersist(base, session.token, session.username);
     expect(first.kind).toBe("ok");
-    expect(await getCursor()).toBe(0);
+    expect(await getCursor(session.username)).toBe(0);
 
     // Stand-in for the next server build: it accepts v2..v2, so this client is too old.
     const moved = Bun.serve({
@@ -226,7 +226,7 @@ describe("PWA client (apps/web)", () => {
         ),
     });
     try {
-      const outcome = await syncAndPersist(`http://127.0.0.1:${moved.port}`, session.token);
+      const outcome = await syncAndPersist(`http://127.0.0.1:${moved.port}`, session.token, session.username);
       expect(outcome).toEqual({ kind: "upgrade", error: ResponseError.ClientTooNew, range: { min: 2, max: 2 } });
     } finally {
       await moved.stop(true);
@@ -235,12 +235,12 @@ describe("PWA client (apps/web)", () => {
     // The cached range is what lets the UI say "update available" before the server
     // stops answering, and the local cursor must not move on a rejected response.
     expect(await getRange()).toEqual({ min: 2, max: 2 });
-    expect(await getCursor()).toBe(0);
+    expect(await getCursor(session.username)).toBe(0);
   });
 
   test("an unauthenticated sync throws instead of writing a cursor", async () => {
     await expect(postSyncRequest(base, "nope".repeat(8), buildSyncRequest(0))).rejects.toThrow("status 401");
-    expect(await getStoredCursor()).toBeNull();
+    expect(await getStoredCursor("nobody")).toBeNull();
   });
 
   test("a request without a token throws", async () => {
@@ -270,7 +270,7 @@ describe("PWA client (apps/web)", () => {
 
     await auth.confirmRecovery(base, recoveryCode.slice(-5));
     expect((await getSession())?.recoveryPending).toBeUndefined();
-    expect((await syncAndPersist(base, pending.token)).kind).toBe("ok");
+    expect((await syncAndPersist(base, pending.token, pending.username)).kind).toBe("ok");
 
     const next = await auth.regenerateRecovery(base);
     expect(next).not.toBe(recoveryCode);
@@ -282,14 +282,14 @@ describe("PWA client (apps/web)", () => {
     const redeemed = await auth.redeemRecovery(base, account, next);
     expect(redeemed.session.username).toBe(account);
     expect(await getSession()).toEqual(redeemed.session);
-    expect((await syncAndPersist(base, redeemed.session.token)).kind).toBe("ok");
+    expect((await syncAndPersist(base, redeemed.session.token, redeemed.session.username)).kind).toBe("ok");
   });
 
   test("the empty sync round trip stays under 1 KB on the wire, bearer header included", async () => {
     const { session } = await signUpConfirmed();
     const counter = await startWireCounter();
     try {
-      const outcome = await syncAndPersist(counter.base, session.token);
+      const outcome = await syncAndPersist(counter.base, session.token, session.username);
       expect(outcome.kind).toBe("ok");
       const wireBytes = counter.totals();
       console.log(`empty sync wire bytes (client->server->client, real socket): ${wireBytes} B`);

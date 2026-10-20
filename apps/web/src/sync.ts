@@ -10,7 +10,7 @@ import {
   type VersionRange,
 } from "@brr-chat/protocol";
 import { bearerHeader } from "./auth.ts";
-import { getCursor, setCursor, setRange } from "./store.ts";
+import { applyEvents, getCursor, setCursor, setRange } from "./store.ts";
 
 export const SYNC_PATH = "/sync";
 
@@ -56,13 +56,22 @@ export function classifySyncResponse(response: SyncResponse): SyncOutcome {
 
 /**
  * Syncs from the stored cursor, caches the server range either way, and advances the stored
- * cursor only for an in-range response.
+ * cursor only for an in-range response. Events are applied before the cursor moves, so a
+ * failed IndexedDB write cannot strand them behind an advanced cursor.
  */
-export async function syncAndPersist(base: string, token: string, outbox: Op[] = []): Promise<SyncOutcome> {
-  const cursor = await getCursor();
+export async function syncAndPersist(
+  base: string,
+  token: string,
+  username: string,
+  outbox: Op[] = [],
+): Promise<SyncOutcome> {
+  const cursor = await getCursor(username);
   const response = await postSyncRequest(base, token, buildSyncRequest(cursor, outbox));
   await setRange(response.range);
   const outcome = classifySyncResponse(response);
-  if (outcome.kind === "ok") await setCursor(response.cursor);
+  if (outcome.kind === "ok") {
+    await applyEvents(username, response.events);
+    await setCursor(username, response.cursor);
+  }
   return outcome;
 }
