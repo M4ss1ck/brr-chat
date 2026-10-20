@@ -5,6 +5,7 @@ import type { Database } from "bun:sqlite";
 import { AckError, Role, Tag, decodeEventBytes, type Event } from "@brr-chat/protocol";
 import { actorFor, applyOutbox, groupFor, groupForInviteToken, memberFor, newInviteToken } from "./events.ts";
 import type { AuthInstance } from "./index.ts";
+import type { AbuseLimiters } from "./limits.ts";
 import { isRecoveryConfirmed } from "./recovery.ts";
 
 /** The public path a link points at. The shell serves the app for this route. */
@@ -82,7 +83,12 @@ export interface InviteService {
   handle(req: Request, pathname: string): Promise<Response | null>;
 }
 
-export function createInviteService(db: Database, auth: AuthInstance, baseURL: string): InviteService {
+export function createInviteService(
+  db: Database,
+  auth: AuthInstance,
+  baseURL: string,
+  limits: AbuseLimiters,
+): InviteService {
   async function sessionAccount(req: Request): Promise<{ userId: string; wireId: number } | Response> {
     const session = await auth.api.getSession({ headers: req.headers });
     if (!session || session.user.banned) return json(401, { error: "sign in first" });
@@ -155,7 +161,7 @@ export function createInviteService(db: Database, auth: AuthInstance, baseURL: s
     const cid = crypto.getRandomValues(new Uint8Array(8));
     const result = applyOutbox(db, actorFor(db, session.userId), [
       { cid, tag: Tag.Membership, scope: group.id, user: session.wireId, role: Role.Member, invite: token },
-    ]);
+    ], limits);
     const ack = result.acks[0];
     if (!ack || "error" in ack) {
       const error = ack && "error" in ack ? ack.error : AckError.Forbidden;

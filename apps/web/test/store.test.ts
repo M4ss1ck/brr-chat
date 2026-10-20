@@ -193,6 +193,30 @@ describe("store (IndexedDB)", () => {
     expect(await getDmMessages("alice", 40)).toEqual([]);
   });
 
+  test("a block event drops the blocked author's cached posts and reactions", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.GroupMeta, seq: 10, ts: 100, author: 1, scope: 10, name: "Habana", about: "", open: false },
+      { tag: Tag.Membership, seq: 11, ts: 101, author: 1, scope: 10, user: 1, role: Role.Owner },
+      { tag: Tag.Membership, seq: 12, ts: 102, author: 2, scope: 10, user: 2, role: Role.Member },
+      { tag: Tag.Post, seq: 13, ts: 103, author: 1, scope: 10, text: "mine", media: null },
+      { tag: Tag.Post, seq: 14, ts: 104, author: 2, scope: 10, text: "theirs", media: null },
+      { tag: Tag.Reaction, seq: 15, ts: 105, author: 2, scope: 10, target: 13, emoji: 0, on: true },
+      { tag: Tag.DmScope, seq: 40, ts: 400, author: 1, scope: 40, peer: 2 },
+      { tag: Tag.Dm, seq: 41, ts: 401, author: 1, scope: 40, peer: 2, text: "hola", media: null },
+      { tag: Tag.Dm, seq: 42, ts: 402, author: 2, scope: 40, peer: 1, text: "te oigo", media: null },
+    ]);
+
+    await applyEvents("alice", [{ tag: Tag.Block, seq: 50, ts: 500, author: 1, scope: 0, user: 2, on: true }]);
+
+    expect((await getPosts("alice", 10)).map((post) => post.author)).toEqual([1]);
+    expect(await getReactions("alice", 10)).toEqual([]);
+    expect((await getDmMessages("alice", 40)).map((message) => message.author)).toEqual([1]);
+    // The block hides content, not the group, its members, or the conversation itself.
+    expect((await getGroups("alice")).map((group) => group.id)).toEqual([10]);
+    expect(await getMembers("alice", 10)).toHaveLength(2);
+    expect(await getDmScopes("alice")).toHaveLength(1);
+  });
+
   test("a dm op round-trips through the outbox with its peer", async () => {
     const stored = await enqueueOp("alice", { tag: Tag.Dm, scope: 0, peer: 2, text: "first" });
     expect(stored).toMatchObject({ tag: Tag.Dm, scope: 0, peer: 2, text: "first" });
@@ -203,6 +227,18 @@ describe("store (IndexedDB)", () => {
       peer: 2,
       text: "first",
       media: null,
+    });
+    expect(await getOutbox("alice")).toEqual([stored]);
+  });
+
+  test("a block op round-trips through the outbox", async () => {
+    const stored = await enqueueOp("alice", { tag: Tag.Block, scope: 0, user: 2, on: true });
+    expect(toWireOp(stored)).toEqual({
+      cid: new Uint8Array(stored.cid),
+      tag: Tag.Block,
+      scope: 0,
+      user: 2,
+      on: true,
     });
     expect(await getOutbox("alice")).toEqual([stored]);
   });

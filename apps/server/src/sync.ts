@@ -22,6 +22,7 @@ import {
   visibleFrom,
 } from "./events.ts";
 import type { AuthInstance } from "./index.ts";
+import type { AbuseLimiters } from "./limits.ts";
 import { isRecoveryConfirmed } from "./recovery.ts";
 
 function respondCborBrotli(res: SyncResponse): Response {
@@ -36,7 +37,12 @@ function respondCborBrotli(res: SyncResponse): Response {
   });
 }
 
-export async function handleSync(req: Request, db: Database, auth: AuthInstance): Promise<Response> {
+export async function handleSync(
+  req: Request,
+  db: Database,
+  auth: AuthInstance,
+  limits: AbuseLimiters,
+): Promise<Response> {
   const session = await auth.api.getSession({ headers: req.headers });
   if (!session || session.user.banned) {
     return new Response("Unauthorized", { status: 401 });
@@ -84,7 +90,7 @@ export async function handleSync(req: Request, db: Database, auth: AuthInstance)
   const actor = actorFor(db, session.user.id);
 
   // Ops are all-or-nothing; a malformed op was already turned into a nack by decodeSyncRequest.
-  const applied = applyOutbox(db, actor, decoded.outbox);
+  const applied = applyOutbox(db, actor, decoded.outbox, limits);
   const acks: Ack[] = [...decoded.rejected.map((r) => ({ cid: r.cid, error: r.error })), ...applied.acks];
 
   let events: Event[];

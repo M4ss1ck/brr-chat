@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { AuthInstance } from "./index.ts";
+import { FixedWindowCounter, type SignupBudget } from "./limits.ts";
 
 // Account recovery by code only (ADR 0006). The code is 4 groups of 5 Crockford base32
 // characters: 100 bits, shown once, stored as hashes. Signing up is not finished until the
@@ -84,33 +85,19 @@ export const DEFAULT_RECOVERY_LIMITS: RecoveryLimits = {
   perUsername: 5,
 };
 
-/** Fixed-window counters. Kept in memory: a restart forgets attempts, but never a code. */
+/** Counts one attempt against both the IP and the username window, in the same fixed bucket. */
 class RateLimiter {
-  private readonly buckets = new Map<string, { count: number; resetAt: number }>();
+  private readonly byIp: FixedWindowCounter;
+  private readonly byUsername: FixedWindowCounter;
 
-  constructor(private readonly limits: RecoveryLimits) {}
-
-  private hit(key: string, max: number, now: number): { allowed: boolean; retryAfter: number } {
-    const bucket = this.buckets.get(key);
-    if (!bucket || bucket.resetAt <= now) {
-      this.buckets.set(key, { count: 1, resetAt: now + this.limits.windowMs });
-      return { allowed: true, retryAfter: 0 };
-    }
-    bucket.count += 1;
-    return {
-      allowed: bucket.count <= max,
-      retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
-    };
+  constructor(limits: RecoveryLimits) {
+    this.byIp = new FixedWindowCounter(limits.windowMs, limits.perIp);
+    this.byUsername = new FixedWindowCounter(limits.windowMs, limits.perUsername);
   }
 
   check(ip: string, username: string, now: number = Date.now()): { allowed: boolean; retryAfter: number } {
-    if (this.buckets.size > 10_000) {
-      for (const [key, bucket] of this.buckets) {
-        if (bucket.resetAt <= now) this.buckets.delete(key);
-      }
-    }
-    const byIp = this.hit(`ip:${ip}`, this.limits.perIp, now);
-    const byUsername = this.hit(`user:${username}`, this.limits.perUsername, now);
+    const byIp = this.byIp.consume(`ip:${ip}`, now);
+    const byUsername = this.byUsername.consume(`user:${username}`, now);
     return {
       allowed: byIp.allowed && byUsername.allowed,
       retryAfter: Math.max(byIp.retryAfter, byUsername.retryAfter, 1),
@@ -193,11 +180,27 @@ export interface RecoveryService {
   handle(req: Request, pathname: string, ip?: string): Promise<Response | null>;
 }
 
-export function createRecoveryService(db: Database, auth: AuthInstance, limits: RecoveryLimits = DEFAULT_RECOVERY_LIMITS): RecoveryService {
+export function createRecoveryService(
+  db: Database,
+  auth: AuthInstance,
+  limits: RecoveryLimits,
+  signupBudget: SignupBudget,
+): RecoveryService {
   const limiter = new RateLimiter(limits);
 
   /** Sign-up goes through BetterAuth, then the new account gets its one recovery code. */
-  async function signUp(req: Request): Promise<Response> {
+  async function signUp(req: Request, ip: string): Promise<Response> {
+    // ADR 0012: signups are budgeted per IP. Reserve before the await so concurrent requests
+    // cannot all pass the check; a failed attempt gives the slot back, so a typo is free.
+    const now = Date.now();
+    const gate = signupBudget.consume(ip, now);
+    if (!gate.allowed) {
+      return json(
+        429,
+        { error: "too many signups; try again later" },
+        { "Retry-After": String(gate.retryAfter) },
+      );
+    }
     const raw = await req.arrayBuffer();
     // Our path is an alias; BetterAuth only knows its own sign-up route.
     const authURL = new URL(req.url);
@@ -209,7 +212,10 @@ export function createRecoveryService(db: Database, auth: AuthInstance, limits: 
         body: raw,
       }),
     );
-    if (!upstream.ok) return upstream;
+    if (!upstream.ok) {
+      signupBudget.refund(ip, now);
+      return upstream;
+    }
 
     const payload = (await upstream.json().catch(() => null)) as
       | { token?: unknown; user?: { id?: unknown } | null }
@@ -309,8 +315,8 @@ export function createRecoveryService(db: Database, auth: AuthInstance, limits: 
 
   return {
     async handle(req, pathname, ip = ipFrom(req)): Promise<Response | null> {
-      if (pathname === "/api/auth/sign-up/email" && req.method === "POST") return signUp(req);
-      if (pathname === "/api/recovery/sign-up" && req.method === "POST") return signUp(req);
+      if (pathname === "/api/auth/sign-up/email" && req.method === "POST") return signUp(req, ip);
+      if (pathname === "/api/recovery/sign-up" && req.method === "POST") return signUp(req, ip);
       if (pathname === "/api/recovery/confirm" && req.method === "POST") return confirm(req);
       if (pathname === "/api/recovery/regenerate" && req.method === "POST") return regenerate(req);
       if (pathname === "/api/recovery/redeem" && req.method === "POST") return redeem(req, ip);

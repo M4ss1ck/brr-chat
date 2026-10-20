@@ -99,8 +99,16 @@ async function identify(app: ServerApp, account: Account): Promise<{ wire: numbe
   return { wire: profile.author, cursor: response.cursor };
 }
 
-async function client(app: ServerApp, username: string): Promise<Client> {
+function setAge(app: ServerApp, username: string, hours: number): void {
+  app.db
+    .query("UPDATE user SET createdAt = ? WHERE username = ?")
+    .run(new Date(Date.now() - hours * 60 * 60 * 1000).toISOString(), username);
+}
+
+/** Default age 25h: past the 24h new-account DM cooldown (ADR 0012). */
+async function client(app: ServerApp, username: string, ageHours = 25): Promise<Client> {
   const account = await signUp(app, username);
+  setAge(app, username, ageHours);
   const identity = await identify(app, account);
   return { account, wire: identity.wire, cursor: identity.cursor };
 }

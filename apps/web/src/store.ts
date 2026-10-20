@@ -491,6 +491,30 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           touchedBans.add(event.scope);
         }
         break;
+      case Tag.Block:
+        // A block is silent but not retroactively invisible to this device: drop what it
+        // already cached from that author, in every group and DM it knows (ADR 0012).
+        if (event.on) {
+          const knownScopes = new Set<number>([
+            ...Object.values(groups).map((group) => group.id),
+            ...Object.values(dms).map((dm) => dm.id),
+          ]);
+          for (const scope of knownScopes) {
+            const postMap = posts.get(scope) ?? (await readMap(postsKey(username, scope), asPost));
+            posts.set(scope, postMap);
+            for (const [key, post] of Object.entries(postMap)) {
+              if (post.author === event.user) delete postMap[key];
+            }
+            const reactionMap = reactions.get(scope) ?? (await readMap(reactionsKey(username, scope), asReaction));
+            reactions.set(scope, reactionMap);
+            for (const [key, reaction] of Object.entries(reactionMap)) {
+              if (reaction.user === event.user) delete reactionMap[key];
+            }
+            touchedPosts.add(scope);
+            touchedReactions.add(scope);
+          }
+        }
+        break;
       default:
         // Gap and unknown tags carry no state this slice can cache.
         break;
@@ -756,6 +780,8 @@ export function toWireOp(op: StoredOp): Op {
         displayName: op.displayName ?? "",
         bio: op.bio ?? "",
       };
+    case Tag.Block:
+      return { cid, tag: Tag.Block, scope: 0, user: op.user ?? 0, on: op.on === true };
     default:
       throw new Error(`outbox: unsupported tag ${op.tag}`);
   }

@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS dm_scopes (
 )
 `.trim();
 
+// A personal block (ADR 0012) is server state, never a public event: the blocked account must
+// not be able to probe it. Rows are keyed by wire ids because that is what events carry.
+const CREATE_USER_BLOCKS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS user_blocks (
+  blocker INTEGER NOT NULL,
+  blocked INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (blocker, blocked)
+)
+`.trim();
+
+// An event visible only to one viewer. Personal block events land here: the blocker's
+// devices see them, everyone else's visibility filter drops them.
+const CREATE_PRIVATE_EVENTS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS private_events (
+  seq INTEGER PRIMARY KEY,
+  viewer INTEGER NOT NULL
+)
+`.trim();
+
 // Outbox dedup (docs/PROTOCOL.md): cid -> seq for 30 days, per account. `tag` lets a retried
 // join or group create still answer with the state snapshot it originally deserved.
 const CREATE_OUTBOX_TABLE_SQL = `
@@ -159,6 +179,8 @@ export function openDb(dbPath: string): Database {
   db.exec(CREATE_DELETED_EVENTS_TABLE_SQL);
   db.exec(CREATE_SCOPE_LEFTS_TABLE_SQL);
   db.exec(CREATE_DM_SCOPES_TABLE_SQL);
+  db.exec(CREATE_USER_BLOCKS_TABLE_SQL);
+  db.exec(CREATE_PRIVATE_EVENTS_TABLE_SQL);
   db.exec(CREATE_OUTBOX_TABLE_SQL);
   db.exec("CREATE INDEX IF NOT EXISTS events_scope_seq ON events(scope, seq);");
   db.exec("CREATE INDEX IF NOT EXISTS events_tag_scope ON events(tag, scope);");

@@ -29,7 +29,14 @@ let app: Awaited<ReturnType<typeof createApp>> | null = null;
 async function startServer(): Promise<void> {
   tempDir = mkdtempSync(join(tmpdir(), "brr-chat-web-pwa-"));
   const dbPath = join(tempDir, "chat.db");
-  app = await createApp({ dbPath, host: "127.0.0.1", baseURL: "http://127.0.0.1", secret: TEST_SECRET });
+  app = await createApp({
+    dbPath,
+    host: "127.0.0.1",
+    baseURL: "http://127.0.0.1",
+    secret: TEST_SECRET,
+    // This suite makes many accounts against one test server; abuse budgets are not its subject.
+    limits: { signupsPerHour: 100 },
+  });
   server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => app!.fetch(req) });
   base = `http://127.0.0.1:${server.port}`;
 }

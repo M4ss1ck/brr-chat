@@ -13,6 +13,8 @@
   server-wide `admin` role in BetterAuth.
 - **DM scope**: the one scope for an unordered pair of accounts. Its id is the `seq` of the
   `dm_scope` event that created it; there is exactly one per pair (ADR 0015).
+- **Block**: one account's personal, silent refusal to receive another account's posts and DMs.
+  Stored as server state; the blocked account is never told (ADR 0012).
 - **Invite link**: an invite-only group's one URL (`/join/<token>`) and the QR code that encodes
   it. Group admins and the owner can rotate it; the old token stops working at once, while
   existing members stay (ADR 0016).
