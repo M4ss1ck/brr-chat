@@ -154,6 +154,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
 | 13 | dm_scope | `peer: uint` | no | server-generated when a DM is first opened; `scope` is the new DM id |
+| 14 | block | `user: uint, on: bool` | yes | `scope = 0` toggles the sender's personal, silent block of `user`. The event is delivered only to the blocker; the blocked account is never told (ADR 0012) |
 
 ```
 Media = [id: uint, w: uint, h: uint, thumbhash: bytes .size (0..32)]
@@ -187,3 +188,24 @@ A scope is either a **group** or a **DM** between two users. There is no friends
 - The server works out the viewer's scope set once per request and filters the log by it.
 - When a user is kicked or banned from a scope, they get `scope_left` with `purge = true`, and
   the client deletes its cached posts from that scope.
+
+## Abuse controls (ADR 0012)
+
+Open servers stay usable without new round trips: every control is decided inside the op that
+would have broken it, and the outbox keeps moving.
+
+- **Budgets.** Posts and DMs share one per-account budget of 30 per minute. Opening a brand-new
+  DM thread is one of 10 per account per day; replies and later messages in an existing thread are
+  free of that budget. Signups are 3 per IP per hour.
+- **Ack, not HTTP error.** An over-budget op gets `AckError.RateLimited = 5` for that `cid`; the
+  rest of the batch still applies. A rate-limited signup is the one JSON route and answers `429`
+  with `Retry-After`.
+- **New-account DM cooldown.** An account younger than 24h cannot open a DM thread: `Forbidden`.
+  It can still reply in a thread an older account opened, because the scope id already exists.
+- **Silent personal block.** A `block` op with `scope = 0` toggles the sender's own block of
+  `user`. The server stores it and returns a normal ack. A blocked account's posts, replies,
+  reactions, DM scopes and DMs stop appearing on the blocker's devices; a device that already
+  cached that author's content drops it when the block event arrives. A DM the blocked account
+  sends is still stored and acked as delivered, but the blocker never receives it. The block event
+  itself is delivered only to the blocker, so the blocked account cannot tell it happened.
+  Unblocking (`on = false`) is just as silent.

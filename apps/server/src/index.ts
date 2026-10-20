@@ -3,6 +3,7 @@ import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
 import { createInviteService } from "./invites.ts";
+import { AbuseLimiters, DEFAULT_ABUSE_LIMITS, type AbuseLimitConfig } from "./limits.ts";
 import { serveShell } from "./pwa.ts";
 import { DEFAULT_RECOVERY_LIMITS, createRecoveryService, type RecoveryLimits } from "./recovery.ts";
 import { handleSync } from "./sync.ts";
@@ -18,6 +19,8 @@ export interface AppOptions {
   secret?: string | undefined;
   /** Recovery redeem limits; tests use it to reach the gate without a hundred requests. */
   recoveryLimits?: Partial<RecoveryLimits>;
+  /** Abuse budgets from ADR 0012; tests use it to shrink a window instead of waiting a day. */
+  limits?: Partial<AbuseLimitConfig>;
 }
 
 export type AuthInstance = Awaited<ReturnType<typeof initAuth>>;
@@ -69,8 +72,14 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     enforceDbFilePermissions(dbPath);
   }
 
-  const recovery = createRecoveryService(db, auth, { ...DEFAULT_RECOVERY_LIMITS, ...opts.recoveryLimits });
-  const invites = createInviteService(db, auth, baseURL);
+  const limits = new AbuseLimiters({ ...DEFAULT_ABUSE_LIMITS, ...opts.limits });
+  const recovery = createRecoveryService(
+    db,
+    auth,
+    { ...DEFAULT_RECOVERY_LIMITS, ...opts.recoveryLimits },
+    limits.signups,
+  );
+  const invites = createInviteService(db, auth, baseURL, limits);
 
   return {
     db,
@@ -85,7 +94,7 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
         return auth.handler(req);
       }
       if (url.pathname === "/sync" && req.method === "POST") {
-        return handleSync(req, db, auth);
+        return handleSync(req, db, auth, limits);
       }
       const shell = serveShell(url.pathname, req.method, req.headers.get("accept-encoding"));
       if (shell) return shell;

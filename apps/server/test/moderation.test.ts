@@ -205,7 +205,12 @@ function banRow(app: ServerApp, group: number, wire: number): { banned: number }
 
 describe("Slice 6: group moderation", () => {
   test("members cannot moderate; a group admin can delete and ban, but not touch the owner", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -332,7 +337,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("a ban kicks with scope_left purge and blocks rejoin until the ban is lifted", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -413,7 +423,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("ownership transfer leaves exactly one owner: target owner, old owner admin", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -459,7 +474,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("a server ban of the owner passes the group to the longest-serving admin", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -505,7 +525,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("a server ban with no group admin falls back to a server admin", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const carol = await client(app, "carol");
@@ -526,7 +551,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("a server ban removes group memberships, including group admin roles", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const carol = await client(app, "carol", 25);
       const alice = await client(app, "alice");
@@ -559,7 +589,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("the last server admin can take a group even when that admin is group-banned", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const carol = await client(app, "carol");
@@ -591,7 +626,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("a state snapshot still carries deletes and removals from before the cursor jump", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -636,7 +676,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("only a server admin can ban server-wide", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -662,7 +707,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("an owner who leaves hands the group to the longest-serving admin", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
@@ -705,7 +755,12 @@ describe("Slice 6: group moderation", () => {
   });
 
   test("moderation deltas page past a corrupt row instead of jumping the cursor", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
     try {
       const alice = await client(app, "alice", 25);
       const { groupId } = await groupWithMembers(app, alice);

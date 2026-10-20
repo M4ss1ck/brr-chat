@@ -305,7 +305,8 @@ describe("Slice 4: groups, posts and visibility", () => {
   });
 
   test("sync pages at 500 events and the next call finishes the log", async () => {
-    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    // The paging test is about response size, not the 30/minute message budget (ADR 0012).
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local", limits: { messagesPerMinute: 1000 } });
     try {
       const alice = await client(app, "alice", 25);
       const createCid = cid();

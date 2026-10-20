@@ -17,6 +17,7 @@ export const Tag = {
   ScopeLeft: 11,
   Gap: 12,
   DmScope: 13,
+  Block: 14,
 } as const;
 export type Tag = (typeof Tag)[keyof typeof Tag];
 
@@ -64,11 +65,14 @@ const SCHEMA = {
   [Tag.ScopeLeft]: [["purge", "bool"]],
   [Tag.Gap]: [["after", "uint"], ["before", "uint"], ["count", "uint"]],
   [Tag.DmScope]: [["peer", "uint"]],
+  // Personal block (ADR 0012). An op toggles it; the event is stored for the blocker only.
+  [Tag.Block]: [["user", "uint"], ["on", "bool"]],
 } as const satisfies Record<Tag, readonly (readonly [string, Kind])[]>;
 
 /** Tags a client may send in its outbox. The rest are server-generated. */
 const OP_TAGS: ReadonlySet<number> = new Set<Tag>([
   Tag.Post, Tag.Reply, Tag.Dm, Tag.Reaction, Tag.Delete, Tag.Profile, Tag.GroupMeta, Tag.Membership, Tag.Ban,
+  Tag.Block,
 ]);
 
 // `media?` is a required field whose value may be null (a post without media). Only an

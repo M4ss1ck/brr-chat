@@ -14,6 +14,7 @@ import {
   type Op,
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
+import { AbuseLimiters } from "./limits.ts";
 
 /** How long a cid is remembered, so a retry returns the original seq (docs/PROTOCOL.md). */
 export const OUTBOX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -320,6 +321,11 @@ function handOverOwnership(db: Database, groupId: number, ownerWire: number, now
   return true;
 }
 
+/** The block lookup for one viewer and the event's author, shared by /sync and the DM list. */
+const BLOCKED_AUTHOR_SQL = `EXISTS (
+  SELECT 1 FROM user_blocks b WHERE b.blocker = ? AND b.blocked = e.author
+)`;
+
 /** The scope row for an unordered pair, or null when these two have never talked. */
 function dmScopeForPair(db: Database, a: number, b: number): DmScopeRow | null {
   const lo = Math.min(a, b);
@@ -348,7 +354,9 @@ function rememberOp(db: Database, actor: Actor, op: Op, tag: number, seq: number
 }
 
 /** Applies one op. Every path returns an event seq or an ack error; nothing throws. */
-function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Failure {
+function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseLimiters): Applied | Failure {
+  // The log works in seconds; the in-memory budgets work in milliseconds.
+  const nowMs = now * 1000;
   switch (op.tag) {
     case Tag.GroupMeta: {
       if (op.scope !== 0) return { error: AckError.Invalid };
@@ -472,6 +480,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       if (op.text.trim().length === 0) return { error: AckError.Invalid };
       // Media needs the upload pipeline (ADR 0011); accepting it here would silently drop it.
       if (op.media !== null) return { error: AckError.Unsupported };
+      if (!limits.allowsMessage(actor.id, nowMs)) return { error: AckError.RateLimited };
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Post,
         seq: next,
@@ -495,6 +504,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       if (parent.tag !== Tag.Post) return { error: AckError.Invalid };
       if (parent.scope !== op.scope) return { error: AckError.NotFound };
       if (deletionFor(db, op.scope, op.parent)) return { error: AckError.NotFound };
+      if (!limits.allowsMessage(actor.id, nowMs)) return { error: AckError.RateLimited };
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Reply,
         seq: next,
@@ -656,47 +666,64 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       if (op.media !== null) return { error: AckError.Unsupported };
 
       let scope = op.scope;
-      let firstSeq: number;
-      let created = false;
+      let opening = false;
 
       if (scope === 0) {
-        // A DM op with scope 0 opens (or reuses) the one scope for this pair. The scope id is
-        // the seq of the dm_scope event, so the pair and the first message share a log position.
+        // A scope-0 op opens (or reuses) the one scope for this pair. Only the first message
+        // of a pair is a new thread: replies and later messages never draw on that budget.
         if (!peerIsKnown(db, op.peer)) return { error: AckError.NotFound };
         const existing = dmScopeForPair(db, actor.wireId, op.peer);
-        if (existing) {
-          scope = existing.id;
-        } else {
-          const candidate = nextSeq(db);
-          db.query("INSERT OR IGNORE INTO dm_scopes (id, user_a, user_b, created_at) VALUES (?, ?, ?, ?)").run(
-            candidate,
-            Math.min(actor.wireId, op.peer),
-            Math.max(actor.wireId, op.peer),
-            now,
-          );
-          // A concurrent first message may have won the unique pair index. Either way there is
-          // now exactly one row, and the scope id is whatever it says.
-          const row = dmScopeForPair(db, actor.wireId, op.peer);
-          if (!row) throw new Error("dm scope vanished inside its own transaction");
-          scope = row.id;
-          created = row.id === candidate;
-          if (created) {
-            insertEventAt(db, candidate, (seq) => ({
-              tag: Tag.DmScope,
-              seq,
-              ts: now,
-              author: actor.wireId,
-              scope,
-              peer: op.peer,
-            }));
-          }
-        }
+        if (existing) scope = existing.id;
+        else opening = true;
       } else {
         const dm = dmScopeById(db, scope);
         if (!dm) return { error: AckError.NotFound };
         if (dm.user_a !== actor.wireId && dm.user_b !== actor.wireId) return { error: AckError.Forbidden };
         const other = dm.user_a === actor.wireId ? dm.user_b : dm.user_a;
         if (other !== op.peer) return { error: AckError.Invalid };
+      }
+
+      if (opening) {
+        // ADR 0012: an account younger than 24h cannot start a conversation, but it can
+        // always answer one an older account started.
+        if (now - actor.createdAt < limits.config.dmCooldownSeconds) return { error: AckError.Forbidden };
+        if (!limits.allowsNewDmThread(actor.id, nowMs)) return { error: AckError.RateLimited };
+      }
+      if (!limits.allowsMessage(actor.id, nowMs)) {
+        // A rejected op created no thread, so give the daily slot back.
+        if (opening) limits.refundNewDmThread(actor.id, nowMs);
+        return { error: AckError.RateLimited };
+      }
+
+      let firstSeq: number;
+      let created = false;
+
+      if (opening) {
+        // The scope id is the seq of the dm_scope event, so the pair and the first message
+        // share a log position.
+        const candidate = nextSeq(db);
+        db.query("INSERT OR IGNORE INTO dm_scopes (id, user_a, user_b, created_at) VALUES (?, ?, ?, ?)").run(
+          candidate,
+          Math.min(actor.wireId, op.peer),
+          Math.max(actor.wireId, op.peer),
+          now,
+        );
+        // A concurrent first message may have won the unique pair index. Either way there is
+        // now exactly one row, and the scope id is whatever it says.
+        const row = dmScopeForPair(db, actor.wireId, op.peer);
+        if (!row) throw new Error("dm scope vanished inside its own transaction");
+        scope = row.id;
+        created = row.id === candidate;
+        if (created) {
+          insertEventAt(db, candidate, (seq) => ({
+            tag: Tag.DmScope,
+            seq,
+            ts: now,
+            author: actor.wireId,
+            scope,
+            peer: op.peer,
+          }));
+        }
       }
 
       const seq = nextSeq(db);
@@ -728,6 +755,33 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       }));
       return { seq, firstSeq: seq, state: false };
     }
+    case Tag.Block: {
+      // ADR 0012: a personal, silent block. It is stored as server state and the event is
+      // visible only to the blocker, so the blocked account is never told.
+      if (op.scope !== 0) return { error: AckError.Invalid };
+      if (op.user === 0 || op.user === actor.wireId) return { error: AckError.Invalid };
+      if (!peerIsKnown(db, op.user)) return { error: AckError.NotFound };
+      const seq = insertEvent(db, (next) => ({
+        tag: Tag.Block,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope: 0,
+        user: op.user,
+        on: op.on,
+      }));
+      db.query("INSERT INTO private_events (seq, viewer) VALUES (?, ?)").run(seq, actor.wireId);
+      if (op.on) {
+        db.query("INSERT OR IGNORE INTO user_blocks (blocker, blocked, created_at) VALUES (?, ?, ?)").run(
+          actor.wireId,
+          op.user,
+          now,
+        );
+      } else {
+        db.query("DELETE FROM user_blocks WHERE blocker = ? AND blocked = ?").run(actor.wireId, op.user);
+      }
+      return { seq, firstSeq: seq, state: false };
+    }
     default:
       // Unknown op tags were already turned into Unsupported by the decoder.
       return { error: AckError.Unsupported };
@@ -735,7 +789,13 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
 }
 
 /** Applies a whole outbox in one transaction: all of it, or none of it. */
-export function applyOutbox(db: Database, actor: Actor, ops: readonly Op[], now = Math.floor(Date.now() / 1000)): OutboxResult {
+export function applyOutbox(
+  db: Database,
+  actor: Actor,
+  ops: readonly Op[],
+  limits: AbuseLimiters,
+  now = Math.floor(Date.now() / 1000),
+): OutboxResult {
   return db.transaction((): OutboxResult => {
     db.query("DELETE FROM outbox_ops WHERE created_at < ?").run(now - OUTBOX_TTL_SECONDS);
 
@@ -761,7 +821,7 @@ export function applyOutbox(db: Database, actor: Actor, ops: readonly Op[], now 
         db.query("DELETE FROM outbox_ops WHERE user_id = ? AND cid = ?").run(actor.id, op.cid);
       }
 
-      const applied = applyOp(db, actor, op, now);
+      const applied = applyOp(db, actor, op, now, limits);
       if ("error" in applied) {
         acks.push({ cid: op.cid, error: applied.error });
         continue;
@@ -776,15 +836,24 @@ export function applyOutbox(db: Database, actor: Actor, ops: readonly Op[], now 
   })();
 }
 
-// One viewer placeholder per branch; callers bind the viewer once per `?` (four times). The
-// last branch is the exception that makes leaving work: a kicked user is no longer a member,
-// so only the scope_left map can still reach them with the purge event.
+// Six viewer placeholders: group membership, two DM participants, a pending scope_left, the
+// private-event viewer, and the blocker. Callers bind the same viewer id six times. A private
+// block event reaches only its author, and a blocked author's posts, replies, reactions and
+// DMs stop reaching the blocker (ADR 0012). The scope_left branch is the exception that makes
+// leaving work: a kicked user is no longer a member, so only that map can still reach them.
 const VISIBLE_SQL = `
-  e.scope = 0
-  OR (e.tag <> ${Tag.ScopeLeft} AND e.scope IN (SELECT group_id FROM group_members WHERE user_id = ?))
-  OR e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
-  OR (e.tag = ${Tag.GroupMeta} AND e.scope IN (SELECT id FROM chat_groups WHERE open = 1))
-  OR e.seq IN (SELECT seq FROM scope_lefts WHERE user_id = ?)
+  (
+    e.scope = 0
+    OR (e.tag <> ${Tag.ScopeLeft} AND e.scope IN (SELECT group_id FROM group_members WHERE user_id = ?))
+    OR e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
+    OR (e.tag = ${Tag.GroupMeta} AND e.scope IN (SELECT id FROM chat_groups WHERE open = 1))
+    OR e.seq IN (SELECT seq FROM scope_lefts WHERE user_id = ?)
+  )
+  AND NOT EXISTS (SELECT 1 FROM private_events p WHERE p.seq = e.seq AND p.viewer <> ?)
+  AND NOT (
+    e.tag IN (${Tag.Post}, ${Tag.Reply}, ${Tag.Dm}, ${Tag.Reaction}, ${Tag.DmScope})
+    AND ${BLOCKED_AUTHOR_SQL}
+  )
 `;
 
 function decodeRows(rows: EventRow[]): Event[] {
@@ -815,7 +884,7 @@ export function visibleEvents(db: Database, viewer: number, cursor: number): Vis
        ORDER BY e.seq ASC
        LIMIT ?`,
     )
-    .all(cursor, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+    .all(cursor, viewer, viewer, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
 
   const events: Event[] = [];
   let bytes = 0;
@@ -849,7 +918,7 @@ export function visibleFrom(db: Database, viewer: number, firstSeq: number): Eve
        WHERE e.seq >= ? AND (${VISIBLE_SQL})
        ORDER BY e.seq ASC`,
     )
-    .all(firstSeq, viewer, viewer, viewer, viewer) as EventRow[];
+    .all(firstSeq, viewer, viewer, viewer, viewer, viewer, viewer) as EventRow[];
   return decodeRows(rows);
 }
 
@@ -876,7 +945,7 @@ export function moderationDeltas(db: Database, viewer: number, cursor: number): 
        ORDER BY e.seq ASC
        LIMIT ?`,
     )
-    .all(cursor, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+    .all(cursor, viewer, viewer, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
 
   const events: Event[] = [];
   let bytes = 0;
@@ -939,9 +1008,10 @@ export function stateEvents(db: Database, viewer: number): Event[] {
        WHERE e.tag = ${Tag.DmScope}
          AND e.seq = (SELECT MAX(d.seq) FROM events d WHERE d.tag = ${Tag.DmScope} AND d.scope = e.scope)
          AND e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
+         AND NOT (${BLOCKED_AUTHOR_SQL})
        ORDER BY e.seq ASC`,
     )
-    .all(viewer, viewer) as EventRow[];
+    .all(viewer, viewer, viewer) as EventRow[];
   // A fresh member sees who is currently banned, so moderation state survives a reinstall.
   const bans = db
     .query(
@@ -960,7 +1030,21 @@ export function stateEvents(db: Database, viewer: number): Event[] {
        ORDER BY e.seq ASC`,
     )
     .all(viewer) as EventRow[];
-  return decodeRows([...profiles, ...groups, ...members, ...dms, ...bans, ...lefts]).sort((a, b) => a.seq - b.seq);
+  // A blocker's current list survives a reinstall: latest block per user, only those still on.
+  const blockRows = db
+    .query(
+      `SELECT e.bytes FROM events e
+       WHERE e.tag = ${Tag.Block} AND e.author = ?
+       ORDER BY e.seq ASC`,
+    )
+    .all(viewer) as EventRow[];
+  const latestBlocks = new Map<number, Extract<Event, { tag: typeof Tag.Block }>>();
+  for (const event of decodeRows(blockRows)) {
+    if (event.tag === Tag.Block) latestBlocks.set(event.user, event);
+  }
+  const blocks = [...latestBlocks.values()].filter((event) => event.on);
+  const state = decodeRows([...profiles, ...groups, ...members, ...dms, ...bans, ...lefts]);
+  return [...state, ...blocks].sort((a, b) => a.seq - b.seq);
 }
 
 /** Merges events by seq. State events can sit at or below the old cursor; the client applies them. */
