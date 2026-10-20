@@ -5,6 +5,8 @@ import {
   Tag,
   encodeEvent,
   decodeEvent,
+  encodeEventBytes,
+  decodeEventBytes,
   encodeOp,
   decodeOp,
   ProtocolError,
@@ -45,6 +47,17 @@ describe("events", () => {
 
   test("layout is positional: [tag, seq, ts, author, scope, ...fields]", () => {
     expect(encodeEvent({ ...hdr, tag: Tag.Delete, target: 5 })).toEqual([Tag.Delete, 1000, 1_791_000_000, 42, 7, 5]);
+  });
+
+  test("the stored byte form round-trips every sample", () => {
+    for (const ev of samples) {
+      expect(decodeEventBytes(encodeEventBytes(ev))).toEqual(ev);
+    }
+  });
+
+  test("a stored event with a malformed body throws, so the caller can skip it", () => {
+    const bytes = encode([Tag.Delete, 1, 2, 3, 4]);
+    expect(() => decodeEventBytes(new Uint8Array(bytes))).toThrow(ProtocolError);
   });
 
   test("membership roles encode as 0 none, 1 member, 2 admin, 3 owner", () => {

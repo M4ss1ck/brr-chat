@@ -13,6 +13,51 @@ CREATE TABLE IF NOT EXISTS events (
 )
 `.trim();
 
+// Wire ids are the uints on the protocol (author, membership.user); BetterAuth ids are strings.
+const CREATE_WIRE_USERS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS wire_users (
+  id TEXT PRIMARY KEY,
+  wire_id INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+)
+`.trim();
+
+// Group id is the seq of its group_meta event (docs/PROTOCOL.md: a seq is the id of the
+// thing the event creates). The open flag is duplicated from the metadata so visibility
+// can be decided without decoding every event.
+const CREATE_GROUPS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS chat_groups (
+  id INTEGER PRIMARY KEY,
+  open INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+)
+`.trim();
+
+// Current membership. `seq` points at the membership event that established the role, so a
+// state snapshot can replay it without walking the whole log.
+const CREATE_GROUP_MEMBERS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS group_members (
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  role INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (group_id, user_id)
+)
+`.trim();
+
+// Outbox dedup (docs/PROTOCOL.md): cid -> seq for 30 days, per account. `tag` lets a retried
+// join or group create still answer with the state snapshot it originally deserved.
+const CREATE_OUTBOX_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS outbox_ops (
+  user_id TEXT NOT NULL,
+  cid BLOB NOT NULL,
+  tag INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, cid)
+)
+`.trim();
+
 // ADR 0006: only hashes ever reach the disk. `tail_hash` lets signup check the last group
 // without keeping the full code anywhere.
 const CREATE_RECOVERY_TABLE_SQL = `
@@ -51,6 +96,13 @@ export function openDb(dbPath: string): Database {
     enforceDbFilePermissions(dbPath);
   }
   db.exec(CREATE_EVENTS_TABLE_SQL);
+  db.exec(CREATE_WIRE_USERS_TABLE_SQL);
+  db.exec(CREATE_GROUPS_TABLE_SQL);
+  db.exec(CREATE_GROUP_MEMBERS_TABLE_SQL);
+  db.exec(CREATE_OUTBOX_TABLE_SQL);
+  db.exec("CREATE INDEX IF NOT EXISTS events_scope_seq ON events(scope, seq);");
+  db.exec("CREATE INDEX IF NOT EXISTS events_tag_scope ON events(tag, scope);");
+  db.exec("CREATE INDEX IF NOT EXISTS outbox_created ON outbox_ops(created_at);");
   db.exec(CREATE_RECOVERY_TABLE_SQL);
   return db;
 }

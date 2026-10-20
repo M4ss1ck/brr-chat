@@ -1,6 +1,27 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
-import { closeStore, getCursor, getRange, getSession, getStoredCursor, setCursor, setRange, setSession } from "../src/store.ts";
+import { Role, Tag, type Event } from "@brr-chat/protocol";
+import {
+  applyEvents,
+  closeStore,
+  enqueueOp,
+  getCursor,
+  getGroups,
+  getMembers,
+  getOutbox,
+  getPosts,
+  getProfiles,
+  getRange,
+  getSelf,
+  getSession,
+  getStoredCursor,
+  removeOutbox,
+  setCursor,
+  setRange,
+  setSelf,
+  setSession,
+  toWireOp,
+} from "../src/store.ts";
 
 /** Direct handle to the same DB the store uses, to simulate corrupt or stale rows. */
 async function rawStore(): Promise<{ put(key: string, value: unknown): Promise<void>; close(): void }> {
@@ -52,18 +73,18 @@ describe("store (IndexedDB)", () => {
   });
 
   test("empty store reads as cursor 0, stored null, no session, no range", async () => {
-    expect(await getCursor()).toBe(0);
-    expect(await getStoredCursor()).toBeNull();
+    expect(await getCursor("alice")).toBe(0);
+    expect(await getStoredCursor("alice")).toBeNull();
     expect(await getSession()).toBeNull();
     expect(await getRange()).toBeNull();
   });
 
   test("cursor round-trips", async () => {
-    await setCursor(0);
-    expect(await getCursor()).toBe(0);
-    await setCursor(4_000_000_000);
-    expect(await getStoredCursor()).toBe(4_000_000_000);
-    expect(await getCursor()).toBe(4_000_000_000);
+    await setCursor("alice", 0);
+    expect(await getCursor("alice")).toBe(0);
+    await setCursor("alice", 4_000_000_000);
+    expect(await getStoredCursor("alice")).toBe(4_000_000_000);
+    expect(await getCursor("alice")).toBe(4_000_000_000);
   });
 
   test("session round-trips and clears with null", async () => {
@@ -81,9 +102,9 @@ describe("store (IndexedDB)", () => {
   });
 
   test("setCursor rejects values that are not safe integers", async () => {
-    expect(() => setCursor(-1)).toThrow(RangeError);
-    expect(() => setCursor(1.5)).toThrow(RangeError);
-    expect(() => setCursor(Number.MAX_SAFE_INTEGER + 2)).toThrow(RangeError);
+    expect(() => setCursor("alice", -1)).toThrow(RangeError);
+    expect(() => setCursor("alice", 1.5)).toThrow(RangeError);
+    expect(() => setCursor("alice", Number.MAX_SAFE_INTEGER + 2)).toThrow(RangeError);
   });
 
   test("a corrupt row reads back as not stored, never as garbage", async () => {
@@ -96,21 +117,98 @@ describe("store (IndexedDB)", () => {
       store.close();
     }
 
-    expect(await getStoredCursor()).toBeNull();
-    expect(await getCursor()).toBe(0);
+    expect(await getStoredCursor("alice")).toBeNull();
+    expect(await getCursor("alice")).toBe(0);
     expect(await getSession()).toBeNull();
     expect(await getRange()).toBeNull();
   });
 
   test("a closed handle reopens on the next call", async () => {
-    await setCursor(7);
+    await setCursor("alice", 7);
     await closeStore();
-    expect(await getStoredCursor()).toBe(7);
+    expect(await getStoredCursor("alice")).toBe(7);
   });
 
   test("writing after a close does not throw", async () => {
     await closeStore();
-    await setCursor(9);
-    expect(await getCursor()).toBe(9);
+    await setCursor("alice", 9);
+    expect(await getCursor("alice")).toBe(9);
+  });
+
+  test("sync events build group, member, post and profile state", async () => {
+    const events: Event[] = [
+      { tag: Tag.GroupMeta, seq: 10, ts: 100, author: 1, scope: 10, name: "Habana", about: "abierto", open: true },
+      { tag: Tag.Membership, seq: 11, ts: 101, author: 1, scope: 10, user: 1, role: Role.Owner },
+      { tag: Tag.Membership, seq: 12, ts: 102, author: 2, scope: 10, user: 2, role: Role.Member },
+      { tag: Tag.Post, seq: 13, ts: 103, author: 1, scope: 10, text: "hola", media: null },
+      { tag: Tag.Profile, seq: 14, ts: 104, author: 1, scope: 0, username: "ana", displayName: "Ana", bio: "" },
+    ];
+    await applyEvents("alice", events);
+
+    expect(await getGroups("alice")).toEqual([{ id: 10, seq: 10, name: "Habana", about: "abierto", open: true }]);
+    expect(await getMembers("alice", 10)).toEqual([
+      { group: 10, user: 1, role: Role.Owner, seq: 11 },
+      { group: 10, user: 2, role: Role.Member, seq: 12 },
+    ]);
+    expect(await getPosts("alice", 10)).toEqual([{ seq: 13, ts: 103, author: 1, scope: 10, text: "hola" }]);
+    expect((await getProfiles("alice")).get(1)).toEqual({
+      user: 1,
+      seq: 14,
+      username: "ana",
+      displayName: "Ana",
+      bio: "",
+    });
+  });
+
+  test("applying the same state event twice never duplicates a post", async () => {
+    const post: Event = { tag: Tag.Post, seq: 21, ts: 200, author: 1, scope: 20, text: "once", media: null };
+    await applyEvents("alice", [post]);
+    await applyEvents("alice", [post]);
+    expect(await getPosts("alice", 20)).toHaveLength(1);
+  });
+
+  test("scope_left with purge drops the cached posts and members", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.GroupMeta, seq: 30, ts: 300, author: 1, scope: 30, name: "Gone", about: "", open: false },
+      { tag: Tag.Membership, seq: 31, ts: 301, author: 1, scope: 30, user: 1, role: Role.Owner },
+      { tag: Tag.Post, seq: 32, ts: 302, author: 1, scope: 30, text: "bye", media: null },
+    ]);
+    await applyEvents("alice", [{ tag: Tag.ScopeLeft, seq: 33, ts: 303, author: 0, scope: 30, purge: true }]);
+    expect(await getPosts("alice", 30)).toEqual([]);
+    expect(await getMembers("alice", 30)).toEqual([]);
+    expect(await getGroups("alice")).toEqual([]);
+  });
+
+  test("self is scoped to the account and rejected when it is not a positive uint", async () => {
+    expect(await getSelf("alice")).toBeNull();
+    await setSelf("alice", 7);
+    expect(await getSelf("alice")).toBe(7);
+    expect(await getSelf("bob")).toBeNull();
+    expect(() => setSelf("alice", 0)).toThrow(RangeError);
+  });
+
+  test("outbox round-trips a cid and drops only the acknowledged op", async () => {
+    const first = await enqueueOp("alice", { tag: Tag.GroupMeta, scope: 0, name: "G", about: "", open: true });
+    const second = await enqueueOp("alice", { tag: Tag.Post, scope: 5, text: "hi" });
+    expect(first.cid).toHaveLength(8);
+    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([first.cid, second.cid]);
+    // Another account on the same device has its own queue.
+    expect(await getOutbox("bob")).toEqual([]);
+
+    expect(toWireOp(first)).toMatchObject({ tag: Tag.GroupMeta, scope: 0, name: "G", open: true });
+    expect(toWireOp(second)).toMatchObject({ tag: Tag.Post, scope: 5, text: "hi" });
+
+    await removeOutbox("alice", [new Uint8Array(first.cid)]);
+    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([second.cid]);
+  });
+
+  test("a corrupt group row reads back as absent", async () => {
+    const store = await rawStore();
+    try {
+      await store.put("groups:alice", { "10": { id: "ten", seq: 10 } });
+    } finally {
+      store.close();
+    }
+    expect(await getGroups("alice")).toEqual([]);
   });
 });

@@ -85,6 +85,17 @@ output {
   overflow-wrap: anywhere; color: #d8c56a;
 }
 #recover-code { letter-spacing: .08em; }
+ul { list-style: none; padding: 0; margin: .4rem 0; }
+.list li { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .3rem 0; }
+.list li button { margin: 0; }
+#groups-list button[aria-current="true"] { border-color: #f2efe6; background: #2b2a20; }
+#group-view { margin: .5rem 0 1rem; }
+#group-title { margin: .5rem 0 .1rem; }
+.posts { display: grid; gap: .6rem; margin: .8rem 0; }
+.post { display: grid; grid-template-columns: 32px 1fr; gap: .55rem; align-items: start; }
+.avatar { border-radius: .35rem; background: #17170f; }
+.post .meta { margin: 0; font-size: .78rem; color: #a9a49a; }
+.post .text { margin: .1rem 0 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -132,7 +143,37 @@ output {
     <h1>brr chat</h1>
     <h2 id="account"></h2>
     <p id="empty" hidden>No messages yet. This server is empty.</p>
+
+    <h2>Groups</h2>
+    <ul id="groups-list" class="list"></ul>
+    <p id="no-groups" class="note" hidden>No groups yet. Create one, or join an open group below.</p>
+
+    <section id="group-view" hidden>
+      <h3 id="group-title"></h3>
+      <p id="group-about" class="note"></p>
+      <p id="group-members" class="note"></p>
+      <ul id="posts" class="posts"></ul>
+      <label>Message
+        <input id="post-text" autocomplete="off" autocapitalize="sentences">
+      </label>
+      <button type="button" id="post">Post</button>
+    </section>
+
+    <h2>Open groups</h2>
+    <ul id="open-list" class="list"></ul>
+    <p id="no-open-groups" class="note" hidden>No open groups to join right now.</p>
+
+    <h2>New open group</h2>
+    <label>Name
+      <input id="create-name" autocomplete="off">
+    </label>
+    <label>About
+      <input id="create-about" autocomplete="off">
+    </label>
+    <button type="button" id="create">Create group</button>
+
     <dl>
+      <dt>you are</dt><dd id="self">unknown</dd>
       <dt>session</dt><dd id="session"></dd>
       <dt>last synced seq</dt><dd id="cursor">0</dd>
       <dt>server speaks</dt><dd id="range">unknown</dd>

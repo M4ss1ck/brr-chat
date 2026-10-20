@@ -133,7 +133,9 @@ export function parseCliOptions(argv: readonly string[], env: NodeJS.ProcessEnv 
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`port: expected an integer 0..65535, got ${port}`);
   const host = firstValue(argv, ["--host"]) ?? "localhost";
   const dbPath = firstValue(argv, ["--db", "--db-path"]) ?? env.DB_PATH ?? DEFAULT_DB_PATH;
-  const baseURL = firstValue(argv, ["--base-url"]) ?? env.BASE_URL ?? `http://${host}`;
+  // The browser's Origin includes the port, and BetterAuth compares it exactly, so the
+  // default must be the URL the server is actually reachable at.
+  const baseURL = firstValue(argv, ["--base-url"]) ?? env.BASE_URL ?? `http://${host}:${port}`;
   const secret = firstValue(argv, ["--secret"]) ?? env.BETTER_AUTH_SECRET;
   return { port, dbPath, host, baseURL, secret };
 }

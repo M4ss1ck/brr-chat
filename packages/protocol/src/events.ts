@@ -1,6 +1,6 @@
 // Events and ops are positional CBOR arrays described by one table (SCHEMA).
 // Adding an event type = one Tag entry + one SCHEMA row + fixtures. See docs/PROTOCOL.md.
-import type { Wire } from "./cbor.ts";
+import { decode, encode, type Wire } from "./cbor.ts";
 import { AckError, ProtocolError } from "./errors.ts";
 
 export const Tag = {
@@ -201,6 +201,19 @@ export function decodeEvent(v: unknown): Event | null {
   };
   const body = decodeFields(tag, a, 5, "event");
   return body && { ...header, ...body };
+}
+
+/**
+ * The stored form of an event: one canonical CBOR value. The server keeps the log as these
+ * bytes, so replaying an event never depends on a second serializer (ADR 0003).
+ */
+export function encodeEventBytes(e: Event): Uint8Array {
+  return encode(encodeEvent(e));
+}
+
+/** Decodes one stored event. Null means an unknown tag, exactly like `decodeEvent`. */
+export function decodeEventBytes(bytes: Uint8Array): Event | null {
+  return decodeEvent(decode(bytes));
 }
 
 // ---- ops: [cid, tag, scope, ...fields] ----

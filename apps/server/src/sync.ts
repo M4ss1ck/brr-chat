@@ -7,9 +7,12 @@ import {
   encodeSyncResponse,
   negotiate,
   readVersion,
+  type Ack,
+  type Event,
   type SyncResponse,
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
+import { actorFor, applyOutbox, mergeEvents, stateEvents, visibleEvents, visibleFrom } from "./events.ts";
 import type { AuthInstance } from "./index.ts";
 import { isRecoveryConfirmed } from "./recovery.ts";
 
@@ -70,14 +73,35 @@ export async function handleSync(req: Request, db: Database, auth: AuthInstance)
     throw err;
   }
 
-  const acks = decoded.rejected.map((r) => ({ cid: r.cid, error: r.error }));
-  const cursor = headCursor(db);
+  const actor = actorFor(db, session.user.id);
+
+  // Ops are all-or-nothing; a malformed op was already turned into a nack by decodeSyncRequest.
+  const applied = applyOutbox(db, actor, decoded.outbox);
+  const acks: Ack[] = [...decoded.rejected.map((r) => ({ cid: r.cid, error: r.error })), ...applied.acks];
+
+  let events: Event[];
+  let cursor: number;
+  let more = false;
+
+  if (decoded.cursor === 0 || applied.state) {
+    // Fresh device or a join/create in this batch: current state and the head, never old
+    // posts (ADR 0009). Events created by this batch still come back, so the actor sees what
+    // it just did.
+    const fresh = applied.firstSeq === null ? [] : visibleFrom(db, actor.wireId, applied.firstSeq);
+    events = mergeEvents(stateEvents(db, actor.wireId), fresh);
+    cursor = headCursor(db);
+  } else {
+    const page = visibleEvents(db, actor.wireId, decoded.cursor);
+    events = page.events;
+    cursor = page.cursor;
+    more = page.more;
+  }
 
   return respondCborBrotli({
     range: SUPPORTED,
     cursor,
-    more: false,
-    events: [],
+    more,
+    events,
     acks,
     skipped: 0,
   });
