@@ -11,6 +11,8 @@
 - **Group**: a scope with members and roles (member, group admin, owner). Open (anyone can join)
   or invite-only. A **group admin** (`Role.Admin = 2`) is distinct from a **server admin**, the
   server-wide `admin` role in BetterAuth.
+- **DM scope**: the one scope for an unordered pair of accounts. Its id is the `seq` of the
+  `dm_scope` event that created it; there is exactly one per pair (ADR 0015).
 - **Event**: one entry in the server's append-only log, `[tag, seq, ts, author, scope, ...]`.
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.

@@ -84,9 +84,9 @@ export async function handleSync(req: Request, db: Database, auth: AuthInstance)
   let more = false;
 
   if (decoded.cursor === 0 || applied.state) {
-    // Fresh device or a join/create in this batch: current state and the head, never old
-    // posts (ADR 0009). Events created by this batch still come back, so the actor sees what
-    // it just did.
+    // Fresh device or a join/create in this batch: current state (profiles, groups, DM scopes)
+    // and the head, never old posts or DM messages (ADR 0009). Events created by this batch
+    // still come back, so the actor sees what it just did.
     const fresh = applied.firstSeq === null ? [] : visibleFrom(db, actor.wireId, applied.firstSeq);
     events = mergeEvents(stateEvents(db, actor.wireId), fresh);
     cursor = headCursor(db);

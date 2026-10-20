@@ -1,0 +1,40 @@
+{
+  "range": {
+    "min": 1,
+    "max": 1
+  },
+  "cursor": 22,
+  "more": false,
+  "events": [
+    {
+      "seq": 20,
+      "ts": 1791000020,
+      "author": 42,
+      "scope": 20,
+      "tag": 13,
+      "peer": 43
+    },
+    {
+      "seq": 21,
+      "ts": 1791000021,
+      "author": 42,
+      "scope": 20,
+      "tag": 3,
+      "peer": 43,
+      "text": "psst",
+      "media": null
+    },
+    {
+      "seq": 22,
+      "ts": 1791000022,
+      "author": 43,
+      "scope": 20,
+      "tag": 3,
+      "peer": 42,
+      "text": "te oigo",
+      "media": null
+    }
+  ],
+  "skipped": 0,
+  "acks": []
+}
