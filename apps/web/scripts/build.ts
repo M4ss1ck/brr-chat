@@ -109,6 +109,9 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 .post .reaction[aria-pressed="true"] { border-color: #d8c56a; background: #2b2a20; }
 .post .reply { margin: 0 0 0 .2rem; padding: .2rem .5rem; font-size: .8rem; }
 .post .reply[aria-pressed="true"] { border-color: #d8c56a; }
+.post .delete { padding: .2rem .5rem; font-size: .8rem; color: #e0a090; }
+#member-list li, #banned-list li { font-size: .85rem; }
+#member-list button, #banned-list button { margin: 0; padding: .2rem .5rem; font-size: .78rem; }
 .post.reply { margin-left: 1.1rem; padding-left: .55rem; border-left: 2px solid #2f2e25; }
 .post .replies { display: grid; gap: .5rem; margin: .5rem 0 0; }
 #reply-note { display: flex; align-items: center; gap: .4rem; }
@@ -177,6 +180,9 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
         <button type="button" id="rotate-invite">Rotate link</button>
         <p class="note">Anyone with this link or its QR code can join. Rotating it stops the old link from working.</p>
       </section>
+      <ul id="member-list" class="list"></ul>
+      <p id="banned-label" class="note" hidden>Banned</p>
+      <ul id="banned-list" class="list"></ul>
       <ul id="posts" class="posts"></ul>
       <p id="reply-note" class="note" hidden><span id="reply-label"></span> <button type="button" id="cancel-reply">Cancel</button></p>
       <label>Message

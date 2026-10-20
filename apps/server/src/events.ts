@@ -67,6 +67,18 @@ interface DmScopeRow {
   user_b: number;
 }
 
+interface BanRow {
+  group_id: number;
+  user_id: number;
+  banned: number;
+  seq: number;
+}
+
+interface ServerUserRow {
+  id: string;
+  banned: number | null;
+}
+
 interface EventRow {
   seq: number;
   bytes: Uint8Array;
@@ -159,12 +171,153 @@ function groupAccessError(db: Database, actor: Actor, scope: number): AckError |
 interface EventHeaderRow {
   tag: number;
   scope: number;
+  author: number;
 }
 
-/** Tag and scope of an existing event, or null when the seq is unknown. */
+/** Tag, scope and author of an existing event, or null when the seq is unknown. */
 function headerFor(db: Database, seq: number): EventHeaderRow | null {
-  const row = db.query("SELECT tag, scope FROM events WHERE seq = ?").get(seq) as EventHeaderRow | null;
-  return row ? { tag: Number(row.tag), scope: Number(row.scope) } : null;
+  const row = db.query("SELECT tag, scope, author FROM events WHERE seq = ?").get(seq) as EventHeaderRow | null;
+  return row ? { tag: Number(row.tag), scope: Number(row.scope), author: Number(row.author) } : null;
+}
+
+function groupRole(db: Database, groupId: number, wireId: number): number {
+  return memberFor(db, groupId, wireId)?.role ?? Role.None;
+}
+
+function groupBanFor(db: Database, groupId: number, wireId: number): BanRow | null {
+  return db
+    .query("SELECT group_id, user_id, banned, seq FROM group_bans WHERE group_id = ? AND user_id = ?")
+    .get(groupId, wireId) as BanRow | null;
+}
+
+function deletionFor(db: Database, scope: number, target: number): { seq: number } | null {
+  return db.query("SELECT seq FROM deleted_events WHERE scope = ? AND target = ?").get(scope, target) as
+    | { seq: number }
+    | null;
+}
+
+/** BetterAuth stores several roles as a comma-separated list when a user has more than one. */
+function hasAdminRole(role: string | null): boolean {
+  return (role ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .includes("admin");
+}
+
+/** Writes the current membership row and its event. `author` is 0 for server-generated changes. */
+function setMembership(
+  db: Database,
+  scope: number,
+  userId: number,
+  role: number,
+  author: number,
+  now: number,
+): number {
+  const seq = insertEvent(db, (next) => ({
+    tag: Tag.Membership,
+    seq: next,
+    ts: now,
+    author,
+    scope,
+    user: userId,
+    role,
+  }));
+  if (role === Role.None) {
+    db.query("DELETE FROM group_members WHERE group_id = ? AND user_id = ?").run(scope, userId);
+  } else {
+    db.query(
+      `INSERT INTO group_members (group_id, user_id, role, seq) VALUES (?, ?, ?, ?)
+       ON CONFLICT(group_id, user_id) DO UPDATE SET role = excluded.role, seq = excluded.seq`,
+    ).run(scope, userId, role, seq);
+    // A stale purge must not wipe a group the user has since rejoined.
+    db.query("DELETE FROM scope_lefts WHERE user_id = ? AND scope = ?").run(userId, scope);
+  }
+  return seq;
+}
+
+/** Appends the server-generated purge event and makes it visible to the user who lost access. */
+function recordScopeLeft(db: Database, userId: number, scope: number, now: number): number {
+  const seq = insertEvent(db, (next) => ({
+    tag: Tag.ScopeLeft,
+    seq: next,
+    ts: now,
+    author: 0,
+    scope,
+    purge: true,
+  }));
+  db.query(
+    `INSERT INTO scope_lefts (user_id, scope, seq) VALUES (?, ?, ?)
+     ON CONFLICT(user_id, scope) DO UPDATE SET seq = excluded.seq`,
+  ).run(userId, scope, seq);
+  return seq;
+}
+
+function isServerAdmin(db: Database, actor: Actor): boolean {
+  const row = db.query("SELECT role FROM user WHERE id = ?").get(actor.id) as { role: string | null } | null;
+  return hasAdminRole(row?.role ?? null);
+}
+
+/** Lifts a group ban with an event, so the log still says who stopped the ban and when. */
+function liftGroupBan(db: Database, groupId: number, userId: number, author: number, now: number): void {
+  if (groupBanFor(db, groupId, userId)?.banned !== 1) return;
+  const seq = insertEvent(db, (next) => ({
+    tag: Tag.Ban,
+    seq: next,
+    ts: now,
+    author,
+    scope: groupId,
+    user: userId,
+    on: false,
+  }));
+  db.query("UPDATE group_bans SET banned = 0, seq = ? WHERE group_id = ? AND user_id = ?").run(
+    seq,
+    groupId,
+    userId,
+  );
+}
+
+function serverUserFor(db: Database, wireId: number): ServerUserRow | null {
+  return db
+    .query("SELECT u.id AS id, u.banned AS banned FROM wire_users w JOIN user u ON u.id = w.id WHERE w.wire_id = ?")
+    .get(wireId) as ServerUserRow | null;
+}
+
+/**
+ * Who inherits a group when its owner leaves or is banned server-wide (ADR 0010): the
+ * longest-serving current group admin, else the oldest server admin who is not the owner.
+ * Banned accounts are never successors.
+ */
+function successorForGroup(db: Database, groupId: number, ownerWire: number): number | null {
+  const admin = db
+    .query(
+      `SELECT m.user_id AS user_id FROM group_members m
+       LEFT JOIN wire_users w ON w.wire_id = m.user_id
+       LEFT JOIN user u ON u.id = w.id
+       WHERE m.group_id = ? AND m.role = ? AND m.user_id <> ?
+         AND (u.banned IS NULL OR u.banned = 0)
+       ORDER BY m.seq ASC LIMIT 1`,
+    )
+    .get(groupId, Role.Admin, ownerWire) as { user_id: number } | null;
+  if (admin) return Number(admin.user_id);
+
+  const serverAdmin = db
+    .query(
+      `SELECT w.wire_id AS wire_id FROM user u JOIN wire_users w ON w.id = u.id
+       WHERE (',' || replace(u.role, ' ', '') || ',') LIKE '%,admin,%'
+         AND (u.banned IS NULL OR u.banned = 0) AND w.wire_id <> ?
+         AND w.wire_id NOT IN (SELECT user_id FROM group_bans WHERE group_id = ? AND banned = 1)
+       ORDER BY u.createdAt ASC LIMIT 1`,
+    )
+    .get(ownerWire, groupId) as { wire_id: number } | null;
+  return serverAdmin ? Number(serverAdmin.wire_id) : null;
+}
+
+/** Hands `ownerWire`'s group to the next owner. Returns false when nobody can take it. */
+function handOverOwnership(db: Database, groupId: number, ownerWire: number, now: number): boolean {
+  const successor = successorForGroup(db, groupId, ownerWire);
+  if (successor === null) return false;
+  setMembership(db, groupId, successor, Role.Owner, 0, now);
+  return true;
 }
 
 /** The scope row for an unordered pair, or null when these two have never talked. */
@@ -239,35 +392,78 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       if (op.scope === 0) return { error: AckError.Invalid };
       const group = groupFor(db, op.scope);
       if (!group) return { error: AckError.NotFound };
-      if (op.user !== actor.wireId) return { error: AckError.Forbidden };
-      const existing = memberFor(db, op.scope, actor.wireId);
-      if (existing) {
-        // Joining twice is idempotent; changing a role is group moderation, not this op.
-        return existing.role === op.role
-          ? { seq: Number(existing.seq), firstSeq: Number(existing.seq), state: true }
-          : { error: AckError.Forbidden };
+      const existing = memberFor(db, op.scope, op.user);
+
+      if (op.user === actor.wireId) {
+        // A member changes only their own row: join, leave, or replay a join.
+        if (op.role === Role.Member) {
+          if (existing) {
+            return existing.role === Role.Member
+              ? { seq: Number(existing.seq), firstSeq: Number(existing.seq), state: true }
+              : { error: AckError.Forbidden };
+          }
+          // An invite-only group is joinable only with its current link token (ADR 0016). Open
+          // groups ignore any token the client happens to send. The token is an op field and
+          // is never copied into the membership event.
+          if (!group.open && !inviteMatches(group, op.invite)) return { error: AckError.Forbidden };
+          // A ban survives until an admin lifts it: being kicked is not a way around it.
+          if (groupBanFor(db, op.scope, op.user)?.banned === 1) return { error: AckError.Forbidden };
+          const seq = setMembership(db, op.scope, actor.wireId, Role.Member, actor.wireId, now);
+          return { seq, firstSeq: seq, state: true };
+        }
+
+        if (op.role === Role.None) {
+          if (!existing) return { error: AckError.NotFound };
+          if (existing.role === Role.Owner) {
+            // Resolve the successor before writing anything: a failed op must change nothing.
+            const successor = successorForGroup(db, op.scope, actor.wireId);
+            if (successor === null) return { error: AckError.Forbidden };
+            // Leaving without transferring hands the group on in the same transaction.
+            const seq = setMembership(db, op.scope, actor.wireId, Role.None, actor.wireId, now);
+            setMembership(db, op.scope, successor, Role.Owner, 0, now);
+            recordScopeLeft(db, actor.wireId, op.scope, now);
+            return { seq, firstSeq: seq, state: false };
+          }
+          const seq = setMembership(db, op.scope, actor.wireId, Role.None, actor.wireId, now);
+          recordScopeLeft(db, actor.wireId, op.scope, now);
+          return { seq, firstSeq: seq, state: false };
+        }
+
+        // Promoting yourself is not this op: only the owner changes roles.
+        return { error: AckError.Forbidden };
       }
-      // An invite-only group is joinable only with its current link token (ADR 0010). Open
-      // groups ignore any token the client happens to send. The token is an op field and is
-      // never copied into the membership event.
-      if (!group.open && !inviteMatches(group, op.invite)) return { error: AckError.Forbidden };
-      if (op.role !== Role.Member) return { error: AckError.Forbidden };
-      const seq = insertEvent(db, (next) => ({
-        tag: Tag.Membership,
-        seq: next,
-        ts: now,
-        author: actor.wireId,
-        scope: op.scope,
-        user: actor.wireId,
-        role: Role.Member,
-      }));
-      db.query("INSERT INTO group_members (group_id, user_id, role, seq) VALUES (?, ?, ?, ?)").run(
-        op.scope,
-        actor.wireId,
-        Role.Member,
-        seq,
-      );
-      return { seq, firstSeq: seq, state: true };
+      // Changing someone else's role is owner-only (ADR 0010).
+      if (groupRole(db, op.scope, actor.wireId) !== Role.Owner) return { error: AckError.Forbidden };
+      if (!existing) return { error: AckError.NotFound };
+      if (existing.role === op.role) return { seq: Number(existing.seq), firstSeq: Number(existing.seq), state: false };
+
+      if (op.role === Role.Owner) {
+        // Transfer is one transaction: the target becomes owner, the old owner becomes admin.
+        const targetSeq = setMembership(db, op.scope, op.user, Role.Owner, actor.wireId, now);
+        setMembership(db, op.scope, actor.wireId, Role.Admin, actor.wireId, now);
+        return { seq: targetSeq, firstSeq: targetSeq, state: false };
+      }
+
+      if (op.role === Role.Admin) {
+        if (existing.role !== Role.Member) return { error: AckError.Forbidden };
+        const seq = setMembership(db, op.scope, op.user, Role.Admin, actor.wireId, now);
+        return { seq, firstSeq: seq, state: false };
+      }
+
+      if (op.role === Role.Member) {
+        if (existing.role !== Role.Admin) return { error: AckError.Forbidden };
+        const seq = setMembership(db, op.scope, op.user, Role.Member, actor.wireId, now);
+        return { seq, firstSeq: seq, state: false };
+      }
+
+      if (op.role === Role.None) {
+        if (existing.role === Role.Owner) return { error: AckError.Forbidden };
+        const seq = setMembership(db, op.scope, op.user, Role.None, actor.wireId, now);
+        recordScopeLeft(db, op.user, op.scope, now);
+        return { seq, firstSeq: seq, state: false };
+      }
+
+      return { error: AckError.Invalid };
     }
     case Tag.Post: {
       // Group scopes only: DMs have their own tag and their own slice.
@@ -298,6 +494,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       // A reply is not a valid parent, even in the right scope: that is Invalid, not NotFound.
       if (parent.tag !== Tag.Post) return { error: AckError.Invalid };
       if (parent.scope !== op.scope) return { error: AckError.NotFound };
+      if (deletionFor(db, op.scope, op.parent)) return { error: AckError.NotFound };
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Reply,
         seq: next,
@@ -317,6 +514,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       const target = headerFor(db, op.target);
       if (!target || target.scope !== op.scope) return { error: AckError.NotFound };
       if (target.tag !== Tag.Post && target.tag !== Tag.Reply) return { error: AckError.Invalid };
+      if (deletionFor(db, op.scope, op.target)) return { error: AckError.NotFound };
       // Toggling is append-only: each press writes on/off, and clients keep the latest one.
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Reaction,
@@ -328,6 +526,127 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
         emoji: op.emoji,
         on: op.on,
       }));
+      return { seq, firstSeq: seq, state: false };
+    }
+    case Tag.Delete: {
+      // The author, a group admin, or the owner. DM messages have no moderation.
+      const denied = groupAccessError(db, actor, op.scope);
+      if (denied !== null) return { error: denied };
+      const target = headerFor(db, op.target);
+      if (!target || target.scope !== op.scope) return { error: AckError.NotFound };
+      if (target.tag !== Tag.Post && target.tag !== Tag.Reply) return { error: AckError.Invalid };
+      if (target.author !== actor.wireId && groupRole(db, op.scope, actor.wireId) < Role.Admin) {
+        return { error: AckError.Forbidden };
+      }
+      const already = deletionFor(db, op.scope, op.target);
+      if (already) return { seq: Number(already.seq), firstSeq: Number(already.seq), state: false };
+      const seq = insertEvent(db, (next) => ({
+        tag: Tag.Delete,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope: op.scope,
+        target: op.target,
+      }));
+      db.query("INSERT INTO deleted_events (scope, target, seq) VALUES (?, ?, ?)").run(op.scope, op.target, seq);
+      return { seq, firstSeq: seq, state: false };
+    }
+    case Tag.Ban: {
+      if (op.user === 0) return { error: AckError.Invalid };
+
+      if (op.scope === 0) {
+        // Server-wide ban: server admin only (ADR 0010).
+        if (!isServerAdmin(db, actor)) return { error: AckError.Forbidden };
+        const target = serverUserFor(db, op.user);
+        if (!target) return { error: AckError.NotFound };
+        if (target.id === actor.id) return { error: AckError.Forbidden };
+        if (op.on) {
+          db.query("UPDATE user SET banned = 1 WHERE id = ?").run(target.id);
+          // A server ban removes access everywhere, so every group membership goes, and an
+          // owned group gets a successor in the same transaction.
+          const memberships = db
+            .query("SELECT group_id, role FROM group_members WHERE user_id = ?")
+            .all(op.user) as { group_id: number; role: number }[];
+          for (const row of memberships) {
+            const groupId = Number(row.group_id);
+            const owner = Number(row.role) === Role.Owner;
+            setMembership(db, groupId, op.user, Role.None, 0, now);
+            if (owner && !handOverOwnership(db, groupId, op.user, now)) {
+              // The actor is the last server admin, but may itself be group-banned. Taking the
+              // group is what lifts that ban: nobody can own a group they cannot enter.
+              liftGroupBan(db, groupId, actor.wireId, actor.wireId, now);
+              setMembership(db, groupId, actor.wireId, Role.Owner, 0, now);
+            }
+            recordScopeLeft(db, op.user, groupId, now);
+          }
+        } else {
+          db.query("UPDATE user SET banned = 0 WHERE id = ?").run(target.id);
+        }
+        const seq = insertEvent(db, (next) => ({
+          tag: Tag.Ban,
+          seq: next,
+          ts: now,
+          author: actor.wireId,
+          scope: 0,
+          user: op.user,
+          on: op.on,
+        }));
+        return { seq, firstSeq: seq, state: false };
+      }
+
+      const group = groupFor(db, op.scope);
+      if (!group) return { error: AckError.NotFound };
+      const actorRole = groupRole(db, op.scope, actor.wireId);
+      if (actorRole < Role.Admin) return { error: AckError.Forbidden };
+      if (op.user === actor.wireId) return { error: AckError.Forbidden };
+
+      const ban = groupBanFor(db, op.scope, op.user);
+      if (ban && ban.banned === (op.on ? 1 : 0)) {
+        return { seq: Number(ban.seq), firstSeq: Number(ban.seq), state: false };
+      }
+
+      if (op.on) {
+        const target = memberFor(db, op.scope, op.user);
+        if (!target) return { error: AckError.NotFound };
+        // Admins moderate members. Banning a peer or the owner is the owner's call.
+        if (target.role === Role.Owner) return { error: AckError.Forbidden };
+        if (actorRole === Role.Admin && target.role === Role.Admin) return { error: AckError.Forbidden };
+
+        // A ban kicks: membership goes away, then the user is told to purge the scope.
+        const firstSeq = setMembership(db, op.scope, op.user, Role.None, actor.wireId, now);
+        const seq = insertEvent(db, (next) => ({
+          tag: Tag.Ban,
+          seq: next,
+          ts: now,
+          author: actor.wireId,
+          scope: op.scope,
+          user: op.user,
+          on: true,
+        }));
+        recordScopeLeft(db, op.user, op.scope, now);
+        db.query(
+          `INSERT INTO group_bans (group_id, user_id, banned, seq) VALUES (?, ?, 1, ?)
+           ON CONFLICT(group_id, user_id) DO UPDATE SET banned = 1, seq = excluded.seq`,
+        ).run(op.scope, op.user, seq);
+        return { seq, firstSeq, state: false };
+      }
+
+      // Unban keeps the person out until an admin lifts the ban; it does not restore membership.
+      if (!ban) return { error: AckError.NotFound };
+      const seq = insertEvent(db, (next) => ({
+        tag: Tag.Ban,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope: op.scope,
+        user: op.user,
+        on: false,
+      }));
+      db.query("UPDATE group_bans SET banned = 0, seq = ? WHERE group_id = ? AND user_id = ?").run(
+        seq,
+        op.scope,
+        op.user,
+      );
       return { seq, firstSeq: seq, state: false };
     }
     case Tag.Dm: {
@@ -410,8 +729,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       return { seq, firstSeq: seq, state: false };
     }
     default:
-      // Delete and ban arrive in later slices. The tag is known, but this server does not
-      // implement it yet, so the device gets a nack instead of a silent drop.
+      // Unknown op tags were already turned into Unsupported by the decoder.
       return { error: AckError.Unsupported };
   }
 }
@@ -458,12 +776,15 @@ export function applyOutbox(db: Database, actor: Actor, ops: readonly Op[], now 
   })();
 }
 
-// One viewer placeholder per branch; callers bind the viewer once per `?` (three times).
+// One viewer placeholder per branch; callers bind the viewer once per `?` (four times). The
+// last branch is the exception that makes leaving work: a kicked user is no longer a member,
+// so only the scope_left map can still reach them with the purge event.
 const VISIBLE_SQL = `
   e.scope = 0
-  OR e.scope IN (SELECT group_id FROM group_members WHERE user_id = ?)
+  OR (e.tag <> ${Tag.ScopeLeft} AND e.scope IN (SELECT group_id FROM group_members WHERE user_id = ?))
   OR e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
   OR (e.tag = ${Tag.GroupMeta} AND e.scope IN (SELECT id FROM chat_groups WHERE open = 1))
+  OR e.seq IN (SELECT seq FROM scope_lefts WHERE user_id = ?)
 `;
 
 function decodeRows(rows: EventRow[]): Event[] {
@@ -494,7 +815,7 @@ export function visibleEvents(db: Database, viewer: number, cursor: number): Vis
        ORDER BY e.seq ASC
        LIMIT ?`,
     )
-    .all(cursor, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+    .all(cursor, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
 
   const events: Event[] = [];
   let bytes = 0;
@@ -528,8 +849,56 @@ export function visibleFrom(db: Database, viewer: number, firstSeq: number): Eve
        WHERE e.seq >= ? AND (${VISIBLE_SQL})
        ORDER BY e.seq ASC`,
     )
-    .all(firstSeq, viewer, viewer, viewer) as EventRow[];
+    .all(firstSeq, viewer, viewer, viewer, viewer) as EventRow[];
   return decodeRows(rows);
+}
+
+/**
+ * Moderation events after the viewer's old cursor. A state snapshot jumps the cursor to the
+ * head, and current state cannot express a tombstone (a deleted post) or an absence (a member
+ * who left), so these events have to travel with it. A fresh device (cursor 0) has no cache
+ * to reconcile and gets nothing.
+ */
+export interface ModerationDeltaPage {
+  events: Event[];
+  more: boolean;
+  /** Last applied seq; the caller keeps the head cursor only when nothing is left. */
+  cursor: number;
+}
+
+export function moderationDeltas(db: Database, viewer: number, cursor: number): ModerationDeltaPage {
+  if (cursor <= 0) return { events: [], more: false, cursor };
+  const rows = db
+    .query(
+      `SELECT e.seq, e.bytes FROM events e
+       WHERE e.seq > ? AND e.tag IN (${Tag.Delete}, ${Tag.Ban}, ${Tag.Membership})
+         AND (${VISIBLE_SQL})
+       ORDER BY e.seq ASC
+       LIMIT ?`,
+    )
+    .all(cursor, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+
+  const events: Event[] = [];
+  let bytes = 0;
+  // A row the decoder drops still occupies a LIMIT slot, so the extra row is the only proof
+  // that this page is not the end, exactly like visibleEvents.
+  let more = rows.length > MAX_SYNC_EVENTS;
+  for (const row of rows) {
+    if (events.length >= MAX_SYNC_EVENTS || (events.length > 0 && bytes + row.bytes.length > MAX_SYNC_BYTES)) {
+      more = true;
+      break;
+    }
+    let event: Event | null;
+    try {
+      event = decodeEventBytes(row.bytes);
+    } catch {
+      continue;
+    }
+    if (!event) continue;
+    events.push(event);
+    bytes += row.bytes.length;
+  }
+  return { events, more, cursor: events.at(-1)?.seq ?? cursor };
 }
 
 /**
@@ -573,7 +942,25 @@ export function stateEvents(db: Database, viewer: number): Event[] {
        ORDER BY e.seq ASC`,
     )
     .all(viewer, viewer) as EventRow[];
-  return decodeRows([...profiles, ...groups, ...members, ...dms]).sort((a, b) => a.seq - b.seq);
+  // A fresh member sees who is currently banned, so moderation state survives a reinstall.
+  const bans = db
+    .query(
+      `SELECT e.bytes FROM group_bans b JOIN events e ON e.seq = b.seq
+       WHERE b.banned = 1
+         AND b.group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)
+       ORDER BY e.seq ASC`,
+    )
+    .all(viewer) as EventRow[];
+  // A pending purge must survive a state snapshot too: joining another group, or retrying a
+  // lost leave response, moves the cursor to the head without ever walking the event log.
+  const lefts = db
+    .query(
+      `SELECT e.bytes FROM scope_lefts s JOIN events e ON e.seq = s.seq
+       WHERE s.user_id = ?
+       ORDER BY e.seq ASC`,
+    )
+    .all(viewer) as EventRow[];
+  return decodeRows([...profiles, ...groups, ...members, ...dms, ...bans, ...lefts]).sort((a, b) => a.seq - b.seq);
 }
 
 /** Merges events by seq. State events can sit at or below the old cursor; the client applies them. */
