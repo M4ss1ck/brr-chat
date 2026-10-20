@@ -113,7 +113,7 @@ output {
       </label>
       <button type="button" id="recover">Sign in with code</button>
     </form>
-    <p class="note">No email recovery, no admin reset. If you lose your recovery code and every signed-in device, the account is gone.</p>
+    <p class="note">No email recovery, no admin reset. If you lose your recovery code and cannot sign in on any device, the account is gone.</p>
   </section>
 
   <section id="confirm-panel" hidden>
@@ -125,7 +125,7 @@ output {
     </label>
     <button type="button" id="confirm">Finish sign-up</button>
     <button type="button" id="refresh-code">Show a new code</button>
-    <p class="note">Losing this code and every signed-in device means losing the account. There is no email recovery and no admin reset.</p>
+    <p class="note">Losing this code and every way to sign in means losing the account. There is no email recovery and no admin reset.</p>
   </section>
 
   <section id="signed-in" hidden>
@@ -140,7 +140,7 @@ output {
     <button type="button" id="sync">Sync</button>
     <button type="button" id="sign-out">Sign out</button>
     <h2>Recovery code</h2>
-    <p class="note">If you lose every signed-in device, this code is the only way back in. Losing both means losing the account: there is no email recovery and no admin reset.</p>
+    <p class="note">This code is the only way back in if you also lose your password and every signed-in device. Lose all of them and the account is gone: there is no email recovery and no admin reset.</p>
     <button type="button" id="regenerate">New recovery code</button>
     <div id="code-panel" hidden><output id="new-code"></output></div>
   </section>

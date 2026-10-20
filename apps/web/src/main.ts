@@ -3,7 +3,7 @@
 // lookup is optional, so the module also loads in a test or in a worker without a DOM.
 import { ResponseError } from "@brr-chat/protocol";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
-import { syncAndPersist } from "./sync.ts";
+import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import { getCursor, getRange, getSession } from "./store.ts";
 
 type Mode = "up" | "in";
@@ -76,6 +76,7 @@ async function finishSignup(): Promise<void> {
   }
   try {
     await confirmRecovery(location.origin, group);
+    setText("recovery-code", "");
     message("Recovery code confirmed. Signup is finished.");
   } catch (err) {
     message(err instanceof Error ? err.message : "That code did not match.");
@@ -147,8 +148,12 @@ async function syncNow(): Promise<void> {
     message(response.events.length === 0 && response.cursor === 0 ? "In sync. This server is empty." : `In sync at ${response.cursor}.`);
     await refresh();
   } catch (err) {
-    const text = err instanceof Error ? err.message : "Sync failed.";
-    message(text.includes("403") ? "Save your recovery code and type its last group to finish signup." : text);
+    const text = err instanceof SyncHttpError && err.status === 403
+      ? "Save your recovery code and type its last group to finish signup."
+      : err instanceof Error
+        ? err.message
+        : "Sync failed.";
+    message(text);
   }
 }
 

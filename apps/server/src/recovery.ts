@@ -15,11 +15,11 @@ const RECOVERY_GROUPS = RECOVERY_CODE_LENGTH / RECOVERY_GROUP_LENGTH;
 const HASH_BYTES = 32;
 
 /** A fresh code, unformatted. Each of the 20 characters carries 5 bits. */
-export function generateRecoveryCode(bytes: Uint8Array = crypto.getRandomValues(new Uint8Array(RECOVERY_CODE_LENGTH))): string {
-  if (bytes.length < RECOVERY_CODE_LENGTH) throw new RangeError("recovery code: not enough random bytes");
+export function generateRecoveryCode(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(RECOVERY_CODE_LENGTH));
   let code = "";
-  for (let i = 0; i < RECOVERY_CODE_LENGTH; i++) {
-    code += ALPHABET[(bytes[i] ?? 0) % ALPHABET.length];
+  for (const byte of bytes) {
+    code += ALPHABET[byte % ALPHABET.length];
   }
   return code;
 }
@@ -275,19 +275,18 @@ export function createRecoveryService(db: Database, auth: AuthInstance, limits: 
     // Hash even when there is no row, so an unknown username costs the same as a wrong code.
     const expected = row?.code_hash ?? new Uint8Array(HASH_BYTES);
     const normalized = normalizeRecoveryCode(code);
-    const valid =
-      row !== null &&
-      user !== null &&
-      normalized.length === RECOVERY_CODE_LENGTH &&
-      matchesCode(normalized, expected);
-    if (!valid || user === null) return json(401, { error: "invalid username or recovery code" });
+    const matches = matchesCode(normalized, expected);
+    if (user === null || row === null || normalized.length !== RECOVERY_CODE_LENGTH || !matches) {
+      return json(401, { error: "invalid username or recovery code" });
+    }
 
-    const nextCode = rotateRecoveryCode(db, user.id, true);
     const ctx = await auth.$context;
     // Every old session dies before the new one is issued: a stolen session cannot survive
-    // the recovery it was taken from.
+    // the recovery it was taken from. The code rotates last: a failure there leaves the old
+    // code usable, instead of taking it away without handing back a session.
     await ctx.internalAdapter.deleteUserSessions(user.id);
     const session = await ctx.internalAdapter.createSession(user.id, false);
+    const nextCode = rotateRecoveryCode(db, user.id, true);
     // The username plugin's column is not in the base User type BetterAuth exports.
     const account = (await ctx.internalAdapter.findUserById(user.id)) as Record<string, unknown> | null;
     const name = typeof account?.name === "string" ? account.name : username;

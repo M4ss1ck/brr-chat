@@ -9,6 +9,7 @@ export const SIGN_OUT_PATH = "/api/auth/sign-out";
 export const CONFIRM_PATH = "/api/recovery/confirm";
 export const REGENERATE_PATH = "/api/recovery/regenerate";
 export const REDEEM_PATH = "/api/recovery/redeem";
+export const STATUS_PATH = "/api/recovery/status";
 
 interface AuthPayload {
   token?: unknown;
@@ -54,25 +55,46 @@ function sessionFrom(payload: AuthPayload | null, res: Response, path: string, u
   return { token, username: typeof payload?.user?.username === "string" ? payload.user.username : username };
 }
 
+async function exchange(
+  base: string,
+  path: string,
+  body: unknown,
+  username: string,
+  options: { token?: string; pending?: boolean } = {},
+): Promise<Exchange> {
+  const { res, payload } = await postJson(base, path, body, options.token);
+  const session = sessionFrom(payload, res, path, username);
+  const recoveryCode = codeFrom(payload, res, path);
+  if (options.pending === true) session.recoveryPending = true;
+  await setSession(session);
+  return { session, recoveryCode };
+}
+
 /**
  * Create an account. The server also returns the one recovery code it will ever show; the
  * session stays pending until the last group is typed back, so the caller must confirm.
  */
-export async function signUp(base: string, username: string, password: string): Promise<Exchange> {
-  const { res, payload } = await postJson(base, SIGN_UP_PATH, { username, password });
-  const session = sessionFrom(payload, res, SIGN_UP_PATH, username);
-  const recoveryCode = codeFrom(payload, res, SIGN_UP_PATH);
-  session.recoveryPending = true;
-  await setSession(session);
-  return { session, recoveryCode };
+export function signUp(base: string, username: string, password: string): Promise<Exchange> {
+  return exchange(base, SIGN_UP_PATH, { username, password }, username, { pending: true });
 }
 
 /** Username + password sign-in on the same device, returning the stored session. */
 export async function signIn(base: string, username: string, password: string): Promise<Session> {
   const { res, payload } = await postJson(base, SIGN_IN_PATH, { username, password });
   const session = sessionFrom(payload, res, SIGN_IN_PATH, username);
+  // A signup that never finished can still be signed in to; say so, so the UI asks for the
+  // type-back instead of hiding it behind a sync that always 403s.
+  if (!(await recoveryConfirmed(base, session.token))) session.recoveryPending = true;
   await setSession(session);
   return session;
+}
+
+/** True unless the server says otherwise; a failed check must not block signing in. */
+async function recoveryConfirmed(base: string, token: string): Promise<boolean> {
+  const res = await fetch(`${base}${STATUS_PATH}`, { headers: { Authorization: bearerHeader(token) } }).catch(() => null);
+  if (!res?.ok) return true;
+  const payload = (await res.json().catch(() => null)) as { confirmed?: unknown } | null;
+  return payload?.confirmed !== false;
 }
 
 /** Finish signup by typing back the last group of the code (ADR 0006). */
@@ -96,12 +118,8 @@ export async function regenerateRecovery(base: string): Promise<string> {
  * Sign in with a recovery code. The server rotates the code and revokes every other session,
  * so the caller must show the new code before the user can lose it.
  */
-export async function redeemRecovery(base: string, username: string, code: string): Promise<Exchange> {
-  const { res, payload } = await postJson(base, REDEEM_PATH, { username, code });
-  const session = sessionFrom(payload, res, REDEEM_PATH, username);
-  const recoveryCode = codeFrom(payload, res, REDEEM_PATH);
-  await setSession(session);
-  return { session, recoveryCode };
+export function redeemRecovery(base: string, username: string, code: string): Promise<Exchange> {
+  return exchange(base, REDEEM_PATH, { username, code }, username);
 }
 
 /**

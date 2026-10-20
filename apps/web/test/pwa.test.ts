@@ -247,6 +247,21 @@ describe("PWA client (apps/web)", () => {
     await expect(postSyncRequest(base, "", buildSyncRequest(0))).rejects.toThrow();
   });
 
+  test("signing in to a signup that never finished still asks for the type-back", async () => {
+    const account = username();
+    const { recoveryCode } = await auth.signUp(base, account, "password1234");
+    await closeStore();
+    globalThis.indexedDB = new IDBFactory();
+
+    const pending = await auth.signIn(base, account, "password1234");
+    expect(pending.recoveryPending).toBe(true);
+    await auth.confirmRecovery(base, recoveryCode.slice(-5));
+    await auth.signOut(base);
+
+    const finished = await auth.signIn(base, account, "password1234");
+    expect(finished.recoveryPending).toBeUndefined();
+  });
+
   test("recovery: confirm finishes signup, regenerate rotates, redeem signs back in", async () => {
     const account = username();
     const { session: pending, recoveryCode } = await auth.signUp(base, account, "password1234");
