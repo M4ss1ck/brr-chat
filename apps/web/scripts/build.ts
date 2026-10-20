@@ -88,7 +88,7 @@ output {
 ul { list-style: none; padding: 0; margin: .4rem 0; }
 .list li { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .3rem 0; }
 .list li button { margin: 0; }
-#groups-list button[aria-current="true"] { border-color: #f2efe6; background: #2b2a20; }
+#groups-list button[aria-current="true"], #dm-list button[aria-current="true"] { border-color: #f2efe6; background: #2b2a20; }
 #group-view { margin: .5rem 0 1rem; }
 #group-title { margin: .5rem 0 .1rem; }
 .posts { display: grid; gap: .6rem; margin: .8rem 0; }
@@ -172,6 +172,26 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       </label>
       <button type="button" id="post">Post</button>
     </section>
+
+    <h2>Direct messages</h2>
+    <ul id="dm-list" class="list"></ul>
+    <p id="no-dms" class="note" hidden>No direct messages yet. Start one below.</p>
+
+    <section id="dm-view" hidden>
+      <h3 id="dm-title"></h3>
+      <ul id="dm-messages" class="posts"></ul>
+      <p id="dm-empty" class="note" hidden>No messages yet. Say hi.</p>
+      <label>Message
+        <input id="dm-text" autocomplete="off" autocapitalize="sentences">
+      </label>
+      <button type="button" id="dm-send">Send</button>
+    </section>
+
+    <h2>New direct message</h2>
+    <label>Username
+      <input id="dm-username" autocomplete="off" autocapitalize="none" spellcheck="false">
+    </label>
+    <button type="button" id="dm-start">Message</button>
 
     <h2>Open groups</h2>
     <ul id="open-list" class="list"></ul>

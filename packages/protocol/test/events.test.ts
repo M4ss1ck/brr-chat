@@ -33,6 +33,7 @@ export const samples: Event[] = [
   { ...hdr, tag: Tag.Ban, user: 66, on: true },
   { ...hdr, tag: Tag.ScopeLeft, purge: true },
   { ...hdr, author: 0, tag: Tag.Gap, after: 10, before: 900, count: 340 },
+  { ...hdr, tag: Tag.DmScope, peer: 43 },
 ];
 
 describe("events", () => {
@@ -130,6 +131,7 @@ describe("ops (outbox items)", () => {
   test("server-only tags cannot be sent as ops", () => {
     expect(decodeOp([cid, Tag.Gap, 7, 1, 2, 3])).toEqual({ ok: false, cid, error: AckError.Unsupported });
     expect(decodeOp([cid, Tag.ScopeLeft, 7, true])).toEqual({ ok: false, cid, error: AckError.Unsupported });
+    expect(decodeOp([cid, Tag.DmScope, 7, 43])).toEqual({ ok: false, cid, error: AckError.Unsupported });
   });
 
   test("unknown op tag with a valid cid is reported so the server can nack it", () => {

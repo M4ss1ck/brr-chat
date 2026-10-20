@@ -8,6 +8,7 @@ import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import {
   enqueueOp,
   getCursor,
+  getDmScopes,
   getGroups,
   getMembers,
   getOutbox,
@@ -23,6 +24,7 @@ import {
   tallyReactions,
   toWireOp,
   type ReactionTally,
+  type StoredDm,
   type StoredGroup,
   type StoredPost,
   type StoredProfile,
@@ -31,6 +33,9 @@ import {
 type Mode = "up" | "in";
 
 let currentGroup: number | null = null;
+let currentDm: number | null = null;
+/** Set while composing the first message to a peer; the scope does not exist until it is sent. */
+let pendingDmPeer: number | null = null;
 /** Post being replied to in the composer, or null for a top-level post. */
 let replyingTo: number | null = null;
 /** Taps are serialized, so the second tap sees the first one's new state. */
@@ -80,7 +85,9 @@ async function refresh(): Promise<void> {
   const range = await getRange();
   setText("range", range ? `v${range.min}..v${range.max}` : "unknown");
   await refreshGroups();
+  await refreshDms();
   await renderGroup();
+  await renderDm();
 }
 
 function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
@@ -94,9 +101,13 @@ function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
     button.setAttribute("aria-current", currentGroup === group.id ? "true" : "false");
     button.addEventListener("click", () => {
       currentGroup = group.id;
+      currentDm = null;
+      pendingDmPeer = null;
       cancelReply();
       void renderGroup();
+      void renderDm();
       void refreshGroups();
+      void refreshDms();
     });
   }
   item.append(button);
@@ -132,6 +143,57 @@ async function refreshGroups(): Promise<void> {
   show("no-open-groups", open.length === 0);
 }
 
+function dmItem(
+  dm: StoredDm,
+  self: number | null,
+  profiles: Map<number, StoredProfile>,
+  last: StoredPost | undefined,
+): HTMLLIElement {
+  const other = self !== null && dm.a === self ? dm.b : dm.a;
+  const profile = profiles.get(other);
+  const name = profile?.displayName || profile?.username || `user #${other}`;
+
+  const item = document.createElement("li");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = name;
+  button.setAttribute("aria-current", currentDm === dm.id ? "true" : "false");
+  button.addEventListener("click", () => {
+    currentDm = dm.id;
+    currentGroup = null;
+    pendingDmPeer = null;
+    cancelReply();
+    void renderGroup();
+    void renderDm();
+    void refreshDms();
+  });
+  item.append(button);
+
+  const note = document.createElement("span");
+  note.className = "note";
+  note.textContent = last ? last.text : "No messages yet";
+  item.append(note);
+  return item;
+}
+
+async function refreshDms(): Promise<void> {
+  const session = await getSession();
+  const list = el("dm-list");
+  if (!session || !list) return;
+
+  const self = await getSelf(session.username);
+  const profiles = await getProfiles(session.username);
+  const rows: { dm: StoredDm; last: StoredPost | undefined }[] = [];
+  for (const dm of await getDmScopes(session.username)) {
+    const messages = await getPosts(session.username, dm.id);
+    rows.push({ dm, last: messages.at(-1) });
+  }
+  rows.sort((a, b) => (b.last?.seq ?? b.dm.seq) - (a.last?.seq ?? a.dm.seq));
+
+  list.replaceChildren(...rows.map(({ dm, last }) => dmItem(dm, self, profiles, last)));
+  show("no-dms", rows.length === 0);
+}
+
 function reactionBar(target: number, context: ViewContext): HTMLDivElement {
   const bar = document.createElement("div");
   bar.className = "reactions";
@@ -152,7 +214,7 @@ function reactionBar(target: number, context: ViewContext): HTMLDivElement {
   return bar;
 }
 
-function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] = []): HTMLLIElement {
+function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] = [], interactive = true): HTMLLIElement {
   const item = document.createElement("li");
   item.className = post.parent === 0 ? "post" : "post reply";
 
@@ -174,23 +236,26 @@ function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] 
   text.className = "text";
   text.textContent = post.text;
 
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  actions.append(reactionBar(post.seq, context));
-  if (post.parent === 0) {
-    const reply = document.createElement("button");
-    reply.type = "button";
-    reply.className = "reply";
-    reply.textContent = "Reply";
-    reply.setAttribute("aria-pressed", replyingTo === post.seq ? "true" : "false");
-    reply.addEventListener("click", () => {
-      setReply(post.seq, name);
-      void renderGroup();
-    });
-    actions.append(reply);
+  body.append(meta, text);
+  // DMs are a flat thread: no reactions or reply affordance on a message.
+  if (interactive) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(reactionBar(post.seq, context));
+    if (post.parent === 0) {
+      const reply = document.createElement("button");
+      reply.type = "button";
+      reply.className = "reply";
+      reply.textContent = "Reply";
+      reply.setAttribute("aria-pressed", replyingTo === post.seq ? "true" : "false");
+      reply.addEventListener("click", () => {
+        setReply(post.seq, name);
+        void renderGroup();
+      });
+      actions.append(reply);
+    }
+    body.append(actions);
   }
-
-  body.append(meta, text, actions);
   if (replies.length > 0) {
     const list = document.createElement("ul");
     list.className = "replies";
@@ -268,6 +333,48 @@ async function renderGroup(): Promise<void> {
   }
 }
 
+/** Renders the DM thread from cache only, so it opens offline exactly like a group. */
+async function renderDm(): Promise<void> {
+  const view = el("dm-view");
+  if (!view) return;
+  const session = await getSession();
+  if (!session) {
+    show("dm-view", false);
+    return;
+  }
+
+  let peer = pendingDmPeer;
+  const scope = currentDm;
+  if (scope !== null) {
+    const dm = (await getDmScopes(session.username)).find((row) => row.id === scope);
+    if (!dm) {
+      show("dm-view", false);
+      return;
+    }
+    const self = await getSelf(session.username);
+    peer = self !== null && dm.a === self ? dm.b : dm.a;
+  }
+  if (peer === null) {
+    show("dm-view", false);
+    return;
+  }
+
+  const profiles = await getProfiles(session.username);
+  const profile = profiles.get(peer);
+  const name = profile?.displayName || profile?.username || `user #${peer}`;
+  show("dm-view", true);
+  setText("dm-title", `Direct message · ${name}`);
+
+  const context: ViewContext = { profiles, reactions: new Map() };
+  const messages = scope === null ? [] : await getPosts(session.username, scope);
+  const list = el("dm-messages");
+  if (list) list.replaceChildren(...messages.map((message) => postItem(message, context, [], false)));
+  show("dm-empty", messages.length === 0);
+
+  const input = el<HTMLInputElement>("dm-text");
+  if (input) input.placeholder = `Message ${name}`;
+}
+
 async function identifySelf(username: string): Promise<void> {
   if ((await getSelf(username)) !== null) return;
   for (const profile of (await getProfiles(username)).values()) {
@@ -287,7 +394,7 @@ function explainAck(error: number): string {
     case 3:
       return "The server rejected that request as invalid.";
     case 4:
-      return "That group or post no longer exists.";
+      return "That group, account, post or message no longer exists.";
     case 5:
       return "Too many requests. Try again in a moment.";
     default:
@@ -458,6 +565,8 @@ async function createGroup(): Promise<void> {
   if (ack && "seq" in ack) {
     cancelReply();
     currentGroup = ack.seq;
+    currentDm = null;
+    pendingDmPeer = null;
   }
   await refresh();
 }
@@ -477,7 +586,91 @@ async function joinGroup(group: StoredGroup): Promise<void> {
   });
   cancelReply();
   currentGroup = group.id;
+  currentDm = null;
+  pendingDmPeer = null;
   await syncNow();
+}
+
+/** Resolves a username from the cached profile list, then opens its thread or starts one. */
+async function openDm(): Promise<void> {
+  const session = await getSession();
+  if (!session) {
+    message("Sign in first.");
+    return;
+  }
+  // Usernames are stored lowercased on the server; match what the user typed.
+  const username = value("dm-username").toLowerCase();
+  if (username.length === 0) {
+    message("Type the username of the person to message.");
+    return;
+  }
+  const self = await getSelf(session.username);
+  const profile = [...(await getProfiles(session.username)).values()].find((row) => row.username === username);
+  if (!profile) {
+    message("This device has not seen that account yet. Sync after they join the server.");
+    return;
+  }
+  if (profile.user === self) {
+    message("That is you.");
+    return;
+  }
+
+  const existing = (await getDmScopes(session.username)).find(
+    (dm) => dm.a === profile.user || dm.b === profile.user,
+  );
+  currentGroup = null;
+  pendingDmPeer = existing ? null : profile.user;
+  currentDm = existing ? existing.id : null;
+  cancelReply();
+  clear("dm-username");
+  await renderGroup();
+  await renderDm();
+  await refreshDms();
+}
+
+async function sendDm(): Promise<void> {
+  const session = await getSession();
+  if (!session) {
+    message("Sign in first.");
+    return;
+  }
+  const text = value("dm-text");
+  if (text.length === 0) {
+    message("Write something first.");
+    return;
+  }
+
+  let scope = currentDm;
+  let peer = pendingDmPeer;
+  if (scope !== null) {
+    const dm = (await getDmScopes(session.username)).find((row) => row.id === scope);
+    if (!dm) {
+      message("That conversation is gone. Open it again.");
+      return;
+    }
+    const self = await getSelf(session.username);
+    peer = self !== null && dm.a === self ? dm.b : dm.a;
+  }
+  if (scope === null && peer === null) {
+    message("Choose someone to message first.");
+    return;
+  }
+
+  // scope 0 lets the server open (or reuse) the single scope for this pair; a retry reuses
+  // the same cid through the outbox, so it can never create a second conversation.
+  const queued = await enqueueOp(session.username, { tag: Tag.Dm, scope: scope ?? 0, peer: peer ?? 0, text });
+  clear("dm-text");
+  const response = await syncNow();
+  const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
+  if (ack && "seq" in ack) {
+    // The cache now holds the dm_scope event, so the conversation can be selected by peer.
+    const dm = (await getDmScopes(session.username)).find((row) => row.a === peer || row.b === peer);
+    if (dm) {
+      currentDm = dm.id;
+      pendingDmPeer = null;
+    }
+  }
+  await refresh();
 }
 
 async function postMessage(): Promise<void> {
@@ -535,6 +728,8 @@ async function leave(): Promise<void> {
     await signOut(location.origin);
     cancelReply();
     currentGroup = null;
+    currentDm = null;
+    pendingDmPeer = null;
     setText("new-code", "");
     show("code-panel", false);
     message("Signed out.");
@@ -565,6 +760,8 @@ function wire(): void {
     cancelReply();
     void renderGroup();
   });
+  el<HTMLButtonElement>("dm-start")?.addEventListener("click", () => void openDm());
+  el<HTMLButtonElement>("dm-send")?.addEventListener("click", () => void sendDm());
 }
 
 function boot(): void {

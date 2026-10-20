@@ -79,8 +79,8 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
   server sends a `Gap` event instead of the excess. The gap is filled only when the user asks
   (`/history`).
 - **Fresh device or new join:** the server sends current state (profiles, group metadata,
-  memberships) and a cursor at the head of the log. **No posts.** Older posts load only when the
-  user asks. A state snapshot may repeat an event at or below the device's previous cursor; the
+  memberships, the viewer's `dm_scope` events) and a cursor at the head of the log. **No
+  posts or DM messages.** Older posts load only when the user asks. A state snapshot may repeat an event at or below the device's previous cursor; the
   client applies it by `seq` and then moves to the returned cursor.
 - **Outbox:** each op carries a `cid`, 8 random bytes chosen by the device. A retry resends the
   same `cid`. The server remembers `cid → seq` for 30 days and returns the original seq instead of
@@ -132,6 +132,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 10 | ban | `user: uint, on: bool` | yes | `scope = 0`: server ban (server admin), else group ban (group admin or owner) |
 | 11 | scope_left | `purge: bool` | no | the viewer lost access to `scope`. `purge`: delete cached posts |
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
+| 13 | dm_scope | `peer: uint` | no | server-generated when a DM is first opened; `scope` is the new DM id |
 
 ```
 Media = [id: uint, w: uint, h: uint, thumbhash: bytes .size (0..32)]
@@ -144,6 +145,12 @@ shown blurred until the user taps to load `GET /m/{id}`.
 
 A scope is either a **group** or a **DM** between two users. There is no friends feed.
 
+- The first `dm` op for a pair (`scope = 0`, `peer` set) creates the DM scope. Its id is the
+  `seq` of the server-generated `dm_scope` event, whose `peer` names the other participant.
+  There is exactly one DM scope per unordered pair; later messages use that scope id. The
+  first sender's `dm` event and the `dm_scope` event are appended in the same transaction.
+- A fresh device gets every `dm_scope` its account participates in, like group metadata, and
+  zero DM messages (ADR 0009).
 - A user sees an event if they currently have access to its scope: they are a member of the
   group (or the group is open and they joined), or they are one of the two DM participants.
   Scope-0 events are visible to everyone on the server.

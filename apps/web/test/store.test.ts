@@ -6,6 +6,8 @@ import {
   closeStore,
   enqueueOp,
   getCursor,
+  getDmMessages,
+  getDmScopes,
   getGroups,
   getMembers,
   getOutbox,
@@ -161,6 +163,47 @@ describe("store (IndexedDB)", () => {
       displayName: "Ana",
       bio: "",
     });
+  });
+
+  test("a DM scope and its messages cache so the list and thread open offline", async () => {
+    const events: Event[] = [
+      { tag: Tag.DmScope, seq: 40, ts: 400, author: 1, scope: 40, peer: 2 },
+      { tag: Tag.Dm, seq: 41, ts: 401, author: 1, scope: 40, peer: 2, text: "hola", media: null },
+      { tag: Tag.Dm, seq: 42, ts: 402, author: 2, scope: 40, peer: 1, text: "te oigo", media: null },
+      { tag: Tag.Profile, seq: 43, ts: 403, author: 2, scope: 0, username: "bea", displayName: "Bea", bio: "" },
+    ];
+    await applyEvents("alice", events);
+
+    expect(await getDmScopes("alice")).toEqual([{ id: 40, seq: 40, a: 1, b: 2 }]);
+    expect(await getDmMessages("alice", 40)).toEqual([
+      { seq: 41, ts: 401, author: 1, scope: 40, text: "hola", parent: 0 },
+      { seq: 42, ts: 402, author: 2, scope: 40, text: "te oigo", parent: 0 },
+    ]);
+    // No session, no network: a reopened store still renders the conversation.
+    await closeStore();
+    expect(await getDmScopes("alice")).toHaveLength(1);
+    expect((await getDmMessages("alice", 40)).map((message) => message.text)).toEqual(["hola", "te oigo"]);
+    // Another account on the same device never sees this conversation.
+    expect(await getDmScopes("bob")).toEqual([]);
+
+    // Losing access purges the conversation and its messages, like a group.
+    await applyEvents("alice", [{ tag: Tag.ScopeLeft, seq: 44, ts: 404, author: 0, scope: 40, purge: true }]);
+    expect(await getDmScopes("alice")).toEqual([]);
+    expect(await getDmMessages("alice", 40)).toEqual([]);
+  });
+
+  test("a dm op round-trips through the outbox with its peer", async () => {
+    const stored = await enqueueOp("alice", { tag: Tag.Dm, scope: 0, peer: 2, text: "first" });
+    expect(stored).toMatchObject({ tag: Tag.Dm, scope: 0, peer: 2, text: "first" });
+    expect(toWireOp(stored)).toEqual({
+      cid: new Uint8Array(stored.cid),
+      tag: Tag.Dm,
+      scope: 0,
+      peer: 2,
+      text: "first",
+      media: null,
+    });
+    expect(await getOutbox("alice")).toEqual([stored]);
   });
 
   test("applying the same state event twice never duplicates a post", async () => {

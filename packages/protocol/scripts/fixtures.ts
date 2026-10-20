@@ -14,6 +14,14 @@ const cidA = Uint8Array.from([0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8]);
 const cidB = Uint8Array.from([0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8]);
 const h = (seq: number) => ({ seq, ts: 1_791_000_000 + seq, author: 42, scope: 7 });
 
+// A DM conversation as a client sees it: the scope event (id = seq) first, then messages.
+// Tag 13 has its own fixture because the frozen every-event file predates it and must not change.
+const dmEvents: Event[] = [
+  { ...h(20), scope: 20, tag: Tag.DmScope, peer: 43 },
+  { ...h(21), scope: 20, tag: Tag.Dm, peer: 43, text: "psst", media: null },
+  { ...h(22), scope: 20, author: 43, tag: Tag.Dm, peer: 42, text: "te oigo", media: null },
+];
+
 const everyEvent: Event[] = [
   { ...h(1), tag: Tag.GroupMeta, name: "La Habana", about: "Grupo abierto", open: true },
   { ...h(2), tag: Tag.Membership, user: 42, role: 3 },
@@ -46,6 +54,14 @@ export const fixtures: Record<string, Uint8Array> = {
     more: true,
     events: everyEvent,
     acks: [{ cid: cidA, seq: 4 }, { cid: cidB, error: AckError.Forbidden }],
+    skipped: 0,
+  }),
+  "sync-response-dm": encodeSyncResponse({
+    range: SUPPORTED,
+    cursor: 22,
+    more: false,
+    events: dmEvents,
+    acks: [],
     skipped: 0,
   }),
   "sync-response-upgrade": encodeSyncResponse({

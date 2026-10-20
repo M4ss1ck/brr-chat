@@ -43,6 +43,12 @@ interface MemberRow {
   seq: number;
 }
 
+interface DmScopeRow {
+  id: number;
+  user_a: number;
+  user_b: number;
+}
+
 interface EventRow {
   seq: number;
   bytes: Uint8Array;
@@ -87,9 +93,12 @@ export interface OutboxResult {
 type Applied = { seq: number; firstSeq: number; state: boolean };
 type Failure = { error: AckError };
 
-function insertEvent(db: Database, build: (seq: number) => Event): number {
+function nextSeq(db: Database): number {
   const row = db.query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events").get() as { seq: number };
-  const seq = Number(row.seq);
+  return Number(row.seq);
+}
+
+function insertEventAt(db: Database, seq: number, build: (seq: number) => Event): number {
   const event = build(seq);
   db.query("INSERT INTO events (seq, tag, ts, author, scope, bytes) VALUES (?, ?, ?, ?, ?, ?)").run(
     seq,
@@ -100,6 +109,10 @@ function insertEvent(db: Database, build: (seq: number) => Event): number {
     encodeEventBytes(event),
   );
   return seq;
+}
+
+function insertEvent(db: Database, build: (seq: number) => Event): number {
+  return insertEventAt(db, nextSeq(db), build);
 }
 
 function groupFor(db: Database, id: number): GroupRow | null {
@@ -129,6 +142,23 @@ interface EventHeaderRow {
 function headerFor(db: Database, seq: number): EventHeaderRow | null {
   const row = db.query("SELECT tag, scope FROM events WHERE seq = ?").get(seq) as EventHeaderRow | null;
   return row ? { tag: Number(row.tag), scope: Number(row.scope) } : null;
+}
+
+/** The scope row for an unordered pair, or null when these two have never talked. */
+function dmScopeForPair(db: Database, a: number, b: number): DmScopeRow | null {
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return db.query("SELECT id, user_a, user_b FROM dm_scopes WHERE user_a = ? AND user_b = ?").get(lo, hi) as
+    | DmScopeRow
+    | null;
+}
+
+function dmScopeById(db: Database, id: number): DmScopeRow | null {
+  return db.query("SELECT id, user_a, user_b FROM dm_scopes WHERE id = ?").get(id) as DmScopeRow | null;
+}
+
+function peerIsKnown(db: Database, wireId: number): boolean {
+  return db.query("SELECT 1 AS ok FROM wire_users WHERE wire_id = ?").get(wireId) !== null;
 }
 
 function rememberOp(db: Database, actor: Actor, op: Op, tag: number, seq: number, now: number): void {
@@ -268,6 +298,70 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       }));
       return { seq, firstSeq: seq, state: false };
     }
+    case Tag.Dm: {
+      if (op.peer === 0 || op.peer === actor.wireId) return { error: AckError.Invalid };
+      if (op.text.trim().length === 0) return { error: AckError.Invalid };
+      // Media needs the upload pipeline (ADR 0011); accepting it here would silently drop it.
+      if (op.media !== null) return { error: AckError.Unsupported };
+
+      let scope = op.scope;
+      let firstSeq: number;
+      let created = false;
+
+      if (scope === 0) {
+        // A DM op with scope 0 opens (or reuses) the one scope for this pair. The scope id is
+        // the seq of the dm_scope event, so the pair and the first message share a log position.
+        if (!peerIsKnown(db, op.peer)) return { error: AckError.NotFound };
+        const existing = dmScopeForPair(db, actor.wireId, op.peer);
+        if (existing) {
+          scope = existing.id;
+        } else {
+          const candidate = nextSeq(db);
+          db.query("INSERT OR IGNORE INTO dm_scopes (id, user_a, user_b, created_at) VALUES (?, ?, ?, ?)").run(
+            candidate,
+            Math.min(actor.wireId, op.peer),
+            Math.max(actor.wireId, op.peer),
+            now,
+          );
+          // A concurrent first message may have won the unique pair index. Either way there is
+          // now exactly one row, and the scope id is whatever it says.
+          const row = dmScopeForPair(db, actor.wireId, op.peer);
+          if (!row) throw new Error("dm scope vanished inside its own transaction");
+          scope = row.id;
+          created = row.id === candidate;
+          if (created) {
+            insertEventAt(db, candidate, (seq) => ({
+              tag: Tag.DmScope,
+              seq,
+              ts: now,
+              author: actor.wireId,
+              scope,
+              peer: op.peer,
+            }));
+          }
+        }
+      } else {
+        const dm = dmScopeById(db, scope);
+        if (!dm) return { error: AckError.NotFound };
+        if (dm.user_a !== actor.wireId && dm.user_b !== actor.wireId) return { error: AckError.Forbidden };
+        const other = dm.user_a === actor.wireId ? dm.user_b : dm.user_a;
+        if (other !== op.peer) return { error: AckError.Invalid };
+      }
+
+      const seq = nextSeq(db);
+      insertEventAt(db, seq, (next) => ({
+        tag: Tag.Dm,
+        seq: next,
+        ts: now,
+        author: actor.wireId,
+        scope,
+        peer: op.peer,
+        text: op.text,
+        media: null,
+      }));
+      firstSeq = created ? scope : seq;
+      return { seq, firstSeq, state: false };
+    }
     case Tag.Profile: {
       if (op.scope !== 0) return { error: AckError.Invalid };
       if (op.username.trim().length === 0) return { error: AckError.Invalid };
@@ -284,7 +378,7 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number): Applied | Fai
       return { seq, firstSeq: seq, state: false };
     }
     default:
-      // Delete, DM and ban arrive in later slices. The tag is known, but this server does not
+      // Delete and ban arrive in later slices. The tag is known, but this server does not
       // implement it yet, so the device gets a nack instead of a silent drop.
       return { error: AckError.Unsupported };
   }
@@ -332,9 +426,11 @@ export function applyOutbox(db: Database, actor: Actor, ops: readonly Op[], now 
   })();
 }
 
+// One viewer placeholder per branch; callers bind the viewer once per `?` (three times).
 const VISIBLE_SQL = `
   e.scope = 0
   OR e.scope IN (SELECT group_id FROM group_members WHERE user_id = ?)
+  OR e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
   OR (e.tag = ${Tag.GroupMeta} AND e.scope IN (SELECT id FROM chat_groups WHERE open = 1))
 `;
 
@@ -366,7 +462,7 @@ export function visibleEvents(db: Database, viewer: number, cursor: number): Vis
        ORDER BY e.seq ASC
        LIMIT ?`,
     )
-    .all(cursor, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+    .all(cursor, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
 
   const events: Event[] = [];
   let bytes = 0;
@@ -400,7 +496,7 @@ export function visibleFrom(db: Database, viewer: number, firstSeq: number): Eve
        WHERE e.seq >= ? AND (${VISIBLE_SQL})
        ORDER BY e.seq ASC`,
     )
-    .all(firstSeq, viewer) as EventRow[];
+    .all(firstSeq, viewer, viewer, viewer) as EventRow[];
   return decodeRows(rows);
 }
 
@@ -434,7 +530,18 @@ export function stateEvents(db: Database, viewer: number): Event[] {
        ORDER BY e.seq ASC`,
     )
     .all(viewer) as EventRow[];
-  return decodeRows([...profiles, ...groups, ...members]).sort((a, b) => a.seq - b.seq);
+  // A fresh device learns which DM conversations exist, but no messages (ADR 0009). The
+  // dm_scope event names the pair and its seq is the scope id, exactly like group metadata.
+  const dms = db
+    .query(
+      `SELECT e.bytes FROM events e
+       WHERE e.tag = ${Tag.DmScope}
+         AND e.seq = (SELECT MAX(d.seq) FROM events d WHERE d.tag = ${Tag.DmScope} AND d.scope = e.scope)
+         AND e.scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)
+       ORDER BY e.seq ASC`,
+    )
+    .all(viewer, viewer) as EventRow[];
+  return decodeRows([...profiles, ...groups, ...members, ...dms]).sort((a, b) => a.seq - b.seq);
 }
 
 /** Merges events by seq. State events can sit at or below the old cursor; the client applies them. */

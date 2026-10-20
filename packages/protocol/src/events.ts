@@ -16,6 +16,7 @@ export const Tag = {
   Ban: 10,
   ScopeLeft: 11,
   Gap: 12,
+  DmScope: 13,
 } as const;
 export type Tag = (typeof Tag)[keyof typeof Tag];
 
@@ -59,6 +60,7 @@ const SCHEMA = {
   [Tag.Ban]: [["user", "uint"], ["on", "bool"]],
   [Tag.ScopeLeft]: [["purge", "bool"]],
   [Tag.Gap]: [["after", "uint"], ["before", "uint"], ["count", "uint"]],
+  [Tag.DmScope]: [["peer", "uint"]],
 } as const satisfies Record<Tag, readonly (readonly [string, Kind])[]>;
 
 /** Tags a client may send in its outbox. The rest are server-generated. */
@@ -71,7 +73,7 @@ type Fields<F> = F extends readonly (readonly [string, Kind])[]
   : never;
 type BodyOf<T extends Tag> = { tag: T } & Fields<(typeof SCHEMA)[T]>;
 export type Body = { [T in Tag]: BodyOf<T> }[Tag];
-export type OpTag = Exclude<Tag, typeof Tag.ScopeLeft | typeof Tag.Gap>;
+export type OpTag = Exclude<Tag, typeof Tag.ScopeLeft | typeof Tag.Gap | typeof Tag.DmScope>;
 export type OpBody = { [T in OpTag]: BodyOf<T> }[OpTag];
 
 export interface Header {

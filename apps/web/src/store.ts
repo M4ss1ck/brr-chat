@@ -16,6 +16,7 @@ const reactionsKey = (username: string, scope: number): string => `reactions:${u
 const outboxKey = (username: string): string => `outbox:${username}`;
 const cursorKey = (username: string): string => `cursor:${username}`;
 const groupsKey = (username: string): string => `groups:${username}`;
+const dmsKey = (username: string): string => `dms:${username}`;
 const profilesKey = (username: string): string => `profiles:${username}`;
 const selfKey = (username: string): string => `self:${username}`;
 
@@ -236,6 +237,14 @@ export interface StoredMember {
   seq: number;
 }
 
+/** A DM conversation. `a` is the opener (event author) and `b` the peer it was opened with. */
+export interface StoredDm {
+  id: number;
+  seq: number;
+  a: number;
+  b: number;
+}
+
 export interface StoredProfile {
   user: number;
   seq: number;
@@ -277,6 +286,13 @@ function asReaction(value: unknown): StoredReaction | null {
   return { scope: row.scope, target: row.target, emoji: row.emoji, user: row.user, on: row.on, seq: row.seq };
 }
 
+function asDm(value: unknown): StoredDm | null {
+  const row = asObject(value);
+  if (!isUint(row.id) || row.id === 0 || !isUint(row.seq) || row.seq === 0) return null;
+  if (!isUint(row.a) || row.a === 0 || !isUint(row.b) || row.b === 0 || row.a === row.b) return null;
+  return { id: row.id, seq: row.seq, a: row.a, b: row.b };
+}
+
 function asMember(value: unknown): StoredMember | null {
   const row = asObject(value);
   if (!isUint(row.group) || row.group === 0 || !isUint(row.user) || row.user === 0) return null;
@@ -309,6 +325,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   if (events.length === 0) return;
 
   const groups = await readMap(groupsKey(username), asGroup);
+  const dms = await readMap(dmsKey(username), asDm);
   const profiles = await readMap(profilesKey(username), asProfile);
   const scopes = [...new Set(events.map((e) => e.scope).filter((scope) => scope > 0))];
   const posts = new Map<number, Record<string, StoredPost>>();
@@ -323,6 +340,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   const touchedPosts = new Set<number>();
   const touchedMembers = new Set<number>();
   const touchedReactions = new Set<number>();
+  let touchedDms = false;
 
   for (const event of events) {
     switch (event.tag) {
@@ -343,8 +361,18 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
         touchedMembers.add(event.scope);
         break;
       }
+      case Tag.DmScope:
+        dms[String(event.scope)] = {
+          id: event.scope,
+          seq: event.seq,
+          a: event.author,
+          b: event.peer,
+        };
+        touchedDms = true;
+        break;
       case Tag.Post:
-      case Tag.Reply: {
+      case Tag.Reply:
+      case Tag.Dm: {
         const map = posts.get(event.scope);
         if (!map) break;
         map[String(event.seq)] = {
@@ -395,6 +423,10 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           const reactionMap = reactions.get(event.scope);
           if (reactionMap) for (const key of Object.keys(reactionMap)) delete reactionMap[key];
           if (groups[String(event.scope)]?.open !== true) delete groups[String(event.scope)];
+          if (dms[String(event.scope)]) {
+            delete dms[String(event.scope)];
+            touchedDms = true;
+          }
           touchedPosts.add(event.scope);
           touchedMembers.add(event.scope);
           touchedReactions.add(event.scope);
@@ -407,6 +439,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   }
 
   const writes = [write(groupsKey(username), groups), write(profilesKey(username), profiles)];
+  if (touchedDms) writes.push(write(dmsKey(username), dms));
   for (const scope of touchedPosts) writes.push(write(postsKey(username, scope), posts.get(scope) ?? {}));
   for (const scope of touchedMembers) writes.push(write(membersKey(username, scope), members.get(scope) ?? {}));
   for (const scope of touchedReactions) writes.push(write(reactionsKey(username, scope), reactions.get(scope) ?? {}));
@@ -479,6 +512,16 @@ export function tallyReactions(rows: readonly StoredReaction[], self: number | n
   return out;
 }
 
+/** DM conversations cached on this device, in the order they were opened. */
+export async function getDmScopes(username: string): Promise<StoredDm[]> {
+  return Object.values(await readMap(dmsKey(username), asDm)).sort((a, b) => a.seq - b.seq);
+}
+
+/** One DM thread, oldest first. Messages share the post store: a seq names exactly one scope. */
+export async function getDmMessages(username: string, scope: number): Promise<StoredPost[]> {
+  return getPosts(username, scope);
+}
+
 export async function getMembers(username: string, scope: number): Promise<StoredMember[]> {
   return Object.values(await readMap(membersKey(username, scope), asMember)).sort((a, b) => a.user - b.user);
 }
@@ -523,6 +566,7 @@ export interface StoredOp {
   open?: boolean;
   user?: number;
   role?: number;
+  peer?: number;
   username?: string;
   displayName?: string;
   bio?: string;
@@ -544,6 +588,7 @@ function asStoredOp(value: unknown): StoredOp | null {
   if (typeof row.open === "boolean") op.open = row.open;
   if (isUint(row.user)) op.user = row.user;
   if (isUint(row.role)) op.role = row.role;
+  if (isUint(row.peer)) op.peer = row.peer;
   if (typeof row.username === "string") op.username = row.username;
   if (typeof row.displayName === "string") op.displayName = row.displayName;
   if (typeof row.bio === "string") op.bio = row.bio;
@@ -598,6 +643,15 @@ export function toWireOp(op: StoredOp): Op {
         target: op.target ?? 0,
         emoji: op.emoji ?? 0,
         on: op.on === true,
+      };
+    case Tag.Dm:
+      return {
+        cid,
+        tag: Tag.Dm,
+        scope: op.scope,
+        peer: op.peer ?? 0,
+        text: op.text ?? "",
+        media: null,
       };
     case Tag.GroupMeta:
       return {

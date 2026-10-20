@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS group_members (
 )
 `.trim();
 
+// A DM scope is the unordered pair of its two participants. Its id is the seq of the
+// `dm_scope` event that created it (ADR 0015), so one log position names the conversation.
+// The unique pair index is what makes two concurrent first messages create exactly one scope.
+const CREATE_DM_SCOPES_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS dm_scopes (
+  id INTEGER PRIMARY KEY,
+  user_a INTEGER NOT NULL,
+  user_b INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+)
+`.trim();
+
 // Outbox dedup (docs/PROTOCOL.md): cid -> seq for 30 days, per account. `tag` lets a retried
 // join or group create still answer with the state snapshot it originally deserved.
 const CREATE_OUTBOX_TABLE_SQL = `
@@ -99,9 +111,13 @@ export function openDb(dbPath: string): Database {
   db.exec(CREATE_WIRE_USERS_TABLE_SQL);
   db.exec(CREATE_GROUPS_TABLE_SQL);
   db.exec(CREATE_GROUP_MEMBERS_TABLE_SQL);
+  db.exec(CREATE_DM_SCOPES_TABLE_SQL);
   db.exec(CREATE_OUTBOX_TABLE_SQL);
   db.exec("CREATE INDEX IF NOT EXISTS events_scope_seq ON events(scope, seq);");
   db.exec("CREATE INDEX IF NOT EXISTS events_tag_scope ON events(tag, scope);");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS dm_scopes_pair ON dm_scopes(user_a, user_b);");
+  db.exec("CREATE INDEX IF NOT EXISTS dm_scopes_user_a ON dm_scopes(user_a);");
+  db.exec("CREATE INDEX IF NOT EXISTS dm_scopes_user_b ON dm_scopes(user_b);");
   db.exec("CREATE INDEX IF NOT EXISTS outbox_created ON outbox_ops(created_at);");
   db.exec(CREATE_RECOVERY_TABLE_SQL);
   return db;
