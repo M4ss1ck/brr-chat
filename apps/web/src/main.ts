@@ -1,7 +1,7 @@
 // The PWA shell: auth, recovery, open groups, posts and /sync. Vanilla DOM only, so the app
 // shell stays inside its byte budget (ADR 0014). Every element lookup is optional, so the
 // module also loads in a test or in a worker without a DOM.
-import { ResponseError, Role, Tag, type SyncResponse } from "@brr-chat/protocol";
+import { EMOJI_PALETTE, ResponseError, Role, Tag, type SyncResponse } from "@brr-chat/protocol";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
 import { identicon } from "./identicon.ts";
 import { syncAndPersist, SyncHttpError } from "./sync.ts";
@@ -14,11 +14,15 @@ import {
   getPosts,
   getProfiles,
   getRange,
+  getReactions,
   getSelf,
   getSession,
+  nextReactionOn,
   removeOutbox,
   setSelf,
+  tallyReactions,
   toWireOp,
+  type ReactionTally,
   type StoredGroup,
   type StoredPost,
   type StoredProfile,
@@ -27,6 +31,15 @@ import {
 type Mode = "up" | "in";
 
 let currentGroup: number | null = null;
+/** Post being replied to in the composer, or null for a top-level post. */
+let replyingTo: number | null = null;
+/** Taps are serialized, so the second tap sees the first one's new state. */
+let reactionQueue: Promise<void> = Promise.resolve();
+
+interface ViewContext {
+  profiles: Map<number, StoredProfile>;
+  reactions: Map<number, ReactionTally[]>;
+}
 
 function el<T extends HTMLElement>(id: string): T | null {
   return document.getElementById(id) as T | null;
@@ -81,6 +94,7 @@ function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
     button.setAttribute("aria-current", currentGroup === group.id ? "true" : "false");
     button.addEventListener("click", () => {
       currentGroup = group.id;
+      cancelReply();
       void renderGroup();
       void refreshGroups();
     });
@@ -118,9 +132,29 @@ async function refreshGroups(): Promise<void> {
   show("no-open-groups", open.length === 0);
 }
 
-function postItem(post: StoredPost, profile: StoredProfile | undefined): HTMLLIElement {
+function reactionBar(target: number, context: ViewContext): HTMLDivElement {
+  const bar = document.createElement("div");
+  bar.className = "reactions";
+  const tallies = new Map((context.reactions.get(target) ?? []).map((tally) => [tally.emoji, tally]));
+  EMOJI_PALETTE.forEach((glyph, emoji) => {
+    const tally = tallies.get(emoji);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "reaction";
+    button.textContent = tally && tally.count > 0 ? `${glyph} ${tally.count}` : glyph;
+    button.setAttribute("aria-label", tally && tally.count > 0 ? `${glyph} ${tally.count}` : `React ${glyph}`);
+    if (tally?.mine) button.setAttribute("aria-pressed", "true");
+    button.addEventListener("click", () => {
+      reactionQueue = reactionQueue.then(() => toggleReaction(target, emoji)).catch(() => {});
+    });
+    bar.append(button);
+  });
+  return bar;
+}
+
+function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] = []): HTMLLIElement {
   const item = document.createElement("li");
-  item.className = "post";
+  item.className = post.parent === 0 ? "post" : "post reply";
 
   const avatar = document.createElement("img");
   avatar.className = "avatar";
@@ -132,15 +166,56 @@ function postItem(post: StoredPost, profile: StoredProfile | undefined): HTMLLIE
   const body = document.createElement("div");
   const meta = document.createElement("p");
   meta.className = "meta";
+  const profile = context.profiles.get(post.author);
   const name = profile?.displayName || profile?.username || `user #${post.author}`;
   const when = new Date(post.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  meta.textContent = `${name} · ${when}`;
+  meta.textContent = post.parent === 0 ? `${name} · ${when}` : `${name} · ${when} · reply`;
   const text = document.createElement("p");
   text.className = "text";
   text.textContent = post.text;
-  body.append(meta, text);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  actions.append(reactionBar(post.seq, context));
+  if (post.parent === 0) {
+    const reply = document.createElement("button");
+    reply.type = "button";
+    reply.className = "reply";
+    reply.textContent = "Reply";
+    reply.setAttribute("aria-pressed", replyingTo === post.seq ? "true" : "false");
+    reply.addEventListener("click", () => {
+      setReply(post.seq, name);
+      void renderGroup();
+    });
+    actions.append(reply);
+  }
+
+  body.append(meta, text, actions);
+  if (replies.length > 0) {
+    const list = document.createElement("ul");
+    list.className = "replies";
+    list.append(...replies.map((replyPost) => postItem(replyPost, context)));
+    body.append(list);
+  }
   item.append(avatar, body);
   return item;
+}
+
+function setReply(postSeq: number, authorName: string): void {
+  if (replyingTo === postSeq) {
+    replyingTo = null;
+  } else {
+    replyingTo = postSeq;
+    setText("reply-label", `Replying to ${authorName}`);
+  }
+  show("reply-note", replyingTo !== null);
+  if (replyingTo === null) setText("reply-label", "");
+}
+
+function cancelReply(): void {
+  replyingTo = null;
+  show("reply-note", false);
+  setText("reply-label", "");
 }
 
 async function renderGroup(): Promise<void> {
@@ -160,14 +235,36 @@ async function renderGroup(): Promise<void> {
   const members = await getMembers(session.username, group.id);
   setText("group-members", `${members.length} ${members.length === 1 ? "member" : "members"}`);
 
-  const profiles = await getProfiles(session.username);
+  const self = await getSelf(session.username);
+  const context: ViewContext = {
+    profiles: await getProfiles(session.username),
+    reactions: tallyReactions(await getReactions(session.username, group.id), self),
+  };
   const posts = await getPosts(session.username, group.id);
+  const roots = posts.filter((post) => post.parent === 0);
+  const knownParents = new Set(roots.map((post) => post.seq));
+  const replies = new Map<number, StoredPost[]>();
+  for (const post of posts) {
+    if (post.parent !== 0 && knownParents.has(post.parent)) {
+      const thread = replies.get(post.parent) ?? [];
+      thread.push(post);
+      replies.set(post.parent, thread);
+    }
+  }
+  // A reply to a post older than the join has no cached parent. Show it flat rather than
+  // hiding it: history (#14) will fill the parent in later.
+  const orphans = posts.filter((post) => post.parent !== 0 && !knownParents.has(post.parent));
   const list = el("posts");
-  if (list) list.replaceChildren(...posts.map((post) => postItem(post, profiles.get(post.author))));
+  if (list) {
+    list.replaceChildren(
+      ...roots.map((post) => postItem(post, context, replies.get(post.seq) ?? [])),
+      ...orphans.map((post) => postItem(post, context)),
+    );
+  }
 
   if (currentGroup !== null) {
     const input = el<HTMLInputElement>("post-text");
-    if (input) input.placeholder = `Message ${group.name}`;
+    if (input) input.placeholder = replyingTo === null ? `Message ${group.name}` : "Write a reply";
   }
 }
 
@@ -190,7 +287,7 @@ function explainAck(error: number): string {
     case 3:
       return "The server rejected that request as invalid.";
     case 4:
-      return "That group no longer exists.";
+      return "That group or post no longer exists.";
     case 5:
       return "Too many requests. Try again in a moment.";
     default:
@@ -358,7 +455,10 @@ async function createGroup(): Promise<void> {
   clear("create-about");
   const response = await syncNow();
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
-  if (ack && "seq" in ack) currentGroup = ack.seq;
+  if (ack && "seq" in ack) {
+    cancelReply();
+    currentGroup = ack.seq;
+  }
   await refresh();
 }
 
@@ -375,6 +475,7 @@ async function joinGroup(group: StoredGroup): Promise<void> {
     user: self,
     role: Role.Member,
   });
+  cancelReply();
   currentGroup = group.id;
   await syncNow();
 }
@@ -394,14 +495,45 @@ async function postMessage(): Promise<void> {
     message("Open a group first.");
     return;
   }
-  await enqueueOp(session.username, { tag: Tag.Post, scope: currentGroup, text });
+  const scope = currentGroup;
+  const parent = replyingTo;
+  await enqueueOp(
+    session.username,
+    parent === null
+      ? { tag: Tag.Post, scope, text }
+      : { tag: Tag.Reply, scope, parent, text },
+  );
   clear("post-text");
+  cancelReply();
+  await syncNow();
+}
+
+/** Toggles one palette emoji for this account: on when it was not on, off otherwise. */
+async function toggleReaction(target: number, emoji: number): Promise<void> {
+  const session = await getSession();
+  const scope = currentGroup;
+  if (!session) {
+    message("Sign in first.");
+    return;
+  }
+  if (scope === null) {
+    message("Open a group first.");
+    return;
+  }
+  const self = await getSelf(session.username);
+  if (self === null) {
+    message("Still syncing this account. Try again in a moment.");
+    return;
+  }
+  const on = await nextReactionOn(session.username, scope, target, emoji, self);
+  await enqueueOp(session.username, { tag: Tag.Reaction, scope, target, emoji, on });
   await syncNow();
 }
 
 async function leave(): Promise<void> {
   try {
     await signOut(location.origin);
+    cancelReply();
     currentGroup = null;
     setText("new-code", "");
     show("code-panel", false);
@@ -429,6 +561,10 @@ function wire(): void {
   el<HTMLButtonElement>("recover")?.addEventListener("click", () => void recover());
   el<HTMLButtonElement>("create")?.addEventListener("click", () => void createGroup());
   el<HTMLButtonElement>("post")?.addEventListener("click", () => void postMessage());
+  el<HTMLButtonElement>("cancel-reply")?.addEventListener("click", () => {
+    cancelReply();
+    void renderGroup();
+  });
 }
 
 function boot(): void {

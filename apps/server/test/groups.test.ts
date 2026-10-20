@@ -49,6 +49,14 @@ function postOp(c: Uint8Array, group: number, text: string): Op {
   return { cid: c, tag: Tag.Post, scope: group, text, media: null };
 }
 
+function replyOp(c: Uint8Array, group: number, parent: number, text: string): Op {
+  return { cid: c, tag: Tag.Reply, scope: group, parent, text, media: null };
+}
+
+function reactionOp(c: Uint8Array, group: number, target: number, emoji: number, on: boolean): Op {
+  return { cid: c, tag: Tag.Reaction, scope: group, target, emoji, on };
+}
+
 async function signUp(app: ServerApp, username: string): Promise<Account> {
   const res = await app.fetch(
     new Request("http://chat.local/api/auth/sign-up/email", {
@@ -339,6 +347,164 @@ describe("Slice 4: groups, posts and visibility", () => {
       const missing = cid();
       const notFound = await sync(app, bob.account.token, promoted.cursor, [joinOp(missing, 999_999, bob.wire)]);
       expect(ack(notFound, missing)).toEqual({ error: AckError.NotFound });
+    } finally {
+      app.close();
+    }
+  });
+});
+
+describe("Slice 5: replies and reactions", () => {
+  /** Alice owns an open group with one post; Bob has joined and is at the head. */
+  async function groupWithPost(app: ServerApp): Promise<{
+    alice: Client;
+    bob: Client;
+    groupId: number;
+    postSeq: number;
+    afterPost: number;
+  }> {
+    const alice = await client(app, "alice", 25);
+    const bob = await client(app, "bob");
+
+    const createCid = cid();
+    const created = await sync(app, alice.account.token, alice.cursor, [groupOp(createCid, "Habana", true)]);
+    const groupId = seqOf(created, createCid);
+
+    const listing = await sync(app, bob.account.token, bob.cursor, []);
+    const joinCid = cid();
+    const joined = await sync(app, bob.account.token, listing.cursor, [joinOp(joinCid, groupId, bob.wire)]);
+    bob.cursor = joined.cursor;
+
+    const postCid = cid();
+    const posted = await sync(app, alice.account.token, created.cursor, [postOp(postCid, groupId, "the post")]);
+    const postSeq = seqOf(posted, postCid);
+    return { alice, bob, groupId, postSeq, afterPost: posted.cursor };
+  }
+
+  test("a reply to a post round-trips and a reply to a reply is Invalid", async () => {
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    try {
+      const { alice, bob, groupId, postSeq, afterPost } = await groupWithPost(app);
+
+      const replyCid = cid();
+      const replied = await sync(app, bob.account.token, bob.cursor, [replyOp(replyCid, groupId, postSeq, "first reply")]);
+      const replySeq = seqOf(replied, replyCid);
+      const event = replied.events.find((candidate) => candidate.seq === replySeq);
+      expect(event).toMatchObject({
+        tag: Tag.Reply,
+        scope: groupId,
+        author: bob.wire,
+        parent: postSeq,
+        text: "first reply",
+      });
+
+      // Alice, the post's author, sees Bob's reply on her next sync.
+      const seen = await sync(app, alice.account.token, afterPost, []);
+      expect(seen.events.find((candidate) => candidate.seq === replySeq)).toMatchObject({
+        tag: Tag.Reply,
+        parent: postSeq,
+      });
+
+      // One level only: the parent of a reply must be a post.
+      const nestedCid = cid();
+      const nested = await sync(app, bob.account.token, replied.cursor, [
+        replyOp(nestedCid, groupId, replySeq, "reply to a reply"),
+      ]);
+      expect(ack(nested, nestedCid)).toEqual({ error: AckError.Invalid });
+      expect(app.db.query("SELECT COUNT(*) AS n FROM events WHERE tag = ? AND scope = ?").get(Tag.Reply, groupId)).toEqual({
+        n: 1,
+      });
+    } finally {
+      app.close();
+    }
+  });
+
+  test("replies need an existing post in the same scope and membership", async () => {
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    try {
+      const { alice, bob, groupId, postSeq, afterPost } = await groupWithPost(app);
+
+      const missingCid = cid();
+      const missing = await sync(app, bob.account.token, bob.cursor, [replyOp(missingCid, groupId, 999_999, "no parent")]);
+      expect(ack(missing, missingCid)).toEqual({ error: AckError.NotFound });
+
+      const secondCid = cid();
+      const second = await sync(app, alice.account.token, afterPost, [groupOp(secondCid, "Other", true)]);
+      const secondGroup = seqOf(second, secondCid);
+
+      const otherScopeCid = cid();
+      const otherScope = await sync(app, alice.account.token, second.cursor, [
+        replyOp(otherScopeCid, secondGroup, postSeq, "wrong group"),
+      ]);
+      expect(ack(otherScope, otherScopeCid)).toEqual({ error: AckError.NotFound });
+
+      const outsider = await client(app, "carol");
+      const outsiderCid = cid();
+      const refused = await sync(app, outsider.account.token, outsider.cursor, [
+        replyOp(outsiderCid, groupId, postSeq, "not a member"),
+      ]);
+      expect(ack(refused, outsiderCid)).toEqual({ error: AckError.Forbidden });
+    } finally {
+      app.close();
+    }
+  });
+
+  test("a reaction toggles on and off across two clients", async () => {
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    try {
+      const { alice, bob, groupId, postSeq, afterPost } = await groupWithPost(app);
+
+      const onCid = cid();
+      const on = await sync(app, bob.account.token, bob.cursor, [reactionOp(onCid, groupId, postSeq, 2, true)]);
+      const onSeq = seqOf(on, onCid);
+      expect(on.events.find((candidate) => candidate.seq === onSeq)).toMatchObject({
+        tag: Tag.Reaction,
+        scope: groupId,
+        author: bob.wire,
+        target: postSeq,
+        emoji: 2,
+        on: true,
+      });
+
+      const aliceSeesOn = await sync(app, alice.account.token, afterPost, []);
+      expect(aliceSeesOn.events.find((candidate) => candidate.seq === onSeq)).toMatchObject({ emoji: 2, on: true });
+
+      const offCid = cid();
+      const off = await sync(app, bob.account.token, on.cursor, [reactionOp(offCid, groupId, postSeq, 2, false)]);
+      const offSeq = seqOf(off, offCid);
+      expect(off.events.find((candidate) => candidate.seq === offSeq)).toMatchObject({ emoji: 2, on: false });
+
+      const aliceSeesOff = await sync(app, alice.account.token, aliceSeesOn.cursor, []);
+      expect(aliceSeesOff.events.find((candidate) => candidate.seq === offSeq)).toMatchObject({ emoji: 2, on: false });
+    } finally {
+      app.close();
+    }
+  });
+
+  test("a reaction needs a post or reply target in the same group", async () => {
+    const app = await createApp({ dbPath: ":memory:", host: "chat.local" });
+    try {
+      const { bob, groupId, postSeq } = await groupWithPost(app);
+
+      const missingCid = cid();
+      const missing = await sync(app, bob.account.token, bob.cursor, [
+        reactionOp(missingCid, groupId, 999_999, 0, true),
+      ]);
+      expect(ack(missing, missingCid)).toEqual({ error: AckError.NotFound });
+
+      const wrongTagCid = cid();
+      const wrongTag = await sync(app, bob.account.token, missing.cursor, [
+        reactionOp(wrongTagCid, groupId, groupId, 0, true),
+      ]);
+      expect(ack(wrongTag, wrongTagCid)).toEqual({ error: AckError.Invalid });
+
+      const replyCid = cid();
+      const reply = await sync(app, bob.account.token, wrongTag.cursor, [replyOp(replyCid, groupId, postSeq, "reply")]);
+      const replySeq = seqOf(reply, replyCid);
+      const emojiCid = cid();
+      const reacted = await sync(app, bob.account.token, reply.cursor, [
+        reactionOp(emojiCid, groupId, replySeq, 7, true),
+      ]);
+      expect(ack(reacted, emojiCid)).toEqual({ seq: expect.any(Number) });
     } finally {
       app.close();
     }

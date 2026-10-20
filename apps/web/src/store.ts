@@ -1,7 +1,7 @@
 // Local persistence for the PWA. IndexedDB only: no localStorage, no cookies, and every
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
-import { Role, Tag, type Event, type Op, type VersionRange } from "@brr-chat/protocol";
+import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Op, type VersionRange } from "@brr-chat/protocol";
 
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
@@ -12,6 +12,7 @@ const KEY_RANGE = "range";
 
 const postsKey = (username: string, scope: number): string => `posts:${username}:${scope}`;
 const membersKey = (username: string, scope: number): string => `members:${username}:${scope}`;
+const reactionsKey = (username: string, scope: number): string => `reactions:${username}:${scope}`;
 const outboxKey = (username: string): string => `outbox:${username}`;
 const cursorKey = (username: string): string => `cursor:${username}`;
 const groupsKey = (username: string): string => `groups:${username}`;
@@ -207,6 +208,25 @@ export interface StoredPost {
   author: number;
   scope: number;
   text: string;
+  /** Seq of the post this replies to, or 0 for a top-level post. */
+  parent: number;
+}
+
+/** One account's latest reaction to one target and emoji. Toggling off keeps the record. */
+export interface StoredReaction {
+  scope: number;
+  target: number;
+  emoji: number;
+  user: number;
+  on: boolean;
+  seq: number;
+}
+
+/** Aggregated reactions for one target, in palette order. */
+export interface ReactionTally {
+  emoji: number;
+  count: number;
+  mine: boolean;
 }
 
 export interface StoredMember {
@@ -244,7 +264,17 @@ function asPost(value: unknown): StoredPost | null {
   if (!isUint(row.seq) || row.seq === 0) return null;
   if (!isUint(row.ts) || !isUint(row.author) || !isUint(row.scope) || row.scope === 0) return null;
   if (typeof row.text !== "string") return null;
-  return { seq: row.seq, ts: row.ts, author: row.author, scope: row.scope, text: row.text };
+  // Rows written before replies existed have no parent field: they are top-level posts.
+  if (row.parent !== undefined && !isUint(row.parent)) return null;
+  return { seq: row.seq, ts: row.ts, author: row.author, scope: row.scope, text: row.text, parent: isUint(row.parent) ? row.parent : 0 };
+}
+
+function asReaction(value: unknown): StoredReaction | null {
+  const row = asObject(value);
+  if (!isUint(row.scope) || row.scope === 0 || !isUint(row.target) || row.target === 0) return null;
+  if (!isUint(row.user) || row.user === 0 || !isUint(row.seq) || row.seq === 0) return null;
+  if (!isUint(row.emoji) || row.emoji >= EMOJI_PALETTE_SIZE || typeof row.on !== "boolean") return null;
+  return { scope: row.scope, target: row.target, emoji: row.emoji, user: row.user, on: row.on, seq: row.seq };
 }
 
 function asMember(value: unknown): StoredMember | null {
@@ -283,13 +313,16 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   const scopes = [...new Set(events.map((e) => e.scope).filter((scope) => scope > 0))];
   const posts = new Map<number, Record<string, StoredPost>>();
   const members = new Map<number, Record<string, StoredMember>>();
+  const reactions = new Map<number, Record<string, StoredReaction>>();
   for (const scope of scopes) {
     posts.set(scope, await readMap(postsKey(username, scope), asPost));
     members.set(scope, await readMap(membersKey(username, scope), asMember));
+    reactions.set(scope, await readMap(reactionsKey(username, scope), asReaction));
   }
 
   const touchedPosts = new Set<number>();
   const touchedMembers = new Set<number>();
+  const touchedReactions = new Set<number>();
 
   for (const event of events) {
     switch (event.tag) {
@@ -310,7 +343,8 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
         touchedMembers.add(event.scope);
         break;
       }
-      case Tag.Post: {
+      case Tag.Post:
+      case Tag.Reply: {
         const map = posts.get(event.scope);
         if (!map) break;
         map[String(event.seq)] = {
@@ -319,8 +353,28 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           author: event.author,
           scope: event.scope,
           text: event.text,
+          parent: event.tag === Tag.Reply ? event.parent : 0,
         };
         touchedPosts.add(event.scope);
+        break;
+      }
+      case Tag.Reaction: {
+        const map = reactions.get(event.scope);
+        if (!map) break;
+        const key = `${event.target}:${event.emoji}:${event.author}`;
+        const prior = map[key];
+        // A state snapshot can repeat an event at or below the cursor. The newer seq wins,
+        // so replaying an old "on" cannot undo a later "off".
+        if (prior && prior.seq > event.seq) break;
+        map[key] = {
+          scope: event.scope,
+          target: event.target,
+          emoji: event.emoji,
+          user: event.author,
+          on: event.on,
+          seq: event.seq,
+        };
+        touchedReactions.add(event.scope);
         break;
       }
       case Tag.Profile:
@@ -338,9 +392,12 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           if (postMap) for (const key of Object.keys(postMap)) delete postMap[key];
           const memberMap = members.get(event.scope);
           if (memberMap) for (const key of Object.keys(memberMap)) delete memberMap[key];
+          const reactionMap = reactions.get(event.scope);
+          if (reactionMap) for (const key of Object.keys(reactionMap)) delete reactionMap[key];
           if (groups[String(event.scope)]?.open !== true) delete groups[String(event.scope)];
           touchedPosts.add(event.scope);
           touchedMembers.add(event.scope);
+          touchedReactions.add(event.scope);
         }
         break;
       default:
@@ -352,6 +409,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   const writes = [write(groupsKey(username), groups), write(profilesKey(username), profiles)];
   for (const scope of touchedPosts) writes.push(write(postsKey(username, scope), posts.get(scope) ?? {}));
   for (const scope of touchedMembers) writes.push(write(membersKey(username, scope), members.get(scope) ?? {}));
+  for (const scope of touchedReactions) writes.push(write(reactionsKey(username, scope), reactions.get(scope) ?? {}));
   await Promise.all(writes);
 }
 
@@ -361,6 +419,64 @@ export async function getGroups(username: string): Promise<StoredGroup[]> {
 
 export async function getPosts(username: string, scope: number): Promise<StoredPost[]> {
   return Object.values(await readMap(postsKey(username, scope), asPost)).sort((a, b) => a.seq - b.seq);
+}
+
+/** Latest reaction per account, target and emoji; callers tally what is still on. */
+export async function getReactions(username: string, scope: number): Promise<StoredReaction[]> {
+  return Object.values(await readMap(reactionsKey(username, scope), asReaction)).sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * The value the next tap should send. Pending outbox rows win over the synced cache, so two
+ * taps on a flaky link become on then off instead of two "on" ops.
+ */
+export async function nextReactionOn(
+  username: string,
+  scope: number,
+  target: number,
+  emoji: number,
+  self: number,
+): Promise<boolean> {
+  const stored = (await getReactions(username, scope)).find(
+    (row) => row.target === target && row.emoji === emoji && row.user === self,
+  );
+  let on = stored?.on === true;
+  for (const op of await getOutbox(username)) {
+    if (op.tag !== Tag.Reaction || op.scope !== scope || op.target !== target || op.emoji !== emoji) continue;
+    if (typeof op.on === "boolean") on = op.on;
+  }
+  return !on;
+}
+
+/**
+ * Counts the reactions still on, per target, in palette order. Replaying events cannot
+ * double-count because the store keeps one row per account, target and emoji.
+ */
+export function tallyReactions(rows: readonly StoredReaction[], self: number | null): Map<number, ReactionTally[]> {
+  const byTarget = new Map<number, Map<number, { count: number; mine: boolean }>>();
+  for (const row of rows) {
+    if (!row.on) continue;
+    let byEmoji = byTarget.get(row.target);
+    if (!byEmoji) {
+      byEmoji = new Map();
+      byTarget.set(row.target, byEmoji);
+    }
+    const tally = byEmoji.get(row.emoji) ?? { count: 0, mine: false };
+    tally.count += 1;
+    if (self !== null && row.user === self) tally.mine = true;
+    byEmoji.set(row.emoji, tally);
+  }
+
+  const out = new Map<number, ReactionTally[]>();
+  for (const [target, byEmoji] of byTarget) {
+    out.set(
+      target,
+      [...byEmoji.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([emoji, tally]) => ({ emoji, count: tally.count, mine: tally.mine })),
+    );
+  }
+  return out;
 }
 
 export async function getMembers(username: string, scope: number): Promise<StoredMember[]> {
@@ -410,6 +526,10 @@ export interface StoredOp {
   username?: string;
   displayName?: string;
   bio?: string;
+  parent?: number;
+  target?: number;
+  emoji?: number;
+  on?: boolean;
 }
 
 function asStoredOp(value: unknown): StoredOp | null {
@@ -427,6 +547,10 @@ function asStoredOp(value: unknown): StoredOp | null {
   if (typeof row.username === "string") op.username = row.username;
   if (typeof row.displayName === "string") op.displayName = row.displayName;
   if (typeof row.bio === "string") op.bio = row.bio;
+  if (isUint(row.parent)) op.parent = row.parent;
+  if (isUint(row.target)) op.target = row.target;
+  if (isUint(row.emoji)) op.emoji = row.emoji;
+  if (typeof row.on === "boolean") op.on = row.on;
   return op;
 }
 
@@ -464,6 +588,17 @@ export function toWireOp(op: StoredOp): Op {
   switch (op.tag) {
     case Tag.Post:
       return { cid, tag: Tag.Post, scope: op.scope, text: op.text ?? "", media: null };
+    case Tag.Reply:
+      return { cid, tag: Tag.Reply, scope: op.scope, parent: op.parent ?? 0, text: op.text ?? "", media: null };
+    case Tag.Reaction:
+      return {
+        cid,
+        tag: Tag.Reaction,
+        scope: op.scope,
+        target: op.target ?? 0,
+        emoji: op.emoji ?? 0,
+        on: op.on === true,
+      };
     case Tag.GroupMeta:
       return {
         cid,

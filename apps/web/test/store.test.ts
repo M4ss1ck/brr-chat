@@ -12,14 +12,17 @@ import {
   getPosts,
   getProfiles,
   getRange,
+  getReactions,
   getSelf,
   getSession,
   getStoredCursor,
+  nextReactionOn,
   removeOutbox,
   setCursor,
   setRange,
   setSelf,
   setSession,
+  tallyReactions,
   toWireOp,
 } from "../src/store.ts";
 
@@ -150,7 +153,7 @@ describe("store (IndexedDB)", () => {
       { group: 10, user: 1, role: Role.Owner, seq: 11 },
       { group: 10, user: 2, role: Role.Member, seq: 12 },
     ]);
-    expect(await getPosts("alice", 10)).toEqual([{ seq: 13, ts: 103, author: 1, scope: 10, text: "hola" }]);
+    expect(await getPosts("alice", 10)).toEqual([{ seq: 13, ts: 103, author: 1, scope: 10, text: "hola", parent: 0 }]);
     expect((await getProfiles("alice")).get(1)).toEqual({
       user: 1,
       seq: 14,
@@ -167,15 +170,77 @@ describe("store (IndexedDB)", () => {
     expect(await getPosts("alice", 20)).toHaveLength(1);
   });
 
+  test("replies are cached next to their post with a parent", async () => {
+    await applyEvents("alice", [
+      { tag: Tag.Post, seq: 40, ts: 400, author: 1, scope: 10, text: "parent", media: null },
+      { tag: Tag.Reply, seq: 41, ts: 401, author: 2, scope: 10, parent: 40, text: "child", media: null },
+    ]);
+    expect(await getPosts("alice", 10)).toEqual([
+      { seq: 40, ts: 400, author: 1, scope: 10, text: "parent", parent: 0 },
+      { seq: 41, ts: 401, author: 2, scope: 10, text: "child", parent: 40 },
+    ]);
+  });
+
+  test("reaction counts resync without double-counting and keep the latest toggle", async () => {
+    const bobOn: Event = {
+      tag: Tag.Reaction,
+      seq: 51,
+      ts: 500,
+      author: 2,
+      scope: 10,
+      target: 40,
+      emoji: 2,
+      on: true,
+    };
+    const carolOn: Event = { ...bobOn, seq: 52, ts: 501, author: 3 };
+    await applyEvents("alice", [bobOn, carolOn]);
+
+    let rows = await getReactions("alice", 10);
+    expect(tallyReactions(rows, 2).get(40)).toEqual([{ emoji: 2, count: 2, mine: true }]);
+    expect(tallyReactions(rows, 4).get(40)).toEqual([{ emoji: 2, count: 2, mine: false }]);
+
+    // A resync may resend the same events; counts must not grow.
+    await applyEvents("alice", [bobOn, carolOn]);
+    rows = await getReactions("alice", 10);
+    expect(tallyReactions(rows, 2).get(40)).toEqual([{ emoji: 2, count: 2, mine: true }]);
+
+    // Bob toggles off, then an old snapshot replays his "on": off still wins.
+    await applyEvents("alice", [{ ...bobOn, seq: 53, ts: 502, on: false }]);
+    await applyEvents("alice", [bobOn]);
+    rows = await getReactions("alice", 10);
+    expect(tallyReactions(rows, 2).get(40)).toEqual([{ emoji: 2, count: 1, mine: false }]);
+  });
+
+  test("the next reaction tap counts a still-pending outbox row", async () => {
+    expect(await nextReactionOn("alice", 10, 40, 2, 2)).toBe(true);
+    await enqueueOp("alice", { tag: Tag.Reaction, scope: 10, target: 40, emoji: 2, on: true });
+    // The "on" op has no ack yet, so a second tap must send "off".
+    expect(await nextReactionOn("alice", 10, 40, 2, 2)).toBe(false);
+    await enqueueOp("alice", { tag: Tag.Reaction, scope: 10, target: 40, emoji: 2, on: false });
+    expect(await nextReactionOn("alice", 10, 40, 2, 2)).toBe(true);
+  });
+
+  test("a reaction row from before this shell reads as absent, never as garbage", async () => {
+    const store = await rawStore();
+    try {
+      await store.put("reactions:alice", { "40:2:2": { scope: 10, target: 40, emoji: 9, user: 2, on: true, seq: 1 } });
+    } finally {
+      store.close();
+    }
+    expect(await getReactions("alice", 10)).toEqual([]);
+  });
+
   test("scope_left with purge drops the cached posts and members", async () => {
     await applyEvents("alice", [
       { tag: Tag.GroupMeta, seq: 30, ts: 300, author: 1, scope: 30, name: "Gone", about: "", open: false },
       { tag: Tag.Membership, seq: 31, ts: 301, author: 1, scope: 30, user: 1, role: Role.Owner },
       { tag: Tag.Post, seq: 32, ts: 302, author: 1, scope: 30, text: "bye", media: null },
+      { tag: Tag.Reaction, seq: 33, ts: 303, author: 1, scope: 30, target: 32, emoji: 0, on: true },
     ]);
-    await applyEvents("alice", [{ tag: Tag.ScopeLeft, seq: 33, ts: 303, author: 0, scope: 30, purge: true }]);
+    await applyEvents("alice", [{ tag: Tag.ScopeLeft, seq: 34, ts: 304, author: 0, scope: 30, purge: true }]);
     expect(await getPosts("alice", 30)).toEqual([]);
     expect(await getMembers("alice", 30)).toEqual([]);
+    expect(await getReactions("alice", 30)).toEqual([]);
     expect(await getGroups("alice")).toEqual([]);
   });
 
@@ -200,6 +265,14 @@ describe("store (IndexedDB)", () => {
 
     await removeOutbox("alice", [new Uint8Array(first.cid)]);
     expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([second.cid]);
+  });
+
+  test("the outbox round-trips a reply and a reaction toggle", async () => {
+    const reply = await enqueueOp("alice", { tag: Tag.Reply, scope: 5, parent: 9, text: "re" });
+    const reaction = await enqueueOp("alice", { tag: Tag.Reaction, scope: 5, target: 9, emoji: 7, on: false });
+    expect(toWireOp(reply)).toMatchObject({ tag: Tag.Reply, scope: 5, parent: 9, text: "re", media: null });
+    expect(toWireOp(reaction)).toMatchObject({ tag: Tag.Reaction, scope: 5, target: 9, emoji: 7, on: false });
+    expect(new Uint8Array(toWireOp(reaction).cid)).toEqual(new Uint8Array(reaction.cid));
   });
 
   test("a corrupt group row reads back as absent", async () => {
