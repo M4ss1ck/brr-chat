@@ -202,6 +202,35 @@ function deletionFor(db: Database, scope: number, target: number): { seq: number
     | null;
 }
 
+/** Appends one delete tombstone and releases the target's image, if it had one. */
+function insertDelete(db: Database, scope: number, target: number, author: number, now: number): number {
+  const seq = insertEvent(db, (next) => ({
+    tag: Tag.Delete,
+    seq: next,
+    ts: now,
+    author,
+    scope,
+    target,
+  }));
+  db.query("INSERT INTO deleted_events (scope, target, seq) VALUES (?, ?, ?)").run(scope, target, seq);
+  // The image has no reader left, so its bytes stop counting against the quota.
+  removeMediaForEvent(db, target);
+  return seq;
+}
+
+/** Every live post or reply one account wrote in a group, oldest first. */
+function authoredContentSeqs(db: Database, scope: number, author: number): number[] {
+  const rows = db
+    .query(
+      `SELECT e.seq AS seq FROM events e
+       WHERE e.scope = ? AND e.author = ? AND e.tag IN (${Tag.Post}, ${Tag.Reply})
+         AND NOT EXISTS (SELECT 1 FROM deleted_events d WHERE d.scope = e.scope AND d.target = e.seq)
+       ORDER BY e.seq ASC`,
+    )
+    .all(scope, author) as { seq: number }[];
+  return rows.map((row) => Number(row.seq));
+}
+
 /** Writes the current membership row and its event. `author` is 0 for server-generated changes. */
 function setMembership(
   db: Database,
@@ -576,17 +605,30 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
       }
       const already = deletionFor(db, op.scope, op.target);
       if (already) return { seq: Number(already.seq), firstSeq: Number(already.seq), state: false };
+      const seq = insertDelete(db, op.scope, op.target, actor.wireId, now);
+      return { seq, firstSeq: seq, state: false };
+    }
+    case Tag.DeleteAuthor: {
+      // Bulk moderation (ADR 0010): a group admin or the owner removes every post and reply
+      // one account wrote in this group. The marker event records the action and answers the
+      // op; the individual delete events are what every client, old or new, already applies.
+      const denied = groupAccessError(db, actor, op.scope);
+      if (denied !== null) return { error: denied };
+      // Role first: a plain member must not learn whether an account exists from the ack.
+      if (groupRole(db, op.scope, actor.wireId) < Role.Admin) return { error: AckError.Forbidden };
+      if (op.user === 0) return { error: AckError.Invalid };
+      if (!peerIsKnown(db, op.user)) return { error: AckError.NotFound };
       const seq = insertEvent(db, (next) => ({
-        tag: Tag.Delete,
+        tag: Tag.DeleteAuthor,
         seq: next,
         ts: now,
         author: actor.wireId,
         scope: op.scope,
-        target: op.target,
+        user: op.user,
       }));
-      db.query("INSERT INTO deleted_events (scope, target, seq) VALUES (?, ?, ?)").run(op.scope, op.target, seq);
-      // The image has no reader left, so its bytes stop counting against the quota.
-      removeMediaForEvent(db, op.target);
+      for (const target of authoredContentSeqs(db, op.scope, op.user)) {
+        insertDelete(db, op.scope, target, actor.wireId, now);
+      }
       return { seq, firstSeq: seq, state: false };
     }
     case Tag.Ban: {

@@ -35,6 +35,7 @@ export const samples: Event[] = [
   { ...hdr, author: 0, tag: Tag.Gap, after: 10, before: 900, count: 340 },
   { ...hdr, tag: Tag.DmScope, peer: 43 },
   { ...hdr, scope: 0, tag: Tag.Block, user: 66, on: true },
+  { ...hdr, tag: Tag.DeleteAuthor, user: 66 },
 ];
 
 describe("events", () => {
@@ -121,6 +122,7 @@ describe("ops (outbox items)", () => {
     { cid, scope: 0, tag: Tag.GroupMeta, name: "new group", about: "x", open: false },
     { cid, scope: 7, tag: Tag.Membership, user: 42, role: Role.Member, invite: "tok_123" },
     { cid, scope: 0, tag: Tag.Block, user: 43, on: true },
+    { cid, scope: 7, tag: Tag.DeleteAuthor, user: 43 },
   ];
 
   test.each(ops.map((o) => [o.tag, o] as const))("op tag %d round-trips", (_t, op) => {

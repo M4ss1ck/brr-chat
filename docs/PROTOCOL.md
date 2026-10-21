@@ -79,10 +79,10 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
 - **Gaps:** after a long time offline, if more than 100 missed **posts, replies, DMs or
   reactions** are waiting in one scope, the server sends those newest 100 and a `Gap` event in
   place of the excess. The gap is filled only when the user asks (`/history`). Control events
-  (membership, bans, deletes, profiles, group metadata) are always sent, however old they are,
-  so group state never goes stale behind a gap. A `Gap`'s `after` is the cursor the catch-up
-  started from and `before` is the seq of the first gap-covered event still sent, so `before`
-  is the right argument for the first `/history` call (ADR 0019).
+  (membership, bans, deletes, bulk-delete markers, profiles, group metadata) are always sent,
+  however old they are, so group state never goes stale behind a gap. A `Gap`'s `after` is the
+  cursor the catch-up started from and `before` is the seq of the first gap-covered event still
+  sent, so `before` is the right argument for the first `/history` call (ADR 0019).
 - **Fresh device or new join:** the server sends current state (profiles, group metadata,
   memberships, the viewer's `dm_scope` events) and a cursor at the head of the log. **No
   posts or DM messages.** Older posts load only when the user asks. A state snapshot may repeat an event at or below the device's previous cursor; the
@@ -208,6 +208,9 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
   a group or DM scope id, or 0 for server-wide events (profiles, server bans).
 - An op has the same fields as the event it asks for. The server fills in seq, ts and author. A
   client may send only the tags marked "op".
+- A `delete_author` op is acknowledged by the seq of its marker event. The server expands it
+  into one `delete` event per live post or reply that account wrote in the group. Old clients
+  skip the marker and apply the deletes, which they already understand.
 
 | Tag | Name | Fields after the header | Op | Notes |
 |---|---|---|---|---|
@@ -225,6 +228,7 @@ Op    = [cid: bytes .size 8, tag: uint, scope: uint, ...fields]
 | 12 | gap | `after: uint, before: uint, count: uint` | no | `count` events in `(after, before)` not sent |
 | 13 | dm_scope | `peer: uint` | no | server-generated when a DM is first opened; `scope` is the new DM id |
 | 14 | block | `user: uint, on: bool` | yes | `scope = 0` toggles the sender's personal, silent block of `user`. The event is delivered only to the blocker; the blocked account is never told (ADR 0012) |
+| 15 | delete_author | `user: uint` | yes | group admin or owner removes every post and reply `user` wrote in `scope`. The server appends this marker, then one `delete` event per affected post or reply; old clients skip the marker and apply the deletes (ADR 0004) |
 
 ```
 Media = [id: uint, w: uint, h: uint, thumbhash: bytes .size (0..32)]

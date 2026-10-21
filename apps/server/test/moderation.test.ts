@@ -65,6 +65,10 @@ function deleteOp(c: Uint8Array, group: number, target: number): Op {
   return { cid: c, tag: Tag.Delete, scope: group, target };
 }
 
+function deleteAuthorOp(c: Uint8Array, group: number, user: number): Op {
+  return { cid: c, tag: Tag.DeleteAuthor, scope: group, user };
+}
+
 function banOp(c: Uint8Array, scope: number, user: number, on: boolean): Op {
   return { cid: c, tag: Tag.Ban, scope, user, on };
 }
@@ -821,6 +825,200 @@ describe("Slice 6: group moderation", () => {
       expect(seen).toBe(total);
       expect(page.more).toBe(false);
       expect(calls).toBe(1);
+    } finally {
+      app.close();
+    }
+  });
+
+  test("a group admin removes all of one author's posts and replies in one op", async () => {
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      // Moderation scenarios need several accounts; signup budgets are tested in abuse.test.ts.
+      limits: { signupsPerHour: 100 },
+    });
+    try {
+      const alice = await client(app, "alice", 25);
+      const bob = await client(app, "bob");
+      const carol = await client(app, "carol");
+      const dave = await client(app, "dave");
+      const { groupId, cursor } = await groupWithMembers(app, alice, [
+        { client: bob },
+        { client: carol },
+        { client: dave },
+      ]);
+      alice.cursor = cursor;
+
+      const promoteCid = cid();
+      const promoted = await sync(app, alice.account.token, alice.cursor, [
+        membershipOp(promoteCid, groupId, dave.wire, Role.Admin),
+      ]);
+      seqOf(promoted, promoteCid);
+      alice.cursor = promoted.cursor;
+      dave.cursor = (await sync(app, dave.account.token, dave.cursor, [])).cursor;
+
+      const firstCid = cid();
+      const first = await sync(app, bob.account.token, bob.cursor, [postOp(firstCid, groupId, "first")]);
+      const firstPost = seqOf(first, firstCid);
+      bob.cursor = first.cursor;
+      const secondCid = cid();
+      const second = await sync(app, bob.account.token, bob.cursor, [postOp(secondCid, groupId, "second")]);
+      const secondPost = seqOf(second, secondCid);
+      bob.cursor = second.cursor;
+      const replyCid = cid();
+      const replied = await sync(app, bob.account.token, bob.cursor, [
+        replyOp(replyCid, groupId, firstPost, "bob reply"),
+      ]);
+      const replySeq = seqOf(replied, replyCid);
+      bob.cursor = replied.cursor;
+      const carolCid = cid();
+      const carolPost = await sync(app, carol.account.token, carol.cursor, [postOp(carolCid, groupId, "carol")]);
+      const carolSeq = seqOf(carolPost, carolCid);
+      carol.cursor = carolPost.cursor;
+
+      // One post is already gone, so the bulk delete must not write a second tombstone for it.
+      const singleCid = cid();
+      const single = await sync(app, alice.account.token, alice.cursor, [deleteOp(singleCid, groupId, firstPost)]);
+      seqOf(single, singleCid);
+      alice.cursor = single.cursor;
+
+      // A plain member cannot bulk delete, even their own content.
+      const deniedCid = cid();
+      const denied = await sync(app, bob.account.token, bob.cursor, [
+        deleteAuthorOp(deniedCid, groupId, carol.wire),
+      ]);
+      expect(ack(denied, deniedCid)).toEqual({ error: AckError.Forbidden });
+      bob.cursor = denied.cursor;
+
+      const bulkCid = cid();
+      const bulk = await sync(app, dave.account.token, dave.cursor, [
+        deleteAuthorOp(bulkCid, groupId, bob.wire),
+      ]);
+      const marker = seqOf(bulk, bulkCid);
+      dave.cursor = bulk.cursor;
+      expect(bulk.events.find((event) => event.seq === marker)).toMatchObject({
+        tag: Tag.DeleteAuthor,
+        scope: groupId,
+        author: dave.wire,
+        user: bob.wire,
+      });
+
+      const rows = app.db
+        .query("SELECT target FROM deleted_events WHERE scope = ? ORDER BY target ASC")
+        .all(groupId) as { target: number }[];
+      // First post, second post and the reply: exactly one tombstone each, including the one
+      // the earlier single delete wrote. Carol's post is untouched.
+      expect(rows.map((row) => Number(row.target)).sort((a, b) => a - b)).toEqual(
+        [firstPost, secondPost, replySeq].sort((a, b) => a - b),
+      );
+      expect(rows.some((row) => Number(row.target) === carolSeq)).toBe(false);
+
+      const expanded = app.db
+        .query("SELECT target FROM deleted_events WHERE scope = ? AND seq > ? ORDER BY seq ASC")
+        .all(groupId, marker) as { target: number }[];
+      expect(expanded.map((row) => Number(row.target))).toEqual([secondPost, replySeq]);
+
+      // The same cid is a retry: the original marker seq, and nothing new on the log.
+      const beforeRetry = app.db
+        .query("SELECT COUNT(*) AS n FROM events WHERE tag = ? AND scope = ?")
+        .get(Tag.DeleteAuthor, groupId) as { n: number };
+      const retried = await sync(app, dave.account.token, dave.cursor, [
+        deleteAuthorOp(bulkCid, groupId, bob.wire),
+      ]);
+      expect(seqOf(retried, bulkCid)).toBe(marker);
+      const afterRetry = app.db
+        .query("SELECT COUNT(*) AS n FROM events WHERE tag = ? AND scope = ?")
+        .get(Tag.DeleteAuthor, groupId) as { n: number };
+      expect(Number(afterRetry.n)).toBe(Number(beforeRetry.n));
+
+      // A fresh cid with no live posts left records the action again and deletes nothing.
+      const againCid = cid();
+      const again = await sync(app, dave.account.token, retried.cursor, [
+        deleteAuthorOp(againCid, groupId, bob.wire),
+      ]);
+      expect(seqOf(again, againCid)).toBeGreaterThan(marker);
+      const expandedAgain = app.db
+        .query("SELECT target FROM deleted_events WHERE scope = ? AND seq > ? ORDER BY seq ASC")
+        .all(groupId, marker) as { target: number }[];
+      expect(expandedAgain.map((row) => Number(row.target))).toEqual([secondPost, replySeq]);
+
+      // The owner can bulk delete too, including a group admin's content.
+      const daveCid = cid();
+      const davePost = await sync(app, dave.account.token, again.cursor, [postOp(daveCid, groupId, "admin post")]);
+      const daveSeq = seqOf(davePost, daveCid);
+      const ownerCid = cid();
+      const ownerBulk = await sync(app, alice.account.token, alice.cursor, [
+        deleteAuthorOp(ownerCid, groupId, dave.wire),
+      ]);
+      seqOf(ownerBulk, ownerCid);
+      expect(
+        app.db.query("SELECT 1 AS gone FROM deleted_events WHERE scope = ? AND target = ?").get(groupId, daveSeq),
+      ).not.toBeNull();
+
+      // And an admin can bulk delete the owner's content: like the single delete op, this is
+      // content moderation, so the target's role does not change the rule.
+      const ownerPostCid = cid();
+      const ownerPost = await sync(app, alice.account.token, ownerBulk.cursor, [
+        postOp(ownerPostCid, groupId, "owner post"),
+      ]);
+      const ownerPostSeq = seqOf(ownerPost, ownerPostCid);
+      const adminOwnerCid = cid();
+      const adminOwner = await sync(app, dave.account.token, davePost.cursor, [
+        deleteAuthorOp(adminOwnerCid, groupId, alice.wire),
+      ]);
+      seqOf(adminOwner, adminOwnerCid);
+      expect(
+        app.db
+          .query("SELECT 1 AS gone FROM deleted_events WHERE scope = ? AND target = ?")
+          .get(groupId, ownerPostSeq),
+      ).not.toBeNull();
+    } finally {
+      app.close();
+    }
+  });
+
+  test("bulk delete needs a group scope, an admin or owner, and a real target", async () => {
+    const app = await createApp({
+      dbPath: ":memory:",
+      host: "chat.local",
+      limits: { signupsPerHour: 100 },
+    });
+    try {
+      const alice = await client(app, "alice", 25);
+      const bob = await client(app, "bob");
+      const eve = await client(app, "eve");
+      const { groupId } = await groupWithMembers(app, alice, [{ client: bob }]);
+
+      // A non-member gets exactly the same refusal as a plain member: neither can see the group.
+      const outsiderCid = cid();
+      const outsider = await sync(app, eve.account.token, eve.cursor, [
+        deleteAuthorOp(outsiderCid, groupId, bob.wire),
+      ]);
+      expect(ack(outsider, outsiderCid)).toEqual({ error: AckError.Forbidden });
+
+      const zeroScopeCid = cid();
+      const zeroScope = await sync(app, alice.account.token, alice.cursor, [
+        deleteAuthorOp(zeroScopeCid, 0, bob.wire),
+      ]);
+      expect(ack(zeroScope, zeroScopeCid)).toEqual({ error: AckError.Invalid });
+
+      const unknownGroupCid = cid();
+      const unknownGroup = await sync(app, alice.account.token, zeroScope.cursor, [
+        deleteAuthorOp(unknownGroupCid, 999_999, bob.wire),
+      ]);
+      expect(ack(unknownGroup, unknownGroupCid)).toEqual({ error: AckError.NotFound });
+
+      const zeroUserCid = cid();
+      const zeroUser = await sync(app, alice.account.token, unknownGroup.cursor, [
+        deleteAuthorOp(zeroUserCid, groupId, 0),
+      ]);
+      expect(ack(zeroUser, zeroUserCid)).toEqual({ error: AckError.Invalid });
+
+      const unknownUserCid = cid();
+      const unknownUser = await sync(app, alice.account.token, zeroUser.cursor, [
+        deleteAuthorOp(unknownUserCid, groupId, 999_999),
+      ]);
+      expect(ack(unknownUser, unknownUserCid)).toEqual({ error: AckError.NotFound });
     } finally {
       app.close();
     }

@@ -262,6 +262,8 @@ function outboxLabel(op: StoredOp): string {
     }
     case Tag.Delete:
       return "Delete a post";
+    case Tag.DeleteAuthor:
+      return "Delete all of one account's posts";
     case Tag.GroupMeta:
       return `Group: ${op.name ?? ""}`;
     case Tag.Membership:
@@ -1031,6 +1033,16 @@ async function deletePost(post: StoredPost): Promise<void> {
   await syncNow();
 }
 
+/** One moderation action: every post and reply this account wrote in the current group. */
+async function deleteAuthorPosts(user: number): Promise<void> {
+  const session = await getActiveAccount();
+  const scope = currentGroup;
+  if (!session || scope === null) return;
+  if (!confirm("Delete every post and reply this account wrote in this group? This cannot be undone.")) return;
+  await enqueueOp(session, { tag: Tag.DeleteAuthor, scope, user });
+  await syncNow();
+}
+
 function memberItem(
   member: StoredMember,
   name: string,
@@ -1042,6 +1054,16 @@ function memberItem(
   const roleName = member.role === Role.Owner ? "owner" : member.role === Role.Admin ? "group admin" : "member";
   label.textContent = `${name} · ${roleName}`;
   item.append(label);
+
+  // Removing someone's posts is content moderation, so it follows the delete rule: a group
+  // admin or the owner, no matter what role the target holds.
+  if (self !== null && member.user !== self && myRole >= Role.Admin) {
+    const removePosts = document.createElement("button");
+    removePosts.type = "button";
+    removePosts.textContent = "Delete posts";
+    removePosts.addEventListener("click", () => void deleteAuthorPosts(member.user));
+    item.append(removePosts);
+  }
 
   // The owner changes roles; admins moderate plain members. Nobody changes the owner here.
   if (self !== null && member.user !== self && member.role !== Role.Owner) {
@@ -1079,7 +1101,11 @@ function banItem(ban: StoredBan, name: string, myRole: number): HTMLLIElement {
     unban.type = "button";
     unban.textContent = "Unban";
     unban.addEventListener("click", () => void setMemberBan(ban.user, false));
-    item.append(unban);
+    const removePosts = document.createElement("button");
+    removePosts.type = "button";
+    removePosts.textContent = "Delete posts";
+    removePosts.addEventListener("click", () => void deleteAuthorPosts(ban.user));
+    item.append(unban, removePosts);
   }
   return item;
 }

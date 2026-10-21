@@ -18,6 +18,10 @@ export const Tag = {
   Gap: 12,
   DmScope: 13,
   Block: 14,
+  // Bulk moderation: remove every post and reply one account wrote in a group. The server
+  // appends this marker, then one `delete` event per affected post or reply, so old clients
+  // skip the marker and still apply the content deletes they understand (ADR 0004, ADR 0010).
+  DeleteAuthor: 15,
 } as const;
 export type Tag = (typeof Tag)[keyof typeof Tag];
 
@@ -67,12 +71,14 @@ const SCHEMA = {
   [Tag.DmScope]: [["peer", "uint"]],
   // Personal block (ADR 0012). An op toggles it; the event is stored for the blocker only.
   [Tag.Block]: [["user", "uint"], ["on", "bool"]],
+  // Bulk delete by author. The op is expanded into individual delete events by the server.
+  [Tag.DeleteAuthor]: [["user", "uint"]],
 } as const satisfies Record<Tag, readonly (readonly [string, Kind])[]>;
 
 /** Tags a client may send in its outbox. The rest are server-generated. */
 const OP_TAGS: ReadonlySet<number> = new Set<number>([
   Tag.Post, Tag.Reply, Tag.Dm, Tag.Reaction, Tag.Delete, Tag.Profile, Tag.GroupMeta, Tag.Membership, Tag.Ban,
-  Tag.Block,
+  Tag.Block, Tag.DeleteAuthor,
 ]);
 
 /**

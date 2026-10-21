@@ -6,7 +6,8 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PROTOCOL_VERSION, SUPPORTED } from "../src/index.ts";
+import { PROTOCOL_VERSION, SUPPORTED, Tag, decodeEvent, decodeSyncResponse, type Event } from "../src/index.ts";
+import { decode } from "../src/cbor.ts";
 import { fixtures } from "../scripts/fixtures.ts";
 import { decodeFixture, toJson } from "./fixture-codec.ts";
 
@@ -38,3 +39,34 @@ for (const dir of versions) {
     }
   });
 }
+
+// The tag numbers a v1 client shipped with, frozen as literals before tag 15 existed. This is
+// the check ADR 0004 promises: a client that predates a new tag skips it and still applies
+// every event it already understands. The server's delete_author op expands into that shape.
+const V1_TAGS = new Set<number>([1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]);
+
+test("a v1 client skips the new delete_author marker and applies its delete events", () => {
+  const file = join(ROOT, "v1", "sync-response-delete-author");
+  const bytes = new Uint8Array(Buffer.from(readFileSync(`${file}.hex`, "utf8").trim(), "hex"));
+  const envelope = decode(bytes);
+  if (!Array.isArray(envelope) || !Array.isArray(envelope[4])) throw new Error("fixture is not a sync response");
+  let skipped = 0;
+  const applied: Event[] = [];
+  for (const raw of envelope[4] as unknown[]) {
+    const tag = Array.isArray(raw) ? (raw[0] as number) : -1;
+    if (!V1_TAGS.has(tag)) {
+      skipped += 1;
+      continue;
+    }
+    const event = decodeEvent(raw);
+    expect(event).not.toBeNull();
+    if (event) applied.push(event);
+  }
+  expect(skipped).toBe(1);
+  expect(applied.map((event) => event.tag)).toEqual([Tag.Delete, Tag.Delete]);
+
+  // The current client knows the marker, so the envelope decoder keeps it and skips nothing.
+  const current = decodeSyncResponse(bytes);
+  expect(current.skipped).toBe(0);
+  expect(current.events.map((event) => event.tag)).toEqual([Tag.DeleteAuthor, Tag.Delete, Tag.Delete]);
+});
