@@ -43,30 +43,10 @@ function withScheme(raw: string): string {
 }
 
 /**
- * The canonical origin for a URL or origin string, or null when it is not an http(s) server.
- * Credentials in the URL are refused: a server URL is not a place to hide a password.
+ * The one parser both entry points share: an http(s) URL with no credentials and a host.
+ * A server URL is not a place to hide a password, so userinfo is refused rather than kept.
  */
-export function serverIdOf(value: string): string | null {
-  const raw = value.trim();
-  if (raw.length === 0) return null;
-  let url: URL;
-  try {
-    url = new URL(withScheme(raw));
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-  if (url.username.length > 0 || url.password.length > 0) return null;
-  if (url.hostname.length === 0) return null;
-  return url.origin;
-}
-
-/**
- * Parses what a person pastes or what a QR code contains. Anything beyond a bare origin has
- * to be one of the two invite paths this server serves; an unknown path is a typo, not a
- * server we quietly drop the path from.
- */
-export function parseServerLink(raw: string): ServerLink | null {
+function httpUrl(raw: string): URL | null {
   const text = raw.trim();
   if (text.length === 0) return null;
   let url: URL;
@@ -78,6 +58,22 @@ export function parseServerLink(raw: string): ServerLink | null {
   if (url.protocol !== "http:" && url.protocol !== "https:") return null;
   if (url.username.length > 0 || url.password.length > 0) return null;
   if (url.hostname.length === 0) return null;
+  return url;
+}
+
+/** The canonical origin for a URL or origin string, or null when it is not an http(s) server. */
+export function serverIdOf(value: string): string | null {
+  return httpUrl(value)?.origin ?? null;
+}
+
+/**
+ * Parses what a person pastes or what a QR code contains. Anything beyond a bare origin has
+ * to be one of the two invite paths this server serves; an unknown path is a typo, not a
+ * server we quietly drop the path from.
+ */
+export function parseServerLink(raw: string): ServerLink | null {
+  const url = httpUrl(raw);
+  if (url === null) return null;
 
   const server = url.origin;
   const path = url.pathname.replace(/\/+$/, "");

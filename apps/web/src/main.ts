@@ -20,7 +20,7 @@ import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
 import { clearMediaCache, mediaView, MediaUploadError, prepareImage, uploadImage } from "./media.ts";
 import { forgetServerMeter, formatBytes, meter, migrateLegacyMeterSession, type MeterTotals } from "./meter.ts";
-import { decodeQrFile, decodeQrFrame, qrSvg } from "./qr.ts";
+import { qrSvg } from "./qr.ts";
 import { parseServerLink, serverLabel } from "./servers.ts";
 import { drainOutbox, SyncHttpError } from "./sync.ts";
 import { createSyncQueue } from "./sync-queue.ts";
@@ -109,10 +109,28 @@ let switchQueue: Promise<void> = Promise.resolve();
 /** Camera preview for the in-app QR reader, when one is running. */
 let camera: MediaStream | null = null;
 let cameraTimer: ReturnType<typeof setTimeout> | null = null;
+/** The QR scanner is a separate bundle, so a user who never adds a server never pays for it. */
+interface QrScanner {
+  decodeQrFile(file: Blob): Promise<string | null>;
+  decodeQrFrame(video: HTMLVideoElement): string | null;
+}
+let qrScanner: Promise<QrScanner> | null = null;
+
+function loadQrScanner(): Promise<QrScanner> {
+  if (qrScanner === null) {
+    // A computed specifier: the bundler must not inline jsQR into the app shell.
+    const url = new URL("/qr-scan.js", location.href).href;
+    qrScanner = import(url) as Promise<QrScanner>;
+  }
+  return qrScanner.catch((err: unknown) => {
+    qrScanner = null;
+    throw err;
+  });
+}
 
 
 function historyKey(account: Account, scope: number): string {
-  return `${account.server} ${account.username}:${scope}`;
+  return `${accountKey(account)}:${scope}`;
 }
 
 function accountLabel(account: Account): string {
@@ -383,7 +401,10 @@ async function addServerLink(raw?: string): Promise<void> {
 
   const session = await getActiveAccount();
   if (session === null) await paintRegistration();
-  else if (session.recoveryPending !== true) await syncNow();
+  else if (session.recoveryPending !== true) {
+    await syncNow();
+    if (link.invite?.kind === "join") await completeInvite();
+  }
 }
 
 /** A screenshot or photo of a code: the same link, without a camera permission. */
@@ -395,7 +416,8 @@ async function addServerFromQrImage(): Promise<void> {
     return;
   }
   try {
-    const text = await decodeQrFile(file);
+    const scanner = await loadQrScanner();
+    const text = await scanner.decodeQrFile(file);
     if (text === null) {
       message("No QR code found in that image.");
       return;
@@ -416,6 +438,13 @@ async function startCameraScan(): Promise<void> {
     message("This browser cannot open the camera. Choose an image instead.");
     return;
   }
+  let scanner: QrScanner;
+  try {
+    scanner = await loadQrScanner();
+  } catch {
+    message("The QR reader could not load. Check the connection and try again.");
+    return;
+  }
   stopCameraScan();
   try {
     camera = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
@@ -433,7 +462,7 @@ async function startCameraScan(): Promise<void> {
     if (camera === null) return;
     let text: string | null = null;
     try {
-      text = decodeQrFrame(video);
+      text = scanner.decodeQrFrame(video);
     } catch {
       text = null;
     }
@@ -488,8 +517,10 @@ async function removeActiveServer(): Promise<void> {
       }
     }
   }
-  await removeServer(id);
+  // Drop the meter bucket first: a queued month write must not recreate the row that
+  // removeServer is about to delete.
   forgetServerMeter(id);
+  await removeServer(id);
   resetView();
   await refresh();
   await refreshMeter();
@@ -582,7 +613,7 @@ async function renderAdmin(force = false): Promise<void> {
   }
   // The panel does not change on its own: one fetch per account per page load keeps sync
   // traffic free of admin reads on a metered connection.
-  if (!force && adminLoadedFor === `${session.server} ${session.username}`) {
+  if (!force && adminLoadedFor === accountKey(session)) {
     show("server-admin", serverSettings?.admin === true);
     return;
   }
@@ -590,7 +621,7 @@ async function renderAdmin(force = false): Promise<void> {
     const settings = await getServerSettings(session.server, session.token);
     if (epoch !== renderEpoch) return;
     serverSettings = settings;
-    adminLoadedFor = `${session.server} ${session.username}`;
+    adminLoadedFor = accountKey(session);
     show("server-admin", settings.admin);
     if (!settings.admin) return;
 
@@ -1959,7 +1990,10 @@ async function boot(): Promise<void> {
 
   const session = await getActiveAccount();
   if (session && session.recoveryPending !== true) await afterAuth();
-  else await refresh();
+  else {
+    await refresh();
+    if ((await listServers()).some((server) => server.session !== null)) await syncAll();
+  }
 }
 
 void boot();

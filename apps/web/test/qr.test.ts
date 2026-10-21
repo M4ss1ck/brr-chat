@@ -2,7 +2,8 @@
 // credential, and an inline SVG so the shell makes no extra request.
 import { describe, expect, test } from "bun:test";
 import qrcode from "qrcode-generator";
-import { decodeQr, qrSvg } from "../src/qr.ts";
+import { decodeQr } from "../src/qr-scan.ts";
+import { qrSvg } from "../src/qr.ts";
 import { parseServerLink } from "../src/servers.ts";
 
 describe("invite QR", () => {

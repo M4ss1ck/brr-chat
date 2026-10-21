@@ -24,6 +24,8 @@ const SHELL: readonly ShellFile[] = [
   { name: "sw.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
   { name: "manifest.webmanifest", contentType: "application/manifest+json", cacheControl: "max-age=3600" },
   { name: "icon.svg", contentType: "image/svg+xml", cacheControl: "max-age=86400" },
+  // Loaded on demand by the Add-server panel, not part of the first load (ADR 0020).
+  { name: "qr-scan.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
 ];
 
 /** Paths the server answers. "/" and "/index.html" are the same document. */
@@ -34,6 +36,7 @@ const ROUTES: readonly { route: string; file: string }[] = [
   { route: "/sw.js", file: "sw.js" },
   { route: "/manifest.webmanifest", file: "manifest.webmanifest" },
   { route: "/icon.svg", file: "icon.svg" },
+  { route: "/qr-scan.js", file: "qr-scan.js" },
 ];
 
 const INDEX_HTML = `<!doctype html>
@@ -420,6 +423,8 @@ async function bundle(): Promise<void> {
   };
   await build({ ...shared, entryPoints: [join(webRoot, "src", "main.ts")], outfile: join(distDir, "app.js") });
   await build({ ...shared, entryPoints: [join(webRoot, "src", "sw.ts")], outfile: join(distDir, "sw.js") });
+  // The QR scanner is its own bundle so jsQR never rides in the app shell.
+  await build({ ...shared, entryPoints: [join(webRoot, "src", "qr-scan.ts")], outfile: join(distDir, "qr-scan.js") });
   writeFileSync(join(distDir, "index.html"), INDEX_HTML);
   writeFileSync(join(distDir, "manifest.webmanifest"), MANIFEST);
   writeFileSync(join(distDir, "icon.svg"), ICON);

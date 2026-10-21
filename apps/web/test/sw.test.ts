@@ -200,6 +200,25 @@ describe("service worker (the built shell worker)", () => {
     await expect(refreshed?.text()).resolves.toBe("http://chat.local/app.js:net?v2");
   });
 
+
+  test("the QR scanner loads once, then comes from cache without a request", async () => {
+    const url = "http://chat.local/qr-scan.js";
+    online = [...online, url];
+    requested = [];
+    const first = fetchEvent(url);
+    emit("fetch", first);
+    expect(await (await first.served as FakeResponse).text()).toBe(`${url}:net?v${generation}`);
+    expect(requested).toEqual([url]);
+    expect((await openShellCache()).store.has(url)).toBe(true);
+
+    // Next time it is cached, so the tap costs nothing even if the network has moved on.
+    generation += 1;
+    requested = [];
+    const second = fetchEvent(url);
+    emit("fetch", second);
+    expect(await (await second.served as FakeResponse).text()).toBe(`${url}:net?v${generation - 1}`);
+    expect(requested).toEqual([]);
+  });
   test("offline: the cached copy answers and nothing is requested", async () => {
     // The device is known to be offline, so a revalidation attempt must not be made.
     scope.navigator.onLine = false;

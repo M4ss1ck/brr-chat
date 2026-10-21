@@ -4,6 +4,8 @@
 // not need the service worker types hand-declared.
 const CACHE = "brr-shell-v1";
 const SHELL: readonly string[] = ["/", "/index.html", "/app.js", "/sw.js", "/manifest.webmanifest", "/icon.svg"];
+/** Fetched only when the Add-server panel opens; cached after the first use, not at install. */
+const LAZY: readonly string[] = ["/qr-scan.js"];
 /** Never cached: credentials, sync payloads and media are always fresh from the server. */
 const NEVER_CACHE: readonly string[] = ["/api/auth/", "/sync", "/m/"];
 
@@ -48,6 +50,22 @@ scope.addEventListener("fetch", (event) => {
     // Both "/" and "/index.html" are in the precache list; either one is the same document.
     const offlineFallback = async () => (await caches.match("/index.html")) ?? (await caches.match("/")) ?? Response.error();
     event.respondWith(fetch(request).catch(offlineFallback));
+    return;
+  }
+
+  // The QR scanner is not part of the first load. The first tap pays for it once, then it is
+  // served from cache like the rest of the shell.
+  if (LAZY.includes(url.pathname)) {
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(CACHE);
+        const cached = await cache.match(request);
+        if (cached) return cached;
+        const response = await fetch(request);
+        if (response.ok) await cache.put(request, response.clone());
+        return response;
+      })(),
+    );
     return;
   }
 

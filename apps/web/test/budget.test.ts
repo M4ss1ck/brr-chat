@@ -10,7 +10,7 @@ import { relative, resolve } from "node:path";
 const WEB_ROOT = resolve(import.meta.dir, "..");
 const DIST = resolve(WEB_ROOT, "dist");
 const EMBEDDED = resolve(WEB_ROOT, "..", "server", "src", "pwa-assets.generated.ts");
-const SHELL_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icon.svg"] as const;
+const SHELL_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icon.svg", "qr-scan.js"] as const;
 
 function buildShell(): void {
   const proc = Bun.spawnSync({ cmd: [process.execPath, "scripts/build.ts"], cwd: WEB_ROOT, stdout: "pipe", stderr: "pipe" });

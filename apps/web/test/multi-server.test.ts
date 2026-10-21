@@ -8,7 +8,7 @@ import { createApp, type ServerApp } from "@brr-chat/server";
 import qrcode from "qrcode-generator";
 import * as auth from "../src/auth.ts";
 import { meter } from "../src/meter.ts";
-import { decodeQr } from "../src/qr.ts";
+import { decodeQr } from "../src/qr-scan.ts";
 import { parseServerLink, serverLabel } from "../src/servers.ts";
 import {
   closeStore,

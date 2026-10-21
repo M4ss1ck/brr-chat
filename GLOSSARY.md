@@ -40,8 +40,9 @@
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.
 - **Cursor**: the last seq a client has applied. Sync returns everything after it.
-- **Outbox**: ops the device has queued and not yet had acked.
-- **Failed op**: a queued op the server refused for good (`NotFound`), kept locally with its
+- **Outbox**: ops one account on one server has queued and not yet had acked. It is per server,
+  like the cursor.
+- **Failed op**: a queued op one server refused for good (`NotFound`), kept locally with its
   drafted text and excluded from later syncs until the user discards it.
 - **Op**: a client's request to create an event, carrying a **cid**.
 - **cid**: 8 random bytes chosen by the device for an op, so retries never duplicate.

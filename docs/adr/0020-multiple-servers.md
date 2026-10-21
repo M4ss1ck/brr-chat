@@ -34,18 +34,24 @@ API of another origin.
   path never sees an empty list.
 - **Adding a server is a link.** Accepted shapes are a bare origin, `/signup/<token>` (the
   server invite from ADR 0017) and `/join/<token>` (a group invite from ADR 0016), with or
-  without a scheme (https, or http on loopback). The token is stored beside the server and
-  never appears in a URL this app navigates to; the address bar is cleaned immediately. A QR
-  code encodes exactly that link, so it is the same code path. The client decodes the code on
-  the device, from the camera or a picked image, with jsQR; nothing is uploaded.
+  without a scheme (https, or http on loopback). One parser handles a pasted link and a
+  `/signup` or `/join` deep link, so an invalid token is rejected both ways. The token is
+  stored beside the server and never appears in a URL this app navigates to; the address bar
+  is cleaned immediately. A QR code encodes exactly that link, so it is the same code path.
+  The client decodes the code on the device, from the camera or a picked image, with jsQR;
+  nothing is uploaded. A link tapped in the phone's browser lands on the server it names and
+  adds itself to that origin's list; adding another server to the app served by A is done by
+  pasting or scanning the link, because IndexedDB is per origin.
 - **Switching is local.** The list is a `<select>` outside both auth panels, so a signed-out
   server can be chosen and signed in to. Switching resets every view selection and increases
   a render epoch, so a render that started on the old server paints nothing.
-- **One `/sync` per server.** Boot and the Sync button sync every signed-in server, each with
-  its own bearer token and cursor, and the status line reports each one. Sending an op syncs
-  only the server on screen. A per-server in-flight promise means two taps cannot drain the
-  same outbox twice. Cursors are written per account, so one server's catch-up cannot move
-  another's.
+- **One `/sync` per server.** Boot, the Sync button and the browser's `online` event sync
+  every signed-in server, each with its own bearer token, cursor and outbox, and the status
+  line reports each one. Sending an op syncs only the server on screen. Sends for one account
+  are serialized (ADR 0013): a request already in flight finishes, then a second request
+  carries the op that was queued meanwhile, so "in sync" is never shown over a waiting
+  message. Cursors and outboxes are written per account, so one server's catch-up cannot
+  move or drain another's.
 - **The meter attributes bytes per server.** Each request is charged to the origin it goes to
   (the URL is the only place the server is visible at that layer). The month row is
   `meter:<origin>`, the tab counter is `brr-meter-session:<origin>`, and the headline totals
@@ -59,8 +65,9 @@ API of another origin.
   cookie to this API at all. Same-origin responses get no CORS headers, and only the two
   headers a real response needs are added cross-origin; the rest belong to the preflight.
 - **Removing a server** revokes its session first (one server's sign-out never touches
-  another's token), then deletes every key in that server's namespace and its meter row. If
-  the server cannot be reached, removal stops and asks again: only an explicit second
+  another's token), then deletes every key in that server's namespace: account, cursor,
+  outbox, event cache, range, meter row and the durable image bytes indexed to that account.
+  If the server cannot be reached, removal stops and asks again: only an explicit second
   confirmation deletes the local copy, because the token stays valid there until it expires.
 
 ## Consequences
@@ -72,14 +79,17 @@ API of another origin.
 - A cross-origin `/sync` costs one preflight per origin per `Access-Control-Max-Age` (a day).
   That request is invisible to page code, so the meter cannot count it (ADR 0018 already calls
   the meter an estimate). Same-origin traffic pays nothing new.
-- jsQR adds about 50 KB to the compressed shell, which is 57 KB of the 150 KB budget. It was
-  chosen over a hand-written decoder because Reed-Solomon repair and perspective correction
-  are exactly the part where a custom implementation fails on a real camera.
+- jsQR is its own 27 KB bundle (`/qr-scan.js`), loaded only when the Add-server panel opens,
+  so the first load is 36 KB and every file together is 63 KB of the 150 KB budget. The
+  service worker caches the scanner after its first use. It was chosen over a hand-written
+  decoder because Reed-Solomon repair and perspective correction are exactly the part where
+  a custom implementation fails on a real camera.
 - The service worker does not cache a second server's API. That is correct: API responses are
   never cached (ADR 0018's meter counts them), and stale sync data would be worse than a
   network read.
-- Media ids are local to one server, like every other id. The downloaded-image cache is keyed
-  by origin and id (ADR 0011), and an upload goes to the server whose composer chose the photo,
-  even if the user switches servers while it uploads.
+- Media ids are local to one server, like every other id. The in-memory image URLs are keyed
+  by origin and id, and the durable 50 MB LRU (ADR 0013) is owned by one account on one server,
+  so neither cache can show another server's picture. An upload goes to the server whose
+  composer chose the photo, even if the user switches servers while it uploads.
 - Two tabs still each keep their own month totals in memory; per-server rows do not change
   that. Cross-tab coordination remains out of scope.

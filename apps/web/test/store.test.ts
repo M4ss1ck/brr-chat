@@ -725,6 +725,8 @@ describe("store (IndexedDB)", () => {
     await applyEvents(aliceB, [{ tag: Tag.GroupMeta, seq: 10, ts: 1, author: 1, scope: 10, name: "B group", about: "", open: true }]);
     await setSession(B, { token: "b".repeat(32), username: "alice" });
     await setCursor(aliceB, 7);
+    await setMeter(B, { month: "2026-10", bytes: 99 });
+    await setRange(B, { min: 1, max: 1 });
 
     await removeServer(B);
     expect(await listServers()).toEqual([{ id: A, name: "a.example", addedAt: expect.any(Number), session: null, invite: null }]);
@@ -734,6 +736,9 @@ describe("store (IndexedDB)", () => {
     expect(await getSession(B)).toBeNull();
     expect(await getGroups(aliceB)).toEqual([]);
     expect(await getStoredCursor(aliceB)).toBeNull();
+    // The meter row and the cached range belong to the server and go with it.
+    expect(await getMeter(B)).toBeNull();
+    expect(await getRange(B)).toBeNull();
   });
 
   test("the single-server shell's session, cursor and cache move into the list", async () => {

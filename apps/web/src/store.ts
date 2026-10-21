@@ -20,8 +20,6 @@ import {
 import { isMonthKey } from "./month.ts";
 import { serverIdOf, serverLabel, type PendingInvite } from "./servers.ts";
 
-export type { PendingInvite } from "./servers.ts";
-
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
 const STORE = "kv";
@@ -264,7 +262,7 @@ export async function listServers(): Promise<StoredServer[]> {
   return [...(await readServers())].sort((a, b) => a.addedAt - b.addedAt || a.id.localeCompare(b.id));
 }
 
-export async function getServer(id: string): Promise<StoredServer | null> {
+async function getServer(id: string): Promise<StoredServer | null> {
   return (await readServers()).find((row) => row.id === id) ?? null;
 }
 
