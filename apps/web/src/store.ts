@@ -900,6 +900,10 @@ export async function applyEvents(account: AccountKey, events: Event[], options:
           });
         }
         break;
+      case Tag.DeleteAuthor:
+        // The marker names the account whose content went away; the delete events right
+        // after it carry the state. Nothing to cache here (an older client skips the tag).
+        break;
       default:
         // Unknown tags carry no state this slice can cache.
         break;
@@ -1375,6 +1379,8 @@ export function toWireOp(op: StoredOp): Op {
       };
     case Tag.Delete:
       return { cid, tag: Tag.Delete, scope: op.scope, target: op.target ?? 0 };
+    case Tag.DeleteAuthor:
+      return { cid, tag: Tag.DeleteAuthor, scope: op.scope, user: op.user ?? 0 };
     case Tag.Ban:
       return { cid, tag: Tag.Ban, scope: op.scope, user: op.user ?? 0, on: op.on === true };
     case Tag.Dm:

@@ -452,6 +452,26 @@ describe("store (IndexedDB)", () => {
     expect(await getReactions(alice, 10)).toEqual([]);
   });
 
+  test("a delete_author marker is inert and its delete events clear that author's cache", async () => {
+    await applyEvents(alice, [
+      { tag: Tag.Post, seq: 80, ts: 800, author: 1, scope: 10, text: "keep", media: null },
+      { tag: Tag.Post, seq: 81, ts: 801, author: 2, scope: 10, text: "purge me", media: null },
+      { tag: Tag.Reply, seq: 82, ts: 802, author: 2, scope: 10, parent: 80, text: "and me", media: null },
+      // The marker names the action but changes nothing by itself: an old client skips it.
+      { tag: Tag.DeleteAuthor, seq: 83, ts: 803, author: 1, scope: 10, user: 2 },
+    ]);
+    expect(await getPosts(alice, 10)).toHaveLength(3);
+
+    // These are the events every client already understands, old or new.
+    await applyEvents(alice, [
+      { tag: Tag.Delete, seq: 84, ts: 804, author: 1, scope: 10, target: 81 },
+      { tag: Tag.Delete, seq: 85, ts: 805, author: 1, scope: 10, target: 82 },
+    ]);
+    expect(await getPosts(alice, 10)).toEqual([
+      { seq: 80, ts: 800, author: 1, scope: 10, text: "keep", parent: 0, media: null },
+    ]);
+  });
+
   test("self is scoped to the account and rejected when it is not a positive uint", async () => {
     expect(await getSelf(alice)).toBeNull();
     await setSelf(alice, 7);
@@ -649,6 +669,16 @@ describe("store (IndexedDB)", () => {
     expect(toWireOp(remove)).toMatchObject({ tag: Tag.Delete, scope: 5, target: 9 });
     expect(toWireOp(ban)).toMatchObject({ tag: Tag.Ban, scope: 5, user: 2, on: true });
     expect(new Uint8Array(toWireOp(ban).cid)).toEqual(new Uint8Array(ban.cid));
+  });
+
+  test("the outbox round-trips a bulk delete", async () => {
+    const bulk = await enqueueOp(alice, { tag: Tag.DeleteAuthor, scope: 5, user: 2 });
+    expect(toWireOp(bulk)).toEqual({
+      cid: new Uint8Array(bulk.cid),
+      tag: Tag.DeleteAuthor,
+      scope: 5,
+      user: 2,
+    });
   });
 
   test("the month total round-trips and a corrupt row reads back as absent", async () => {

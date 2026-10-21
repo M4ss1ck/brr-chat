@@ -27,6 +27,11 @@ changing the v1 wire format (ADR 0004).
   ownership (sending a `membership` op with `role = 3` promotes the target to owner and demotes
   the previous owner to group admin in the same transaction; the target's owner event is written
   first, then the old owner's admin event, so a commit that sees either sees both).
+- Bulk delete: a group admin or the owner can remove every post and reply one account wrote in
+  the group with one `delete_author` op (tag 15). The server logs the marker, then one `delete`
+  event per affected post or reply. Like the single `delete` op, this is content moderation, so
+  the target's role does not change the rule. The marker is a compatible addition, so old clients
+  skip it and apply the deletes they already understand; no version bump.
 - Auto-succession: if a group's owner is banned server-wide (or leaves without transferring),
   ownership passes automatically to the longest-serving group admin; if the group has no group
   admins, ownership falls back to a server admin. A server ban removes every group membership

@@ -37,6 +37,14 @@ const everyEvent: Event[] = [
   { ...h(12), author: 0, tag: Tag.Gap, after: 12, before: 900, count: 340 },
 ];
 
+// Tag 15 is newer than the frozen every-event fixture, which must not change. The marker is
+// what an old client skips; the deletes right after it are what every client applies.
+const bulkDeleteEvents: Event[] = [
+  { ...h(30), tag: Tag.DeleteAuthor, user: 66 },
+  { ...h(31), tag: Tag.Delete, target: 4 },
+  { ...h(32), tag: Tag.Delete, target: 6 },
+];
+
 export const fixtures: Record<string, Uint8Array> = {
   "sync-request-empty": encodeSyncRequest({ v: 1, cursor: 0, outbox: [] }),
   "sync-request-outbox": encodeSyncRequest({
@@ -67,6 +75,14 @@ export const fixtures: Record<string, Uint8Array> = {
     cursor: 22,
     more: false,
     events: dmEvents,
+    acks: [],
+    skipped: 0,
+  }),
+  "sync-response-delete-author": encodeSyncResponse({
+    range: SUPPORTED,
+    cursor: 32,
+    more: false,
+    events: bulkDeleteEvents,
     acks: [],
     skipped: 0,
   }),

@@ -17,7 +17,7 @@ backwards, and only they can grow without bound while a device is offline.
 - A gap covers **post, reply, DM and reaction** events only: `GAP_COVERED_TAGS` in
   `packages/protocol`, shared by server and client.
 - Every other event is delivered however old it is: profile, group metadata, membership, ban,
-  delete, `scope_left`, `dm_scope` and the viewer's own block events.
+  delete, bulk-delete marker, `scope_left`, `dm_scope` and the viewer's own block events.
 - For a scope that passed the threshold, the server sends its newest 100 gap-covered events and
   one `gap` marker. `after` is the cursor the catch-up started from, `before` is the seq of the
   first gap-covered event still sent, and `count` is the number of covered events in
