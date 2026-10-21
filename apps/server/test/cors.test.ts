@@ -43,6 +43,28 @@ describe("cross-origin client", () => {
     }
   });
 
+  test("a preflight for a dictionary-negotiated /sync allows the dictionary headers", async () => {
+    const app = await newApp();
+    try {
+      const res = await app.fetch(
+        new Request("http://chat.local/sync", {
+          method: "OPTIONS",
+          headers: {
+            Origin: CLIENT_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,available-dictionary,dictionary-id",
+          },
+        }),
+      );
+      expect(res.status).toBe(204);
+      const allowed = res.headers.get("access-control-allow-headers")?.toLowerCase() ?? "";
+      // A missing header here fails the whole cross-origin sync, not just the compression.
+      for (const header of ["available-dictionary", "dictionary-id"]) expect(allowed).toContain(header);
+    } finally {
+      app.close();
+    }
+  });
+
   test("sign-up from another origin works, carries CORS, and sets no cookie", async () => {
     const app = await newApp();
     try {
