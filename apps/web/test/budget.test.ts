@@ -10,7 +10,9 @@ import { relative, resolve } from "node:path";
 const WEB_ROOT = resolve(import.meta.dir, "..");
 const DIST = resolve(WEB_ROOT, "dist");
 const EMBEDDED = resolve(WEB_ROOT, "..", "server", "src", "pwa-assets.generated.ts");
-const SHELL_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icon.svg", "qr-scan.js"] as const;
+const SHELL_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icon.svg", "qr-scan.js", "passkey.js"] as const;
+/** Fetched on demand, never at install, so it does not affect first load (ADR 0014, 0021). */
+const LAZY_FILES = ["qr-scan.js", "passkey.js"] as const;
 
 function buildShell(): void {
   const proc = Bun.spawnSync({ cmd: [process.execPath, "scripts/build.ts"], cwd: WEB_ROOT, stdout: "pipe", stderr: "pipe" });
@@ -38,14 +40,33 @@ describe("app shell budget", () => {
 
   test("the shell stays at or below 150 KB compressed", () => {
     let total = 0;
+    let firstLoad = 0;
     for (const file of SHELL_FILES) {
       const body = readFileSync(resolve(DIST, file));
       const compressed = brotliCompressSync(body).length;
       total += compressed;
+      if (!(LAZY_FILES as readonly string[]).includes(file)) firstLoad += compressed;
       console.log(`app shell ${file}: ${body.byteLength} B raw, ${compressed} B brotli`);
     }
-    console.log(`app shell compressed: ${total} B of ${APP_SHELL_BUDGET} B budget`);
+    console.log(`app shell first load: ${firstLoad} B, all files: ${total} B of ${APP_SHELL_BUDGET} B budget`);
+    // A lazy chunk is only paid for by the person who uses that screen; the gate still
+    // counts every file, as it does for the QR scanner (ADR 0014, ADR 0021).
+    expect(firstLoad).toBeLessThanOrEqual(total);
     expect(total).toBeLessThanOrEqual(APP_SHELL_BUDGET);
+  });
+
+  test("the WebAuthn library is in its lazy chunk, not in the first load", () => {
+    const app = readFileSync(resolve(DIST, "app.js"), "utf8");
+    expect(app).not.toContain("startRegistration");
+    expect(app).not.toContain("navigator.credentials");
+    expect(app).toContain("/passkey.js");
+
+    const chunk = readFileSync(resolve(DIST, "passkey.js"), "utf8");
+    expect(chunk).toContain("navigator.credentials");
+
+    // The worker caches a lazy chunk on first use but must not precache it at install.
+    const sw = readFileSync(resolve(DIST, "sw.js"), "utf8");
+    for (const file of LAZY_FILES) expect(sw).toContain(JSON.stringify(`/${file}`));
   });
 
   test("the document loads the bundle, the manifest and the service worker", () => {

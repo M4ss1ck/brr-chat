@@ -66,6 +66,15 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
   const host = opts.host ?? "localhost";
   const baseURL = opts.baseURL ?? `http://${host.replace(/^https?:\/\//i, "")}`;
   const secret = resolveSecret(opts.secret, dbPath);
+  // The origin a browser sees, which is what WebAuthn is bound to. The listener address can
+  // differ behind a TLS proxy, so CORS uses this instead of the request URL (ADR 0021).
+  const appOrigin = (() => {
+    try {
+      return new URL(baseURL).origin;
+    } catch {
+      return `http://${host.replace(/^https?:\/\//i, "")}`;
+    }
+  })();
 
   const db = openDb(dbPath);
   const auth = await initAuth(db, {
@@ -128,7 +137,7 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     auth,
     async fetch(req: Request, ip?: string): Promise<Response> {
       if (isPreflight(req)) return preflightResponse();
-      return withCors(req, await route(req, ip));
+      return withCors(req, await route(req, ip), appOrigin);
     },
     close(): void {
       db.close();

@@ -12,12 +12,27 @@ export const CONFIRM_PATH = "/api/recovery/confirm";
 export const REGENERATE_PATH = "/api/recovery/regenerate";
 export const REDEEM_PATH = "/api/recovery/redeem";
 export const STATUS_PATH = "/api/recovery/status";
+export const PASSKEY_REGISTER_OPTIONS_PATH = "/api/auth/passkey/generate-register-options";
+export const PASSKEY_REGISTER_PATH = "/api/auth/passkey/verify-registration";
+export const PASSKEY_SIGN_IN_OPTIONS_PATH = "/api/auth/passkey/generate-authenticate-options";
+export const PASSKEY_SIGN_IN_PATH = "/api/auth/passkey/verify-authentication";
 
 interface AuthPayload {
   token?: unknown;
   user?: { username?: unknown } | null;
+  session?: { token?: unknown } | null;
   recoveryCode?: unknown;
   error?: unknown;
+  message?: unknown;
+}
+
+/**
+ * The browser half of a WebAuthn ceremony (src/passkey.ts), passed in so the network side is
+ * testable without a browser and so the library stays in a lazy bundle.
+ */
+export interface PasskeyCeremony {
+  createCredential(options: unknown): Promise<unknown>;
+  getCredential(options: unknown): Promise<unknown>;
 }
 
 interface Exchange {
@@ -56,6 +71,14 @@ async function postJson(
 function failure(res: Response, payload: AuthPayload | null, path: string): Error {
   const detail = typeof payload?.error === "string" && payload.error.length > 0 ? payload.error : `status ${res.status}`;
   return new Error(`${path}: ${detail}`);
+}
+
+/** Passkey errors are `{ code, message }`, unlike the older endpoints' `{ error }`. */
+function passkeyFailure(res: Response, payload: AuthPayload | null, path: string): Error {
+  if (!res.ok && typeof payload?.message === "string" && payload.message.length > 0) {
+    return new Error(`${path}: ${payload.message}`);
+  }
+  return failure(res, payload, path);
 }
 
 function codeFrom(payload: AuthPayload | null, res: Response, path: string): string {
@@ -113,6 +136,64 @@ async function recoveryConfirmed(base: string, token: string): Promise<boolean> 
   if (!res?.ok) return true;
   const payload = (await res.json().catch(() => null)) as { confirmed?: unknown } | null;
   return payload?.confirmed !== false;
+}
+
+/**
+ * The browser's JSON response carries `clientExtensionResults`, which the server does not
+ * need; dropping it keeps the request to what the WebAuthn response itself says.
+ */
+function credentialJson(credential: unknown): unknown {
+  if (typeof credential !== "object" || credential === null) return credential;
+  const { clientExtensionResults: _ignored, ...response } = credential as Record<string, unknown>;
+  return response;
+}
+
+async function passkeyOptions(base: string, path: string, token?: string): Promise<unknown> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (token !== undefined) headers.Authorization = bearerHeader(token);
+  const res = await meteredFetch(`${base}${path}`, { headers });
+  const payload = (await res.json().catch(() => null)) as AuthPayload | null;
+  if (!res.ok) throw passkeyFailure(res, payload, path);
+  if (payload === null) throw new Error(`${path}: the server returned no options`);
+  return payload;
+}
+
+/**
+ * Add a passkey to the signed-in account (#19). The prompt names the username because the
+ * server rewrites the plugin's placeholder-email label before the browser sees it.
+ */
+export async function registerPasskey(base: string, ceremony: PasskeyCeremony): Promise<void> {
+  const session = await getSession(serverOf(base));
+  if (!session) throw new Error("Sign in first.");
+  const options = await passkeyOptions(base, PASSKEY_REGISTER_OPTIONS_PATH, session.token);
+  const credential = await ceremony.createCredential(options);
+  const { res, payload } = await postJson(
+    base,
+    PASSKEY_REGISTER_PATH,
+    { response: credentialJson(credential), name: "Passkey" },
+    session.token,
+  );
+  if (!res.ok) throw passkeyFailure(res, payload, PASSKEY_REGISTER_PATH);
+}
+
+/**
+ * Sign in with a passkey on this server. The authenticator chooses the account, so there is
+ * no username field; the session comes back in the response because this client holds a bare
+ * bearer token, not a cookie (ADR 0007, ADR 0021).
+ */
+export async function signInWithPasskey(base: string, ceremony: PasskeyCeremony): Promise<Account> {
+  const options = await passkeyOptions(base, PASSKEY_SIGN_IN_OPTIONS_PATH);
+  const credential = await ceremony.getCredential(options);
+  const { res, payload } = await postJson(base, PASSKEY_SIGN_IN_PATH, { response: credentialJson(credential) });
+  if (!res.ok) throw passkeyFailure(res, payload, PASSKEY_SIGN_IN_PATH);
+  const token = typeof payload?.session?.token === "string" ? payload.session.token : "";
+  const username = typeof payload?.user?.username === "string" ? payload.user.username : "";
+  if (token.length === 0) throw new Error(`${PASSKEY_SIGN_IN_PATH}: the server returned no session token`);
+  if (username.length === 0) throw new Error(`${PASSKEY_SIGN_IN_PATH}: the server returned no username`);
+  const session: Session = { token, username };
+  // A signup that never finished can also have a passkey. Keep the type-back in front of it.
+  if (!(await recoveryConfirmed(base, token))) session.recoveryPending = true;
+  return remember(serverOf(base), session);
 }
 
 /** Finish signup by typing back the last group of the code (ADR 0006). */

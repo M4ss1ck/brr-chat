@@ -38,6 +38,11 @@ account, cursor and cached messages stay separate; **Sync** catches up every sig
 Signup shows one recovery code, once, and will not finish until its last group is typed back.
 Keep it: there is no email recovery and no admin reset (ADR 0006).
 
+A signed-in account can add a passkey and then sign in with the device's screen lock or a
+security key, no username needed (ADR 0021). The WebAuthn browser library is a separate
+`/passkey.js` chunk, fetched only when a passkey button is pressed, so the first load does not
+pay for it.
+
 The first account on a fresh server is its **server admin** (ADR 0017). That account sees a
 "Server administration" panel: registration mode (open / invite / closed), an emergency freeze
 switch, the server invite link for `invite` mode (`/signup/<token>`), and every account

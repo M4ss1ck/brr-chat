@@ -58,6 +58,7 @@ describe("embedded PWA shell", () => {
         "/manifest.webmanifest": { contentType: "application/manifest+json", cacheControl: "max-age=3600" },
         "/icon.svg": { contentType: "image/svg+xml", cacheControl: "max-age=86400" },
         "/qr-scan.js": { contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
+        "/passkey.js": { contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
       };
 
       expect(shellPaths()).toEqual(Object.keys(expected));

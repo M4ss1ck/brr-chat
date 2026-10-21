@@ -61,9 +61,11 @@ API of another origin.
   Authentication is the bare bearer token (ADR 0007), so `*` grants no ambient authority: a
   request without the token is still a 401. Two supporting decisions keep that true:
   `trustedOrigins` is `["*"]` (BetterAuth's origin check cannot know A's origin in advance),
-  and the server strips the session cookie BetterAuth would set, so no browser carries a
-  cookie to this API at all. Same-origin responses get no CORS headers, and only the two
-  headers a real response needs are added cross-origin; the rest belong to the preflight.
+  and the server strips the session cookie BetterAuth would set, so no browser carries an
+  identity cookie to this API at all. The one exception is the identity-less WebAuthn
+  challenge cookie on a same-origin passkey ceremony (ADR 0021). Same-origin responses get no
+  CORS headers, and only the two headers a real response needs are added cross-origin; the
+  rest belong to the preflight.
 - **Removing a server** revokes its session first (one server's sign-out never touches
   another's token), then deletes every key in that server's namespace: account, cursor,
   outbox, event cache, range, meter row and the durable image bytes indexed to that account.

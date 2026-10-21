@@ -13,7 +13,17 @@ import {
   type ServerSettings,
   type ServerUser,
 } from "./admin.ts";
-import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
+import {
+  confirmRecovery,
+  redeemRecovery,
+  regenerateRecovery,
+  registerPasskey,
+  signIn,
+  signInWithPasskey,
+  signOut,
+  signUp,
+  type PasskeyCeremony,
+} from "./auth.ts";
 import { watchOnline } from "./connectivity.ts";
 import { advanceGaps, loadHistory } from "./history.ts";
 import { identicon } from "./identicon.ts";
@@ -21,7 +31,7 @@ import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invit
 import { clearMediaCache, mediaView, MediaUploadError, prepareImage, uploadImage } from "./media.ts";
 import { forgetServerMeter, formatBytes, meter, migrateLegacyMeterSession, type MeterTotals } from "./meter.ts";
 import { qrSvg } from "./qr.ts";
-import { parseServerLink, serverLabel } from "./servers.ts";
+import { parseServerLink, serverIdOf, serverLabel } from "./servers.ts";
 import { drainOutbox, SyncHttpError } from "./sync.ts";
 import { createSyncQueue } from "./sync-queue.ts";
 import {
@@ -109,25 +119,42 @@ let switchQueue: Promise<void> = Promise.resolve();
 /** Camera preview for the in-app QR reader, when one is running. */
 let camera: MediaStream | null = null;
 let cameraTimer: ReturnType<typeof setTimeout> | null = null;
+/** A bundle fetched on first use; a failed load is retried on the next tap. */
+function loadOnce<T>(load: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | null = null;
+  return () => {
+    if (pending === null) pending = load();
+    return pending.catch((err: unknown) => {
+      pending = null;
+      throw err;
+    });
+  };
+}
+
 /** The QR scanner is a separate bundle, so a user who never adds a server never pays for it. */
 interface QrScanner {
   decodeQrFile(file: Blob): Promise<string | null>;
   decodeQrFrame(video: HTMLVideoElement): string | null;
 }
-let qrScanner: Promise<QrScanner> | null = null;
 
-function loadQrScanner(): Promise<QrScanner> {
-  if (qrScanner === null) {
-    // A computed specifier: the bundler must not inline jsQR into the app shell.
-    const url = new URL("/qr-scan.js", location.href).href;
-    qrScanner = import(url) as Promise<QrScanner>;
-  }
-  return qrScanner.catch((err: unknown) => {
-    qrScanner = null;
-    throw err;
-  });
+// A computed specifier keeps both libraries out of the app shell (ADR 0014).
+const loadQrScanner = loadOnce<QrScanner>(() => import(new URL("/qr-scan.js", location.href).href) as Promise<QrScanner>);
+
+/** The lazy WebAuthn bundle, built separately so a password user never downloads it. */
+const loadPasskeyCeremony = loadOnce<PasskeyCeremony>(
+  () => import(new URL("/passkey.js", location.href).href) as Promise<PasskeyCeremony>,
+);
+
+/**
+ * WebAuthn is bound to the origin that runs the ceremony, so passkeys work only on the server
+ * that served this app. A second server added to the list is reached cross-origin and cannot
+ * show its own prompt (#18).
+ */
+function passkeysAvailable(): boolean {
+  if (typeof window === "undefined" || typeof location === "undefined") return false;
+  if (activeServerId === null || activeServerId !== serverIdOf(location.origin)) return false;
+  return window.isSecureContext === true && typeof window.PublicKeyCredential !== "undefined";
 }
-
 
 function historyKey(account: Account, scope: number): string {
   return `${accountKey(account)}:${scope}`;
@@ -310,6 +337,8 @@ async function refresh(): Promise<void> {
   show("signed-out", session === null);
   show("signed-in", session !== null && !pending);
   show("confirm-panel", pending);
+  show("passkey-sign-in", session === null && passkeysAvailable());
+  show("passkey-panel", session !== null && !pending && passkeysAvailable());
   if (session === null || pending) show("empty", false);
   setText("account", session ? accountLabel(session) : "");
   setText("session", session ? "32-char bearer token, held on this device only" : "");
@@ -1879,6 +1908,53 @@ async function leave(): Promise<void> {
   await refresh();
 }
 
+/** A cancelled prompt is a normal outcome, not an error to debug. */
+function passkeyFailure(err: unknown, action: "add" | "signin"): string {
+  const name = typeof err === "object" && err !== null && "name" in err ? String((err as { name: unknown }).name) : "";
+  if (name === "NotAllowedError") {
+    return action === "add"
+      ? "Passkey not added. The prompt was cancelled or timed out."
+      : "No passkey was used. Cancel the prompt, or add a passkey from a signed-in device first.";
+  }
+  if (name === "InvalidStateError") return "This device already has a passkey for this account.";
+  if (name === "SecurityError") return "Passkeys need a secure connection: https, or localhost.";
+  // BetterAuth asks for a sign-in from the last day before a new credential may be added.
+  if (err instanceof Error && /fresh/i.test(err.message)) {
+    return "Sign out and back in, then add the passkey: adding one needs a recent sign-in.";
+  }
+  return err instanceof Error ? err.message : action === "add" ? "Could not add a passkey." : "Could not sign in with a passkey.";
+}
+
+async function addPasskey(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) {
+    message("Add a server first.");
+    return;
+  }
+  try {
+    await registerPasskey(server, await loadPasskeyCeremony());
+    message("Passkey added. Next time, sign in with it instead of the password.");
+  } catch (err) {
+    message(passkeyFailure(err, "add"));
+  }
+}
+
+async function passkeySignIn(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) {
+    message("Add a server first.");
+    return;
+  }
+  try {
+    const session = await signInWithPasskey(server, await loadPasskeyCeremony());
+    message(`Signed in as ${session.username}.`);
+  } catch (err) {
+    message(passkeyFailure(err, "signin"));
+    return;
+  }
+  await afterAuth();
+}
+
 function toggleRecovery(): void {
   const panel = el("recover-panel");
   if (panel) panel.hidden = !panel.hidden;
@@ -1887,6 +1963,8 @@ function toggleRecovery(): void {
 function wire(): void {
   el<HTMLButtonElement>("sign-up")?.addEventListener("click", () => void submit("up"));
   el<HTMLButtonElement>("sign-in")?.addEventListener("click", () => void submit("in"));
+  el<HTMLButtonElement>("passkey-sign-in")?.addEventListener("click", () => void passkeySignIn());
+  el<HTMLButtonElement>("passkey-add")?.addEventListener("click", () => void addPasskey());
   el<HTMLButtonElement>("sign-out")?.addEventListener("click", () => void leave());
   el<HTMLButtonElement>("sync")?.addEventListener("click", () => void syncAll());
   el<HTMLSelectElement>("server-select")?.addEventListener("change", (event) => {

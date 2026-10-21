@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { passkey } from "@better-auth/passkey";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { createAuthMiddleware } from "better-auth/api";
 import { getMigrations } from "better-auth/db/migration";
@@ -40,7 +41,16 @@ export async function initAuth(db: Database, opts: AuthInitOptions) {
       expiresIn: 30 * 24 * 60 * 60,
       updateAge: 24 * 60 * 60,
     },
-    plugins: [username(), bearer(), admin()],
+    plugins: [
+      username(),
+      bearer(),
+      admin(),
+      // Passkeys are username-less on the way in: the authenticator picks the credential.
+      // The browser ceremony is the WebAuthn part; this server only stores the public key.
+      // A discoverable credential is required: without one the sign-in prompt has no account
+      // to offer, because this client sends no username and no allowCredentials list.
+      passkey({ rpName: "brr chat", authenticatorSelection: { residentKey: "required" } }),
+    ],
     hooks: {
       before: createAuthMiddleware(async (ctx) => {
         if (ctx.path !== "/sign-up/email") return;
@@ -66,6 +76,21 @@ export async function initAuth(db: Database, opts: AuthInitOptions) {
             body: nextBody,
           },
         };
+      }),
+      // The plugin builds the passkey prompt from `session.user.email`, and this server stores
+      // a placeholder address of the shape `<username>@<host>.invalid` because accounts have
+      // no email (ADR 0006). Rewrite the options so the prompt names the account instead.
+      after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/passkey/generate-register-options") return;
+        const username = (ctx.context.session?.user as { username?: unknown } | undefined)?.username;
+        if (typeof username !== "string" || username.length === 0) return;
+        const options = ctx.context.returned as
+          | { user?: { name?: string; displayName?: string } }
+          | undefined;
+        if (options?.user) {
+          options.user.name = username;
+          options.user.displayName = username;
+        }
       }),
     },
     databaseHooks: {

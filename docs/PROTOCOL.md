@@ -14,7 +14,7 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
 | Empty sync payload (request + response) | 1 KB | 19 B |
 | 100 text posts in one response, uncompressed | 20 KB | 13,859 B (17.1 B/post framing) |
 | Image placeholder (whole media field) | 40 B | 39 B worst case |
-| App shell, compressed | 150 KB | 63,194 B total; 35,959 B first load (the QR reader is on demand) |
+| App shell, compressed | 150 KB | 66,456 B total; 36,821 B first load (the QR reader and passkey prompt are on demand) |
 
 ## Transport
 
