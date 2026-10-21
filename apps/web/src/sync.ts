@@ -10,6 +10,7 @@ import {
   type VersionRange,
 } from "@brr-chat/protocol";
 import { bearerHeader } from "./auth.ts";
+import { meteredFetch } from "./meter.ts";
 import { applyEvents, getCursor, setCursor, setRange } from "./store.ts";
 
 export const SYNC_PATH = "/sync";
@@ -28,7 +29,7 @@ export function buildSyncRequest(cursor: number, outbox: Op[] = [], v: number = 
 
 /** One request as it goes on the wire. Throws on any non-200, including 401. */
 export async function postSyncRequest(base: string, token: string, body: Uint8Array): Promise<SyncResponse> {
-  const res = await fetch(`${base}${SYNC_PATH}`, {
+  const res = await meteredFetch(`${base}${SYNC_PATH}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/cbor",

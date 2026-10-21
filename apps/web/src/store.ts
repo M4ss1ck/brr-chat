@@ -2,6 +2,7 @@
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
 import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Op, type VersionRange } from "@brr-chat/protocol";
+import { isMonthKey } from "./month.ts";
 
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
@@ -9,6 +10,7 @@ const STORE = "kv";
 
 const KEY_SESSION = "session";
 const KEY_RANGE = "range";
+const KEY_METER = "meter";
 
 const postsKey = (username: string, scope: number): string => `posts:${username}:${scope}`;
 const membersKey = (username: string, scope: number): string => `members:${username}:${scope}`;
@@ -20,6 +22,12 @@ const groupsKey = (username: string): string => `groups:${username}`;
 const dmsKey = (username: string): string => `dms:${username}`;
 const profilesKey = (username: string): string => `profiles:${username}`;
 const selfKey = (username: string): string => `self:${username}`;
+
+/** One calendar month of metered traffic. The month is the device's local `YYYY-MM`. */
+export interface StoredMeter {
+  month: string;
+  bytes: number;
+}
 
 export interface Session {
   /** Bare 32-char session token (ADR 0007). */
@@ -144,6 +152,13 @@ function asRange(value: unknown): VersionRange | null {
   return { min: row.min, max: row.max };
 }
 
+function asMeter(value: unknown): StoredMeter | null {
+  const row = asObject(value);
+  if (!isMonthKey(row.month)) return null;
+  if (!isUint(row.bytes)) return null;
+  return { month: row.month, bytes: row.bytes };
+}
+
 function assertCursor(value: number): void {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new RangeError("cursor: expected a safe uint");
@@ -189,6 +204,22 @@ export async function getRange(): Promise<VersionRange | null> {
 
 export async function setRange(range: VersionRange): Promise<void> {
   await write(KEY_RANGE, range);
+}
+
+// ---- data meter ----
+//
+// Only the month is stored. The session counter starts at zero on every page load, which is
+// what "this session" means; the month survives reloads (ADR 0018).
+
+/** Last stored month total, or null when this device has never metered a request. */
+export async function getMeter(): Promise<StoredMeter | null> {
+  return asMeter(await read(KEY_METER));
+}
+
+export async function setMeter(meter: StoredMeter): Promise<void> {
+  if (!isMonthKey(meter.month)) throw new RangeError("meter: expected a YYYY-MM month");
+  if (!isUint(meter.bytes)) throw new RangeError("meter: expected a safe uint");
+  await write(KEY_METER, meter);
 }
 
 // ---- groups, posts, members, profiles ----

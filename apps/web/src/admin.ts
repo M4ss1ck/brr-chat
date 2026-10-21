@@ -1,6 +1,7 @@
 // Server administration over JSON (ADR 0012, ADR 0017). The PWA only shows this panel to a
 // server admin; every route is enforced server-side, so hiding it is convenience, not access.
 import { bearerHeader } from "./auth.ts";
+import { meteredFetch } from "./meter.ts";
 
 export type RegistrationMode = "open" | "invite" | "closed";
 
@@ -68,7 +69,7 @@ async function request(
   const headers: Record<string, string> = { Accept: "application/json" };
   if (token !== undefined) headers.Authorization = bearerHeader(token);
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(`${base}${path}`, {
+  const res = await meteredFetch(`${base}${path}`, {
     method,
     headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -136,7 +137,7 @@ export async function getServerUsers(base: string, token: string): Promise<Serve
 
 /** Public registration state for the sign-in screen; no session needed. */
 export async function getRegistration(base: string): Promise<RegistrationState | null> {
-  const res = await fetch(`${base}/api/server/registration`, { headers: { Accept: "application/json" } }).catch(() => null);
+  const res = await meteredFetch(`${base}/api/server/registration`, { headers: { Accept: "application/json" } }).catch(() => null);
   if (!res?.ok) return null;
   const payload = (await res.json().catch(() => null)) as ServerPayload | null;
   const mode = asMode(payload?.mode);

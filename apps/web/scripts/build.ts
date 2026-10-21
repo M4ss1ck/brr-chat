@@ -60,6 +60,17 @@ body {
   color: #f2efe6;
   font: 1rem/1.45 system-ui, sans-serif;
 }
+/* The data meter is always on screen: sticky, above the content, never inside a signed-in
+   panel, so a signed-out visitor still sees what this device has spent. */
+#meter {
+  position: sticky; top: 0; z-index: 1;
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: .25rem .75rem;
+  margin: -.35rem 0 .9rem; padding: .45rem .15rem;
+  background: #10100e; border-bottom: 1px solid #2f2e25;
+  font-size: .78rem; color: #a9a49a;
+}
+#meter span { display: flex; align-items: baseline; gap: .3rem; }
+#meter strong { color: #d8c56a; font: 600 .82rem/1.2 ui-monospace, monospace; }
 h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
 h2 { font-size: 1.1rem; margin: 1.25rem 0 .25rem; }
 p { margin: .25rem 0; }
@@ -126,6 +137,11 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 </head>
 <body>
 <main>
+  <section id="meter" aria-label="Data usage">
+    <span>This session <strong id="meter-session">0 B</strong></span>
+    <span>This month <strong id="meter-month">0 B</strong></span>
+  </section>
+
   <section id="signed-out" hidden>
     <h1>brr chat</h1>
     <p>One username, no email. Groups and DMs only.</p>

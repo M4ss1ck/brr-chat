@@ -1,6 +1,7 @@
 // Invite links (ADR 0010, ADR 0016). The server owns the token; the client only shows it,
 // rotates it, or resolves a link before sending a membership op with that token.
 import { bearerHeader } from "./auth.ts";
+import { meteredFetch } from "./meter.ts";
 
 export const INVITE_PREFIX = "/api/invites/";
 
@@ -40,7 +41,7 @@ async function request(
   token: string,
   method: "GET" | "POST",
 ): Promise<{ res: Response; payload: InvitePayload | null }> {
-  const res = await fetch(`${base}${path}`, {
+  const res = await meteredFetch(`${base}${path}`, {
     method,
     headers: { Accept: "application/json", Authorization: bearerHeader(token) },
   });

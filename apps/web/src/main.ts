@@ -16,6 +16,7 @@ import {
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
+import { formatBytes, meter, type MeterTotals } from "./meter.ts";
 import { qrSvg } from "./qr.ts";
 import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import {
@@ -95,6 +96,19 @@ function el<T extends HTMLElement>(id: string): T | null {
 function setText(id: string, text: string): void {
   const node = el(id);
   if (node) node.textContent = text;
+}
+
+/** The always-visible meter: this page session and this device's calendar month. */
+function paintMeter(totals: MeterTotals): void {
+  setText("meter-session", formatBytes(totals.sessionBytes));
+  setText("meter-month", formatBytes(totals.monthBytes));
+}
+
+/** Re-reads storage and rolls the local month; never blocks a request or a paint. */
+function refreshMeter(): void {
+  void meter.load().catch(() => {
+    // A meter that cannot read storage still counts this session in memory.
+  });
 }
 
 function show(id: string, visible: boolean): void {
@@ -1230,9 +1244,29 @@ function wire(): void {
   el<HTMLButtonElement>("copy-server-invite")?.addEventListener("click", () => void copyServerInvite());
 }
 
+/** Rolls the meter at the local month boundary even when the app sits open with no traffic. */
+function watchMeterRollover(): void {
+  const now = new Date();
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  // At most a day at a time: 31 days overflow a browser timer.
+  const delay = Math.min(nextMonth.getTime() - now.getTime() + 1000, 24 * 60 * 60 * 1000);
+  setTimeout(() => {
+    refreshMeter();
+    watchMeterRollover();
+  }, Math.max(delay, 1000));
+}
+
 function boot(): void {
   if (typeof document === "undefined") return;
   wire();
+  // Painted before any request so the meter is on screen signed-in or signed-out, and read
+  // before the first sync so the month's stored total is already counted.
+  meter.subscribe(paintMeter);
+  refreshMeter();
+  watchMeterRollover();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshMeter();
+  });
   if ("serviceWorker" in navigator) {
     void navigator.serviceWorker.register("/sw.js").catch(() => {
       // Without a service worker the app still works, it just refetches the shell.
