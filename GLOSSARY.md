@@ -33,7 +33,8 @@
 - **Op**: a client's request to create an event, carrying a **cid**.
 - **cid**: 8 random bytes chosen by the device for an op, so retries never duplicate.
 - **Ack**: the server's answer for one op, either the seq created or an error.
-- **Gap**: a marker for events the server deliberately didn't send. Filled on request.
+- **Gap**: a marker for **messages and reactions** the server deliberately didn't send. Filled
+  on request; control events (membership, bans, deletes, metadata) are never gapped (ADR 0019).
 - **History**: older events in one scope, fetched only when the user asks.
 - **Data meter**: the always-visible count of bytes this tab session and this device's calendar
   month. Every app request goes through it; both survive reloads, and the session ends when the

@@ -1,6 +1,7 @@
 # 0009. No history by default; gaps instead of floods
 
-Status: accepted (2026-10-09)
+Status: accepted (2026-10-09). Amended by ADR 0019 (a gap covers messages and reactions, never
+control events).
 
 ## Decision
 - A fresh device, or a newly joined group or DM, gets current state and a cursor at the head of

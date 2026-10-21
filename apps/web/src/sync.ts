@@ -4,6 +4,7 @@ import {
   PROTOCOL_VERSION,
   decodeSyncResponse,
   encodeSyncRequest,
+  type Event,
   type Op,
   type ResponseError,
   type SyncResponse,
@@ -56,9 +57,12 @@ export function classifySyncResponse(response: SyncResponse): SyncOutcome {
 }
 
 /**
- * Syncs from the stored cursor, caches the server range either way, and advances the stored
- * cursor only for an in-range response. Events are applied before the cursor moves, so a
- * failed IndexedDB write cannot strand them behind an advanced cursor.
+ * Syncs from the stored cursor until `more` is false, caching the server range and applying
+ * each page before its cursor moves. Pages after the first send an empty outbox: the server
+ * already acked every op in the first request, and resending them would only cost bytes.
+ *
+ * The returned response is the whole catch-up: final cursor, every ack, and the events from
+ * every page, so callers keep talking to one response.
  */
 export async function syncAndPersist(
   base: string,
@@ -66,13 +70,35 @@ export async function syncAndPersist(
   username: string,
   outbox: Op[] = [],
 ): Promise<SyncOutcome> {
-  const cursor = await getCursor(username);
-  const response = await postSyncRequest(base, token, buildSyncRequest(cursor, outbox));
-  await setRange(response.range);
-  const outcome = classifySyncResponse(response);
-  if (outcome.kind === "ok") {
+  let cursor = await getCursor(username);
+  let pending = outbox;
+  const events: Event[] = [];
+  const acks: SyncResponse["acks"] = [];
+  let skipped = 0;
+
+  for (;;) {
+    const response = await postSyncRequest(base, token, buildSyncRequest(cursor, pending));
+    await setRange(response.range);
+    const outcome = classifySyncResponse(response);
+    if (outcome.kind === "upgrade") return outcome;
+
     await applyEvents(username, response.events);
-    await setCursor(username, response.cursor);
+    const previous = cursor;
+    cursor = response.cursor;
+    // Events first, cursor second: a failed IndexedDB write cannot strand them behind it.
+    await setCursor(username, cursor);
+    events.push(...response.events);
+    acks.push(...response.acks);
+    skipped += response.skipped;
+
+    const whole: SyncResponse = { ...response, cursor, events, acks, skipped };
+    if (!response.more) return { kind: "ok", response: whole };
+
+    // No progress with more to come would loop forever. Fail loudly instead of claiming
+    // "in sync" while still behind.
+    if (cursor <= previous) {
+      throw new Error("sync stalled: the server said more without advancing the cursor");
+    }
+    pending = [];
   }
-  return outcome;
 }

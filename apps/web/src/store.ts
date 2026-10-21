@@ -20,6 +20,7 @@ const outboxKey = (username: string): string => `outbox:${username}`;
 const cursorKey = (username: string): string => `cursor:${username}`;
 const groupsKey = (username: string): string => `groups:${username}`;
 const dmsKey = (username: string): string => `dms:${username}`;
+const gapsKey = (username: string, scope: number): string => `gaps:${username}:${scope}`;
 const profilesKey = (username: string): string => `profiles:${username}`;
 const selfKey = (username: string): string => `self:${username}`;
 
@@ -285,6 +286,20 @@ export interface StoredDm {
   b: number;
 }
 
+/**
+ * A hole a gap marker left in one scope: content in `(after, before)` was not delivered.
+ * `before` is where the next "load older" tap starts; `count` is what the server said is
+ * hidden there (ADR 0009, ADR 0019).
+ */
+export interface StoredGap {
+  scope: number;
+  after: number;
+  before: number;
+  count: number;
+  /** Seq of the gap marker, so replaying the same sync cannot duplicate the hole. */
+  seq: number;
+}
+
 export interface StoredProfile {
   user: number;
   seq: number;
@@ -331,6 +346,14 @@ function asDm(value: unknown): StoredDm | null {
   if (!isUint(row.id) || row.id === 0 || !isUint(row.seq) || row.seq === 0) return null;
   if (!isUint(row.a) || row.a === 0 || !isUint(row.b) || row.b === 0 || row.a === row.b) return null;
   return { id: row.id, seq: row.seq, a: row.a, b: row.b };
+}
+
+function asGap(value: unknown): StoredGap | null {
+  const row = asObject(value);
+  if (!isUint(row.scope) || row.scope === 0 || !isUint(row.seq) || row.seq === 0) return null;
+  if (!isUint(row.after) || !isUint(row.before) || row.before <= row.after) return null;
+  if (!isUint(row.count) || row.count === 0) return null;
+  return { scope: row.scope, after: row.after, before: row.before, count: row.count, seq: row.seq };
 }
 
 function asMember(value: unknown): StoredMember | null {
@@ -390,6 +413,8 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   const touchedMembers = new Set<number>();
   const touchedReactions = new Set<number>();
   const touchedBans = new Set<number>();
+  const purgedScopes = new Set<number>();
+  const gapEvents: StoredGap[] = [];
   let touchedDms = false;
 
   for (const event of events) {
@@ -520,6 +545,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           touchedMembers.add(event.scope);
           touchedReactions.add(event.scope);
           touchedBans.add(event.scope);
+          purgedScopes.add(event.scope);
         }
         break;
       case Tag.Block:
@@ -546,8 +572,20 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           }
         }
         break;
+      case Tag.Gap:
+        // A marker, not content: remember the hole so "load older" starts at its top edge.
+        if (event.scope > 0 && event.before > event.after && event.count > 0) {
+          gapEvents.push({
+            scope: event.scope,
+            after: event.after,
+            before: event.before,
+            count: event.count,
+            seq: event.seq,
+          });
+        }
+        break;
       default:
-        // Gap and unknown tags carry no state this slice can cache.
+        // Unknown tags carry no state this slice can cache.
         break;
     }
   }
@@ -559,6 +597,38 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
   for (const scope of touchedReactions) writes.push(write(reactionsKey(username, scope), reactions.get(scope) ?? {}));
   for (const scope of touchedBans) writes.push(write(bansKey(username, scope), bans.get(scope) ?? {}));
   await Promise.all(writes);
+
+  for (const scope of purgedScopes) await remove(gapsKey(username, scope));
+  await recordGaps(
+    username,
+    gapEvents.filter((gap) => !purgedScopes.has(gap.scope)),
+  );
+}
+
+/** Merges gap markers into the stored holes, keyed by marker seq so a retried sync is a no-op. */
+async function recordGaps(username: string, gaps: readonly StoredGap[]): Promise<void> {
+  const scopes = new Set(gaps.map((gap) => gap.scope));
+  for (const scope of scopes) {
+    const stored = await getGaps(username, scope);
+    const bySeq = new Map(stored.map((gap) => [gap.seq, gap]));
+    for (const gap of gaps) if (gap.scope === scope) bySeq.set(gap.seq, gap);
+    await setGaps(username, scope, [...bySeq.values()].sort((a, b) => a.before - b.before));
+  }
+}
+
+/** Holes in one scope, nearest to the oldest cached content first. */
+export async function getGaps(username: string, scope: number): Promise<StoredGap[]> {
+  const value = await read(gapsKey(username, scope));
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(asGap)
+    .filter((gap): gap is StoredGap => gap !== null)
+    .sort((a, b) => a.before - b.before);
+}
+
+export async function setGaps(username: string, scope: number, gaps: readonly StoredGap[]): Promise<void> {
+  if (gaps.length === 0) await remove(gapsKey(username, scope));
+  else await write(gapsKey(username, scope), gaps);
 }
 
 export async function getGroups(username: string): Promise<StoredGroup[]> {

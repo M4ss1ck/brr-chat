@@ -1,7 +1,7 @@
 // The PWA shell: auth, recovery, open groups, posts and /sync. Vanilla DOM only, so the app
 // shell stays inside its byte budget (ADR 0014). Every element lookup is optional, so the
 // module also loads in a test or in a worker without a DOM.
-import { EMOJI_PALETTE, ResponseError, Role, Tag, type SyncResponse } from "@brr-chat/protocol";
+import { EMOJI_PALETTE, ResponseError, Role, Tag, isGapCoveredTag, type SyncResponse } from "@brr-chat/protocol";
 import {
   getRegistration,
   getServerSettings,
@@ -14,6 +14,7 @@ import {
   type ServerUser,
 } from "./admin.ts";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
+import { advanceGaps, loadHistory } from "./history.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
 import { formatBytes, meter, type MeterTotals } from "./meter.ts";
@@ -24,6 +25,7 @@ import {
   getBans,
   getCursor,
   getDmScopes,
+  getGaps,
   getGroups,
   getMembers,
   getOutbox,
@@ -35,6 +37,7 @@ import {
   getSession,
   nextReactionOn,
   removeOutbox,
+  setGaps,
   setSelf,
   tallyReactions,
   toWireOp,
@@ -69,6 +72,12 @@ let pendingServerInvite: string | null = serverInviteTokenFromLocation();
 let serverSettings: ServerSettings | null = null;
 /** Account whose admin view is cached; the panel is not refetched on every sync. */
 let adminLoadedFor: string | null = null;
+/** Scopes where /history returned no older page, so "load older" stays hidden. */
+const historyExhausted = new Set<string>();
+
+function historyKey(username: string, scope: number): string {
+  return `${username}:${scope}`;
+}
 
 function inviteTokenFromLocation(): string | null {
   if (typeof location === "undefined") return null;
@@ -665,6 +674,17 @@ async function renderGroup(): Promise<void> {
       ...orphans.map((post) => postItem(post, context)),
     );
   }
+  // A gap only says older events exist; the button is how the user pays for them (ADR 0009).
+  const gaps = await getGaps(session.username, group.id);
+  const gap = gaps[0];
+  show(
+    "load-older",
+    (posts.length > 0 || gap !== undefined) && !historyExhausted.has(historyKey(session.username, group.id)),
+  );
+  setText(
+    "load-older",
+    gap ? `Load ${gap.count} missed ${gap.count === 1 ? "message" : "messages"}` : "Load older posts",
+  );
 
   if (currentGroup !== null) {
     const input = el<HTMLInputElement>("post-text");
@@ -820,9 +840,58 @@ async function renderDm(): Promise<void> {
   const list = el("dm-messages");
   if (list) list.replaceChildren(...messages.map((message) => postItem(message, context, [], false)));
   show("dm-empty", messages.length === 0);
+  const gaps = scope === null ? [] : await getGaps(session.username, scope);
+  const gap = gaps[0];
+  show(
+    "dm-load-older",
+    (messages.length > 0 || gap !== undefined) &&
+      (scope === null || !historyExhausted.has(historyKey(session.username, scope))),
+  );
+  setText(
+    "dm-load-older",
+    gap ? `Load ${gap.count} missed ${gap.count === 1 ? "message" : "messages"}` : "Load older messages",
+  );
 
   const input = el<HTMLInputElement>("dm-text");
   if (input) input.placeholder = `Message ${name}`;
+}
+
+/**
+ * One tap, one /history page, older than the oldest message already cached. The page joins
+ * the same cache, so a gap and the normal sync view become one continuous thread.
+ */
+async function loadOlder(kind: "group" | "dm"): Promise<void> {
+  const session = await getSession();
+  const scope = kind === "group" ? currentGroup : currentDm;
+  if (!session || scope === null) return;
+
+  const cached = await getPosts(session.username, scope);
+  const gaps = await getGaps(session.username, scope);
+  const gap = gaps[0];
+  // A hole sits above the old cache: fill it from its top edge, not below the oldest post.
+  const before = gap?.before ?? cached[0]?.seq;
+  if (before === undefined) return;
+
+  const button = el<HTMLButtonElement>(kind === "group" ? "load-older" : "dm-load-older");
+  if (button) button.disabled = true;
+  try {
+    const outcome = await loadHistory(location.origin, session.token, session.username, scope, before);
+    if (outcome.kind === "upgrade") {
+      message(upgradeMessage(outcome.error, outcome.range));
+      return;
+    }
+    const { response } = outcome;
+    if (gap) await setGaps(session.username, scope, advanceGaps(gaps, response));
+    else if (!response.more) historyExhausted.add(historyKey(session.username, scope));
+    const older = response.events.filter((event) => isGapCoveredTag(event.tag)).length;
+    message(older === 0 ? "No older messages." : `Loaded ${older} older ${older === 1 ? "message" : "messages"}.`);
+  } catch (err) {
+    message(err instanceof Error ? err.message : "Could not load older messages.");
+  } finally {
+    if (button) button.disabled = false;
+    await renderGroup();
+    await renderDm();
+  }
 }
 
 /** Everything that follows a successful sign-up/in/recovery, including a pending link. */
@@ -859,6 +928,12 @@ function explainAck(error: number): string {
   }
 }
 
+function upgradeMessage(error: number, range: { min: number; max: number }): string {
+  return error === ResponseError.ClientTooOld
+    ? `This server is too old: it speaks up to v${range.max}. Update the app.`
+    : `This server moved on: it wants at least v${range.min}. An update is on the way.`;
+}
+
 async function syncNow(): Promise<SyncResponse | null> {
   const session = await getSession();
   if (!session) {
@@ -883,11 +958,7 @@ async function syncNow(): Promise<SyncResponse | null> {
     const outcome = await syncAndPersist(location.origin, session.token, session.username, outbox);
     if (outcome.kind === "upgrade") {
       const { range, error } = outcome;
-      message(
-        error === ResponseError.ClientTooOld
-          ? `This server is too old: it speaks up to v${range.max}. Update the app.`
-          : `This server moved on: it wants at least v${range.min}. An update is on the way.`,
-      );
+      message(upgradeMessage(error, range));
       await refresh();
       return null;
     }
@@ -1224,6 +1295,8 @@ function wire(): void {
   el<HTMLButtonElement>("sign-in")?.addEventListener("click", () => void submit("in"));
   el<HTMLButtonElement>("sign-out")?.addEventListener("click", () => void leave());
   el<HTMLButtonElement>("sync")?.addEventListener("click", () => void syncNow());
+  el<HTMLButtonElement>("load-older")?.addEventListener("click", () => void loadOlder("group"));
+  el<HTMLButtonElement>("dm-load-older")?.addEventListener("click", () => void loadOlder("dm"));
   el<HTMLButtonElement>("confirm")?.addEventListener("click", () => void finishSignup());
   el<HTMLButtonElement>("regenerate")?.addEventListener("click", () => void newCode());
   el<HTMLButtonElement>("refresh-code")?.addEventListener("click", () => void newCode());
