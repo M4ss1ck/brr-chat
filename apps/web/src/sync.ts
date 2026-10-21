@@ -12,7 +12,16 @@ import {
 } from "@brr-chat/protocol";
 import { bearerHeader } from "./auth.ts";
 import { meteredFetch } from "./meter.ts";
-import { applyEvents, getCursor, setCursor, setRange } from "./store.ts";
+import {
+  applyEvents,
+  getCursor,
+  getPendingOps,
+  setCursor,
+  setRange,
+  settleOutbox,
+  toWireOp,
+  type StoredOp,
+} from "./store.ts";
 
 export const SYNC_PATH = "/sync";
 
@@ -54,6 +63,24 @@ export function classifySyncResponse(response: SyncResponse): SyncOutcome {
   return response.error !== undefined
     ? { kind: "upgrade", error: response.error, range: response.range }
     : { kind: "ok", response };
+}
+
+export interface DrainResult {
+  outcome: SyncOutcome;
+  /** NotFound rows kept for the UI's discard action; never sent again (ADR 0013). */
+  failed: StoredOp[];
+}
+
+/**
+ * One whole outbox drain: load the ops that still need an answer, sync, then settle every
+ * ack. A network failure throws with the outbox untouched, so the next online event retries
+ * the same cids and the server deduplicates them.
+ */
+export async function drainOutbox(base: string, token: string, username: string): Promise<DrainResult> {
+  const pending = (await getPendingOps(username)).map(toWireOp);
+  const outcome = await syncAndPersist(base, token, username, pending);
+  const failed = outcome.kind === "ok" ? await settleOutbox(username, outcome.response.acks) : [];
+  return { outcome, failed };
 }
 
 /**

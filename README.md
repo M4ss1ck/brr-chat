@@ -2,7 +2,9 @@
 
 A small, data-saving social network for groups and DMs, built for slow, expensive, intermittent
 connections. Each server is an isolated community. The client can hold accounts on several servers.
-An always-visible data meter counts bytes on the wire for this tab session and this calendar
+Messages composed offline wait in a durable outbox and drain when the link returns; the local
+event cache is capped at 2,000 per scope and the media cache at 50 MB (ADR 0013). An
+always-visible data meter counts bytes on the wire for this tab session and this calendar
 month; both survive reloads (ADR 0018).
 
 | Path | What |

@@ -6,6 +6,7 @@ import { MEDIA_FULL_EDGE, MEDIA_PREVIEW_EDGE, MEDIA_VARIANT_MAX_BYTES, type Medi
 import { rgbaToThumbHash, thumbHashToDataURL } from "thumbhash";
 import { bearerHeader } from "./auth.ts";
 import { meteredFetch } from "./meter.ts";
+import { getMediaBytes, putMediaBytes } from "./store.ts";
 
 export const MEDIA_PATH = "/m";
 /** The largest square ThumbHash encoder input: bigger is slower with no visible gain. */
@@ -246,6 +247,8 @@ export function placeholderDataUrl(media: Pick<Media, "thumbhash">): string {
 export interface MediaViewOptions {
   base: string;
   token: string;
+  /** Durable cache key (account + server); omitted in tests that do not touch storage. */
+  cacheKey?: string;
   /** Test seams; production uses the metered fetch. */
   fetchImpl?: FetchLike;
   createObjectUrl?: (blob: Blob) => string;
@@ -353,6 +356,22 @@ export function mediaView(media: Media, options: MediaViewOptions): HTMLButtonEl
     const requested = Math.max(1, Math.round(button.clientWidth || MEDIA_PREVIEW_EDGE));
     void (async () => {
       try {
+        // The durable cache survives restarts, so a second visit is free even though the
+        // in-memory URLs from last time are gone.
+        if (options.cacheKey !== undefined) {
+          const stored = await getMediaBytes(options.cacheKey, media.id).catch(() => null);
+          if (stored !== null) {
+            // IndexedDB hands back a view whose buffer may be a SharedArrayBuffer in types;
+            // Blob wants a plain ArrayBuffer, so copy into one.
+            const copy = new Uint8Array(stored.byteLength);
+            copy.set(stored);
+            const url = createObjectUrl(new Blob([copy.buffer as ArrayBuffer], { type: "image/webp" }));
+            rememberMedia(key, url, stored.byteLength, revokeObjectUrl);
+            applyLoaded(url);
+            return;
+          }
+        }
+
         const res = await doFetch(`${options.base}${MEDIA_PATH}/${media.id}?w=${requested}`, {
           headers: { Authorization: bearerHeader(options.token) },
         });
@@ -364,6 +383,15 @@ export function mediaView(media: Media, options: MediaViewOptions): HTMLButtonEl
           rememberMedia(key, url, blob.size, revokeObjectUrl);
         }
         applyLoaded(url);
+        if (options.cacheKey !== undefined) {
+          // Best effort, after the image is on screen: a full store must not hide bytes the
+          // user already paid for.
+          const cacheKey = options.cacheKey;
+          void blob
+            .arrayBuffer()
+            .then((bytes) => putMediaBytes(cacheKey, media.id, new Uint8Array(bytes)))
+            .catch(() => undefined);
+        }
       } catch {
         loading = false;
         button.classList.remove("loading");

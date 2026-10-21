@@ -14,22 +14,27 @@ import {
   type ServerUser,
 } from "./admin.ts";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
+import { watchOnline } from "./connectivity.ts";
 import { advanceGaps, loadHistory } from "./history.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
 import { formatBytes, meter, type MeterTotals } from "./meter.ts";
 import { mediaView, prepareImage, uploadImage, MediaUploadError, clearMediaCache } from "./media.ts";
 import { qrSvg } from "./qr.ts";
-import { syncAndPersist, SyncHttpError } from "./sync.ts";
+import { drainOutbox, SyncHttpError } from "./sync.ts";
+import { createSyncQueue } from "./sync-queue.ts";
 import {
+  clearMediaBytes,
+  discardOutbox,
   enqueueOp,
   getBans,
   getCursor,
   getDmScopes,
+  getFailedOps,
   getGaps,
   getGroups,
   getMembers,
-  getOutbox,
+  getPendingOps,
   getPosts,
   getProfiles,
   getRange,
@@ -37,17 +42,16 @@ import {
   getSelf,
   getSession,
   nextReactionOn,
-  removeOutbox,
   setGaps,
   setSelf,
   tallyReactions,
-  toWireOp,
   type ReactionTally,
   type StoredBan,
   type StoredDm,
   type StoredGroup,
   type StoredMedia,
   type StoredMember,
+  type StoredOp,
   type StoredPost,
   type StoredProfile,
 } from "./store.ts";
@@ -105,6 +109,8 @@ interface ViewContext {
   /** Server origin and session token, so a tapped image can fetch with credentials. */
   base: string;
   token: string;
+  /** Account plus server origin: the durable media cache never crosses either. */
+  cacheKey: string;
 }
 
 function el<T extends HTMLElement>(id: string): T | null {
@@ -147,6 +153,78 @@ function clear(id: string): void {
   if (node) node.value = "";
 }
 
+/** One line describing a failed op, with the draft text the user may want to copy. */
+function outboxLabel(op: StoredOp): string {
+  switch (op.tag) {
+    case Tag.Post:
+      return `Post: ${op.text ?? ""}`;
+    case Tag.Reply:
+      return `Reply: ${op.text ?? ""}`;
+    case Tag.Dm:
+      return `Message: ${op.text ?? ""}`;
+    case Tag.Reaction: {
+      const emoji = EMOJI_PALETTE[op.emoji ?? 0];
+      return emoji ? `Reaction ${emoji}` : "Reaction";
+    }
+    case Tag.Delete:
+      return "Delete a post";
+    case Tag.GroupMeta:
+      return `Group: ${op.name ?? ""}`;
+    case Tag.Membership:
+      return "Group join";
+    case Tag.Profile:
+      return "Profile";
+    case Tag.Ban:
+      return op.scope === 0 ? "Server ban" : "Group ban";
+    case Tag.Block:
+      return "Block";
+    default:
+      return "Queued action";
+  }
+}
+
+/**
+ * Failed outbox rows, not events: a post or reply whose parent was deleted while the device
+ * was offline (ADR 0013). The text stays selectable until the user taps discard.
+ */
+async function renderOutbox(): Promise<void> {
+  const session = await getSession();
+  if (!session) {
+    show("outbox", false);
+    return;
+  }
+  const failed = await getFailedOps(session.username);
+  show("outbox", failed.length > 0);
+  const list = el("outbox-list");
+  if (!list) return;
+  list.replaceChildren(
+    ...failed.map((op) => {
+      const item = document.createElement("li");
+      const label = document.createElement("span");
+      label.className = "outbox-label";
+      label.textContent = outboxLabel(op);
+      const reason = document.createElement("span");
+      reason.className = "note";
+      reason.textContent =
+        "Not sent: the post, message or group it points at no longer exists. Copy the text, then discard.";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Discard";
+      button.addEventListener("click", () => {
+        void discardFailedOp(session.username, op.cid);
+      });
+      item.append(label, reason, button);
+      return item;
+    }),
+  );
+}
+
+async function discardFailedOp(username: string, cid: readonly number[]): Promise<void> {
+  await discardOutbox(username, cid);
+  message("Discarded.");
+  await refresh();
+}
+
 async function refresh(): Promise<void> {
   const session = await getSession();
   const pending = session?.recoveryPending === true;
@@ -158,6 +236,7 @@ async function refresh(): Promise<void> {
   setText("cursor", String(session ? await getCursor(session.username) : 0));
   const range = await getRange();
   setText("range", range ? `v${range.min}..v${range.max}` : "unknown");
+  await renderOutbox();
   await refreshGroups();
   await refreshDms();
   await renderGroup();
@@ -489,7 +568,7 @@ function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] 
           h: post.media.h,
           thumbhash: new Uint8Array(post.media.thumbhash),
         },
-        { base: context.base, token: context.token },
+        { base: context.base, token: context.token, cacheKey: context.cacheKey },
       ),
     );
   }
@@ -736,6 +815,7 @@ async function renderGroup(): Promise<void> {
     role: myRole,
     base: location.origin,
     token: session.token,
+    cacheKey: `${session.username}\u0000${location.origin}`,
   };
   const posts = await getPosts(session.username, group.id);
   const roots = posts.filter((post) => post.parent === 0);
@@ -927,6 +1007,7 @@ async function renderDm(): Promise<void> {
     role: Role.None,
     base: location.origin,
     token: session.token,
+    cacheKey: `${session.username}\u0000${location.origin}`,
   };
   const messages = scope === null ? [] : await getPosts(session.username, scope);
   const list = el("dm-messages");
@@ -1028,7 +1109,13 @@ function upgradeMessage(error: number, range: { min: number; max: number }): str
     : `This server moved on: it wants at least v${range.min}. An update is on the way.`;
 }
 
-async function syncNow(): Promise<SyncResponse | null> {
+function failedMessage(failed: readonly StoredOp[]): string {
+  return failed.length === 1
+    ? "One queued message was not sent because what it points at no longer exists. Copy or discard it under Unsent."
+    : `${failed.length} queued messages were not sent because what they point at no longer exists. Copy or discard them under Unsent.`;
+}
+
+async function runSync(): Promise<SyncResponse | null> {
   const session = await getSession();
   if (!session) {
     message("Sign in first.");
@@ -1037,7 +1124,7 @@ async function syncNow(): Promise<SyncResponse | null> {
 
   // The wire id is learned from the profile event this account publishes; no extra endpoint.
   const knownSelf = await getSelf(session.username);
-  if (knownSelf === null && !(await getOutbox(session.username)).some((op) => op.tag === Tag.Profile)) {
+  if (knownSelf === null && !(await getPendingOps(session.username)).some((op) => op.tag === Tag.Profile)) {
     await enqueueOp(session.username, {
       tag: Tag.Profile,
       scope: 0,
@@ -1048,8 +1135,7 @@ async function syncNow(): Promise<SyncResponse | null> {
   }
 
   try {
-    const outbox = (await getOutbox(session.username)).map(toWireOp);
-    const outcome = await syncAndPersist(location.origin, session.token, session.username, outbox);
+    const { outcome, failed } = await drainOutbox(location.origin, session.token, session.username);
     if (outcome.kind === "upgrade") {
       const { range, error } = outcome;
       message(upgradeMessage(error, range));
@@ -1058,12 +1144,18 @@ async function syncNow(): Promise<SyncResponse | null> {
     }
 
     const { response } = outcome;
-    await removeOutbox(session.username, response.acks.map((ack) => ack.cid));
     await identifySelf(session.username);
 
-    const failure = response.acks.find((ack) => "error" in ack);
-    if (failure && "error" in failure) message(explainAck(failure.error));
-    else message(`In sync at ${response.cursor}.`);
+    // A failed row already has its own explanation under Unsent; do not repeat its ack text.
+    const failure = response.acks.find(
+      (ack) =>
+        "error" in ack &&
+        !failed.some((op) => op.cid.every((byte, index) => byte === ack.cid[index])),
+    );
+    const notes: string[] = [];
+    if (failed.length > 0) notes.push(failedMessage(failed));
+    if (failure && "error" in failure) notes.push(explainAck(failure.error));
+    message(notes.length > 0 ? notes.join(" ") : `In sync at ${response.cursor}.`);
 
     setText("cursor", String(response.cursor));
     show("empty", response.events.length === 0 && response.cursor === 0 && (await getGroups(session.username)).length === 0);
@@ -1085,6 +1177,12 @@ async function syncNow(): Promise<SyncResponse | null> {
     return null;
   }
 }
+
+/**
+ * One sync at a time, in call order. A tap that lands during an in-flight sync gets its own
+ * run afterwards: the earlier request was built before that op was queued.
+ */
+const syncNow = createSyncQueue<SyncResponse | null>(runSync);
 
 async function submit(mode: Mode): Promise<void> {
   const username = value("username");
@@ -1188,6 +1286,7 @@ async function createGroup(): Promise<void> {
     return;
   }
   const privateGroup = el<HTMLInputElement>("create-private")?.checked === true;
+  const knownGroups = new Set((await getGroups(session.username)).map((group) => group.id));
   const queued = await enqueueOp(session.username, {
     tag: Tag.GroupMeta,
     scope: 0,
@@ -1202,10 +1301,19 @@ async function createGroup(): Promise<void> {
   currentInvite = null;
   const response = await syncNow();
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
-  if (ack && "seq" in ack) {
+  let created = ack && "seq" in ack ? ack.seq : null;
+  if (created === null) {
+    // Another sync may have drained this op before the run this call belongs to. The group
+    // is in the cache either way; pick the newest one with this name instead of losing it.
+    const named = (await getGroups(session.username))
+      .filter((group) => group.name === name && !knownGroups.has(group.id))
+      .sort((a, b) => b.seq - a.seq);
+    created = named[0]?.id ?? null;
+  }
+  if (created !== null) {
     cancelReply();
     clearImages();
-    currentGroup = ack.seq;
+    currentGroup = created;
     currentDm = null;
     pendingDmPeer = null;
   }
@@ -1311,7 +1419,7 @@ async function sendDm(): Promise<void> {
 
   // scope 0 lets the server open (or reuse) the single scope for this pair; a retry reuses
   // the same cid through the outbox, so it can never create a second conversation.
-  const queued = await enqueueOp(session.username, {
+  await enqueueOp(session.username, {
     tag: Tag.Dm,
     scope: scope ?? 0,
     peer: peer ?? 0,
@@ -1320,15 +1428,13 @@ async function sendDm(): Promise<void> {
   });
   clear("dm-text");
   clearImage("dm");
-  const response = await syncNow();
-  const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
-  if (ack && "seq" in ack) {
-    // The cache now holds the dm_scope event, so the conversation can be selected by peer.
-    const dm = (await getDmScopes(session.username)).find((row) => row.a === peer || row.b === peer);
-    if (dm) {
-      currentDm = dm.id;
-      pendingDmPeer = null;
-    }
+  await syncNow();
+  // The cache holds the dm_scope event once it lands, so the conversation is selected by
+  // peer. This does not depend on which queued sync consumed the op.
+  const dm = (await getDmScopes(session.username)).find((row) => row.a === peer || row.b === peer);
+  if (dm) {
+    currentDm = dm.id;
+    pendingDmPeer = null;
   }
   await refresh();
 }
@@ -1399,6 +1505,8 @@ async function leave(): Promise<void> {
   try {
     await signOut(location.origin);
     clearMediaCache();
+    // Signing out drops downloaded images from the durable cache too, not just this page.
+    await clearMediaBytes().catch(() => undefined);
     cancelReply();
     clearImages();
     currentGroup = null;
@@ -1471,6 +1579,13 @@ function boot(): void {
   watchMeterRollover();
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refreshMeter();
+  });
+  // Coming back online is the one moment the durable outbox can drain without a tap.
+  watchOnline(globalThis, () => {
+    void (async () => {
+      const session = await getSession();
+      if (session && session.recoveryPending !== true) await syncNow();
+    })();
   });
   if ("serviceWorker" in navigator) {
     void navigator.serviceWorker.register("/sw.js").catch(() => {

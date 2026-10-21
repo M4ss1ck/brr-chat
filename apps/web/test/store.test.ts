@@ -1,18 +1,24 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
-import { Role, Tag, type Event } from "@brr-chat/protocol";
+import { AckError, Role, Tag, type Event } from "@brr-chat/protocol";
 import {
+  MEDIA_CACHE_LIMIT_BYTES,
   applyEvents,
+  clearMediaBytes,
   closeStore,
+  discardOutbox,
   enqueueOp,
   getBans,
   getCursor,
   getDmMessages,
   getDmScopes,
+  getFailedOps,
   getGroups,
+  getMediaBytes,
   getMembers,
   getMeter,
   getOutbox,
+  getPendingOps,
   getPosts,
   getProfiles,
   getRange,
@@ -20,8 +26,11 @@ import {
   getSelf,
   getSession,
   getStoredCursor,
+  mediaCacheBytes,
   nextReactionOn,
+  putMediaBytes,
   removeOutbox,
+  settleOutbox,
   setCursor,
   setMeter,
   setRange,
@@ -464,6 +473,150 @@ describe("store (IndexedDB)", () => {
 
     await removeOutbox("alice", [new Uint8Array(first.cid)]);
     expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([second.cid, third.cid]);
+  });
+
+  test("the event cache keeps 2,000 events per scope, the latest page, and a queued reply's parent", async () => {
+    const reply = await enqueueOp("alice", { tag: Tag.Reply, scope: 10, parent: 50, text: "queued" });
+    const posts: Event[] = Array.from({ length: 2100 }, (_, index) => ({
+      tag: Tag.Post,
+      seq: index + 1,
+      ts: 1_000 + index,
+      author: 1,
+      scope: 10,
+      text: `post ${index + 1}`,
+      media: null,
+    }));
+    await applyEvents("alice", [
+      ...posts,
+      // A reaction to the oldest post leaves with the post in the same eviction pass.
+      { tag: Tag.Reaction, seq: 2_101, ts: 9_999, author: 1, scope: 10, target: 1, emoji: 0, on: true },
+    ]);
+
+    const seqs = new Set((await getPosts("alice", 10)).map((post) => post.seq));
+    expect(seqs.size).toBe(2000);
+    // The pending reply's parent survives even though it is far outside the window.
+    expect(seqs.has(50)).toBe(true);
+    expect(seqs.has(101)).toBe(false);
+    expect(seqs.has(102)).toBe(true);
+    // The latest page is never evicted, so opening the group offline shows recent messages.
+    for (let seq = 2001; seq <= 2100; seq++) expect(seqs.has(seq)).toBe(true);
+    expect((await getOutbox("alice")).map((op) => op.cid)).toEqual([reply.cid]);
+
+    // A reaction whose post left the cache in this pass is dropped with it.
+    expect(await getReactions("alice", 10)).toEqual([]);
+  });
+
+  test("a page just fetched from /history stays visible even when the cache is full", async () => {
+    const posts: Event[] = Array.from({ length: 2100 }, (_, index) => ({
+      tag: Tag.Post,
+      seq: 5_001 + index,
+      ts: 5_001 + index,
+      author: 1,
+      scope: 10,
+      text: `post ${index + 1}`,
+      media: null,
+    }));
+    await applyEvents("alice", posts);
+
+    // Exactly what /history returns next: 100 events older than the oldest cached seq.
+    const older: Event[] = Array.from({ length: 100 }, (_, index) => ({
+      tag: Tag.Post,
+      seq: 4_901 + index,
+      ts: 4_901 + index,
+      author: 1,
+      scope: 10,
+      text: `older ${index + 1}`,
+      media: null,
+    }));
+    await applyEvents("alice", older, { protectedSeqs: new Set(older.map((event) => event.seq)) });
+
+    const seqs = new Set((await getPosts("alice", 10)).map((post) => post.seq));
+    expect(seqs.size).toBe(2000);
+    for (const event of older) expect(seqs.has(event.seq)).toBe(true);
+    // The page was not bought just to be evicted by its own write.
+    expect(seqs.has(5_001)).toBe(false);
+  });
+
+  test("the media cache is a durable 50 MB LRU, scoped per account", async () => {
+    const size = 20 * 1024 * 1024;
+    const bytes = (): Uint8Array => new Uint8Array(size);
+    expect(MEDIA_CACHE_LIMIT_BYTES).toBe(50 * 1024 * 1024);
+
+    await putMediaBytes("alice", 1, bytes(), 1_000);
+    await putMediaBytes("alice", 2, bytes(), 2_000);
+    await putMediaBytes("alice", 3, bytes(), 3_000);
+    // 60 MB went in, so the least recently used image (id 1) left.
+    expect(await mediaCacheBytes()).toBe(40 * 1024 * 1024);
+    expect(await getMediaBytes("alice", 1, 3_500)).toBeNull();
+
+    // Reading id 2 refreshes it; id 3 is now the oldest.
+    expect((await getMediaBytes("alice", 2, 4_000))?.byteLength).toBe(size);
+    await putMediaBytes("alice", 4, bytes(), 5_000);
+    expect(await getMediaBytes("alice", 3, 6_000)).toBeNull();
+    expect(await getMediaBytes("alice", 2, 6_000)).not.toBeNull();
+    expect(await getMediaBytes("alice", 4, 6_000)).not.toBeNull();
+
+    // Another account on the same device never reads this account's image bytes.
+    expect(await getMediaBytes("bob", 2, 6_000)).toBeNull();
+    // The LRU itself survives a restart.
+    await closeStore();
+    expect((await getMediaBytes("alice", 4, 7_000))?.byteLength).toBe(size);
+
+    // Signing out drops this account's bytes without touching other owners.
+    await putMediaBytes("bob", 9, new Uint8Array(10), 8_000);
+    await clearMediaBytes("alice");
+    expect(await getMediaBytes("alice", 4, 9_000)).toBeNull();
+    expect((await getMediaBytes("bob", 9, 9_000))?.byteLength).toBe(10);
+    await clearMediaBytes();
+    expect(await mediaCacheBytes()).toBe(0);
+  });
+
+  test("a media index row without bytes reads as absent and stops counting toward the cap", async () => {
+    const store = await rawStore();
+    try {
+      await store.put("media-index", [{ owner: "alice", id: 1, bytes: 10, used: 1 }]);
+    } finally {
+      store.close();
+    }
+    expect(await getMediaBytes("alice", 1)).toBeNull();
+    expect(await mediaCacheBytes()).toBe(0);
+  });
+
+  test("a NotFound ack keeps the draft as failed, out of the next sync, until discarded", async () => {
+    const reply = await enqueueOp("alice", { tag: Tag.Reply, scope: 5, parent: 9, text: "still worth saying" });
+    const acked = await enqueueOp("alice", { tag: Tag.Post, scope: 5, text: "accepted" });
+
+    const failed = await settleOutbox("alice", [
+      { cid: new Uint8Array(reply.cid), error: AckError.NotFound },
+      { cid: new Uint8Array(acked.cid), seq: 10 },
+    ]);
+
+    expect(failed.map((op) => op.cid)).toEqual([reply.cid]);
+    expect(failed[0]).toMatchObject({ failed: AckError.NotFound, text: "still worth saying" });
+    // Only the still-unsent op goes back on the wire; a dead reply must not block the queue.
+    expect((await getPendingOps("alice")).map((op) => op.cid)).toEqual([]);
+    expect((await getFailedOps("alice")).map((op) => op.text)).toEqual(["still worth saying"]);
+
+    // The failure survives a restart with its text, so the user can copy it later.
+    await closeStore();
+    expect((await getFailedOps("alice")).map((op) => op.text)).toEqual(["still worth saying"]);
+
+    await discardOutbox("alice", reply.cid);
+    expect(await getOutbox("alice")).toEqual([]);
+  });
+
+  test("a failed reaction never decides the next tap", async () => {
+    const tap = await enqueueOp("alice", { tag: Tag.Reaction, scope: 10, target: 40, emoji: 2, on: true });
+    await settleOutbox("alice", [{ cid: new Uint8Array(tap.cid), error: AckError.NotFound }]);
+    // The failed "on" was never applied, so the next tap still asks for "on".
+    expect(await nextReactionOn("alice", 10, 40, 2, 2)).toBe(true);
+  });
+
+  test("other nacks drop the op instead of keeping a failed row", async () => {
+    const op = await enqueueOp("alice", { tag: Tag.Post, scope: 5, text: "too fast" });
+    const failed = await settleOutbox("alice", [{ cid: new Uint8Array(op.cid), error: AckError.RateLimited }]);
+    expect(failed).toEqual([]);
+    expect(await getOutbox("alice")).toEqual([]);
   });
 
   test("the outbox round-trips a reply and a reaction toggle", async () => {

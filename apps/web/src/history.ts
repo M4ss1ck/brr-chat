@@ -80,7 +80,13 @@ export async function loadHistory(
 ): Promise<HistoryOutcome> {
   const response = await postHistoryRequest(base, token, buildHistoryRequest(scope, before, limit));
   const outcome = classifyHistoryResponse(response);
-  if (outcome.kind === "ok") await applyEvents(username, response.events);
+  // The page being shown is exempt from this batch's eviction; the next sync trims it if it
+  // no longer belongs in the latest window.
+  if (outcome.kind === "ok") {
+    await applyEvents(username, response.events, {
+      protectedSeqs: new Set(response.events.map((event) => event.seq)),
+    });
+  }
   return outcome;
 }
 

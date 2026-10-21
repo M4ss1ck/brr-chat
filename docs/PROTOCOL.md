@@ -92,6 +92,8 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
   creating a duplicate. Every op gets exactly one ack. An op with an unknown
   tag gets `AckError.Unsupported`. A malformed op with a readable `cid` gets `AckError.Invalid`.
   Neither fails the rest of the batch, so one bad op can't block a device's outbox.
+  A `NotFound` ack turns the op into a local failed row instead of a retry: the device keeps the
+  drafted text, stops sending that `cid`, and offers the user a discard action (ADR 0013).
 - **Malformed events** in a response are dropped and counted, like unknown tags. One bad event
   must not block a client's sync.
 

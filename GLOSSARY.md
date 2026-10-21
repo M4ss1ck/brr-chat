@@ -35,9 +35,14 @@
 - **Seq**: an event's position in the log, also the id of what it creates.
 - **Cursor**: the last seq a client has applied. Sync returns everything after it.
 - **Outbox**: ops the device has queued and not yet had acked.
+- **Failed op**: a queued op the server refused for good (`NotFound`), kept locally with its
+  drafted text and excluded from later syncs until the user discards it.
 - **Op**: a client's request to create an event, carrying a **cid**.
 - **cid**: 8 random bytes chosen by the device for an op, so retries never duplicate.
 - **Ack**: the server's answer for one op, either the seq created or an error.
+- **Event cache**: the bounded per-scope offline store of posts, replies and DMs (2,000 rows,
+  newest page protected from eviction).
+- **Media cache**: the durable 50 MB LRU of downloaded image bytes, separate from event rows.
 - **Gap**: a marker for **messages and reactions** the server deliberately didn't send. Filled
   on request; control events (membership, bans, deletes, metadata) are never gapped (ADR 0019).
 - **History**: older events in one scope, fetched only when the user asks.
