@@ -24,6 +24,8 @@ const SHELL: readonly ShellFile[] = [
   { name: "sw.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
   { name: "manifest.webmanifest", contentType: "application/manifest+json", cacheControl: "max-age=3600" },
   { name: "icon.svg", contentType: "image/svg+xml", cacheControl: "max-age=86400" },
+  // Loaded on demand by the Add-server panel, not part of the first load (ADR 0020).
+  { name: "qr-scan.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
 ];
 
 /** Paths the server answers. "/" and "/index.html" are the same document. */
@@ -34,6 +36,7 @@ const ROUTES: readonly { route: string; file: string }[] = [
   { route: "/sw.js", file: "sw.js" },
   { route: "/manifest.webmanifest", file: "manifest.webmanifest" },
   { route: "/icon.svg", file: "icon.svg" },
+  { route: "/qr-scan.js", file: "qr-scan.js" },
 ];
 
 const INDEX_HTML = `<!doctype html>
@@ -71,6 +74,29 @@ body {
 }
 #meter span { display: flex; align-items: baseline; gap: .3rem; }
 #meter strong { color: #d8c56a; font: 600 .82rem/1.2 ui-monospace, monospace; }
+/* Once there is more than one server, the same two scopes are shown per server, because
+   "which community cost me this" is the question the meter has to answer (#18). Three
+   aligned columns keep the numbers readable without repeating a label per row. */
+#meter-servers { flex-basis: 100%; margin-top: .15rem; font-size: .72rem; color: #a9a49a; }
+#meter-servers p, #meter-servers li {
+  display: grid; grid-template-columns: 1fr auto auto; gap: .1rem .9rem; margin: 0;
+}
+#meter-servers ul { list-style: none; margin: .1rem 0 0; padding: 0; }
+#meter-servers span:first-child { color: #f2efe6; overflow-wrap: anywhere; }
+#meter-servers li[aria-current="true"] span:first-child { color: #d8c56a; }
+#meter-servers span:not(:first-child) {
+  text-align: right; font: 600 .72rem/1.35 ui-monospace, monospace; color: #d8c56a;
+}
+/* The server list is device state, so it sits outside both auth panels like the meter. */
+#server-bar {
+  display: flex; flex-wrap: wrap; align-items: end; gap: .4rem;
+  margin: 0 0 .8rem; padding: 0 0 .6rem; border-bottom: 1px solid #2f2e25;
+}
+#server-bar label { flex: 1 1 12rem; margin: 0; }
+#server-bar button { margin: 0; padding: .45rem .7rem; font-size: .82rem; }
+#add-server { margin: 0 0 1rem; padding: .7rem; border: 1px solid #4a4740; border-radius: .4rem; }
+#server-link { font: .82rem/1.4 ui-monospace, monospace; }
+#qr-video { display: block; width: 100%; max-width: 18rem; margin: .5rem 0; border-radius: .4rem; background: #000; }
 h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
 h2 { font-size: 1.1rem; margin: 1.25rem 0 .25rem; }
 p { margin: .25rem 0; }
@@ -155,6 +181,35 @@ input[type="file"] { padding: .35rem; }
   <section id="meter" aria-label="Data usage">
     <span>This session <strong id="meter-session">0 B</strong></span>
     <span>This month <strong id="meter-month">0 B</strong></span>
+    <div id="meter-servers" hidden>
+      <p aria-hidden="true"><span>server</span><span>session</span><span>month</span></p>
+      <ul id="meter-servers-list" aria-label="Data usage per server"></ul>
+    </div>
+  </section>
+
+  <section id="server-bar" aria-label="Server">
+    <label>Server
+      <select id="server-select"></select>
+    </label>
+    <button type="button" id="add-server-show">Add server</button>
+    <button type="button" id="server-remove" aria-label="Remove this server from this device" hidden>Remove</button>
+  </section>
+
+  <section id="add-server" hidden>
+    <h2>Add a server</h2>
+    <p class="note">Like a network in an IRC client. Each server keeps its own account, cursor and cached messages. Add one by its address or by an invite link or QR code from that server.</p>
+    <label>Server address or invite link
+      <input id="server-link" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://chat.example or https://chat.example/signup/…">
+    </label>
+    <button type="button" id="add-server-link">Add from link</button>
+    <label>QR code image
+      <input id="server-qr-file" type="file" accept="image/*">
+    </label>
+    <button type="button" id="add-server-camera">Scan with camera</button>
+    <button type="button" id="add-server-cancel">Cancel</button>
+    <video id="qr-video" hidden playsinline muted></video>
+    <button type="button" id="qr-stop" hidden>Stop camera</button>
+    <p class="note">The camera image is decoded on this device and never uploaded. A screenshot or photo of the code works too.</p>
   </section>
 
   <section id="signed-out" hidden>
@@ -368,6 +423,8 @@ async function bundle(): Promise<void> {
   };
   await build({ ...shared, entryPoints: [join(webRoot, "src", "main.ts")], outfile: join(distDir, "app.js") });
   await build({ ...shared, entryPoints: [join(webRoot, "src", "sw.ts")], outfile: join(distDir, "sw.js") });
+  // The QR scanner is its own bundle so jsQR never rides in the app shell.
+  await build({ ...shared, entryPoints: [join(webRoot, "src", "qr-scan.ts")], outfile: join(distDir, "qr-scan.js") });
   writeFileSync(join(distDir, "index.html"), INDEX_HTML);
   writeFileSync(join(distDir, "manifest.webmanifest"), MANIFEST);
   writeFileSync(join(distDir, "icon.svg"), ICON);

@@ -44,7 +44,7 @@ headers, and browser-added headers (User-Agent, Sec-Fetch-*) are not visible to 
   headers, uses compressed sizes, and rounds only at display time; tests pin the arithmetic.
 - A single tab is assumed for month accumulation. Two open tabs each keep their own in-memory
   month total and the last write wins, so the persisted month can lag by the other tab's usage.
-  Cross-tab coordination is out of scope until multiple servers (#18) make it matter.
+  The month row is now per server (ADR 0020), but cross-tab coordination is still out of scope.
 - Session bytes follow the tab, not the auth session: signing out and back in on the same tab
   keeps the count, while a new tab starts at zero. That matches the word "session" in the meter
   and makes a reload keep both numbers, which is what the issue's "survives reloads" asks for.

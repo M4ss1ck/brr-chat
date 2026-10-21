@@ -1,6 +1,11 @@
 // Local persistence for the PWA. IndexedDB only: no localStorage, no cookies, and every
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
+//
+// One device holds several servers, like an IRC client with several networks (#18, ADR 0020).
+// Each server has its own account, cursor, range, outbox and event cache. Group and DM ids
+// are small integers local to one server, so every per-account key starts with the server
+// origin: two servers' logs would otherwise collide in one key space.
 import {
   AckError,
   EMOJI_PALETTE_SIZE,
@@ -13,6 +18,7 @@ import {
   type VersionRange,
 } from "@brr-chat/protocol";
 import { isMonthKey } from "./month.ts";
+import { serverIdOf, serverLabel, type PendingInvite } from "./servers.ts";
 
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
@@ -25,23 +31,34 @@ const LATEST_PAGE_SIZE = 100;
 /** Downloaded images kept across the app; older bytes leave first (ADR 0013). */
 export const MEDIA_CACHE_LIMIT_BYTES = 50 * 1024 * 1024;
 
-const KEY_SESSION = "session";
-const KEY_RANGE = "range";
-const KEY_METER = "meter";
+/** The server list and which entry the UI is showing. Both are device state, not server state. */
+const KEY_SERVERS = "servers";
+const KEY_ACTIVE = "active";
 const MEDIA_INDEX = "media-index";
 
-const mediaKey = (username: string, id: number): string => `media:${username}:${id}`;
-const postsKey = (username: string, scope: number): string => `posts:${username}:${scope}`;
-const membersKey = (username: string, scope: number): string => `members:${username}:${scope}`;
-const reactionsKey = (username: string, scope: number): string => `reactions:${username}:${scope}`;
-const bansKey = (username: string, scope: number): string => `bans:${username}:${scope}`;
-const outboxKey = (username: string): string => `outbox:${username}`;
-const cursorKey = (username: string): string => `cursor:${username}`;
-const groupsKey = (username: string): string => `groups:${username}`;
-const dmsKey = (username: string): string => `dms:${username}`;
-const gapsKey = (username: string, scope: number): string => `gaps:${username}:${scope}`;
-const profilesKey = (username: string): string => `profiles:${username}`;
-const selfKey = (username: string): string => `self:${username}`;
+const rangeKey = (server: string): string => `range:${server}`;
+const meterKey = (server: string): string => `meter:${server}`;
+/** The durable image cache is scoped by an owner key the caller chooses (account + server). */
+const mediaKey = (owner: string, id: number): string => `media:${owner}:${id}`;
+
+/**
+ * The key namespace shared by every cached row of one account. Exported so the UI's own keys
+ * (admin cache, history exhaustion) use the same encoding instead of rebuilding it.
+ */
+export function accountKey(account: AccountKey): string {
+  return `${account.server} ${account.username}`;
+}
+const postsKey = (account: AccountKey, scope: number): string => `posts:${accountKey(account)}:${scope}`;
+const membersKey = (account: AccountKey, scope: number): string => `members:${accountKey(account)}:${scope}`;
+const reactionsKey = (account: AccountKey, scope: number): string => `reactions:${accountKey(account)}:${scope}`;
+const bansKey = (account: AccountKey, scope: number): string => `bans:${accountKey(account)}:${scope}`;
+const outboxKey = (account: AccountKey): string => `outbox:${accountKey(account)}`;
+const cursorKey = (account: AccountKey): string => `cursor:${accountKey(account)}`;
+const groupsKey = (account: AccountKey): string => `groups:${accountKey(account)}`;
+const dmsKey = (account: AccountKey): string => `dms:${accountKey(account)}`;
+const gapsKey = (account: AccountKey, scope: number): string => `gaps:${accountKey(account)}:${scope}`;
+const profilesKey = (account: AccountKey): string => `profiles:${accountKey(account)}`;
+const selfKey = (account: AccountKey): string => `self:${accountKey(account)}`;
 
 /** One calendar month of metered traffic. The month is the device's local `YYYY-MM`. */
 export interface StoredMeter {
@@ -55,6 +72,27 @@ export interface Session {
   username: string;
   /** True until the signup code's last group is typed back (ADR 0006). */
   recoveryPending?: boolean;
+}
+
+/** One server's account on this device: the session plus the origin it belongs to. */
+export interface Account extends Session {
+  server: string;
+}
+
+/** The pair every cached row belongs to. A cursor without a server would skip the other log. */
+export type AccountKey = Pick<Account, "server" | "username">;
+
+/** One entry in the server list, like a network in an IRC client. */
+export interface StoredServer {
+  /** Canonical origin. The id, the fetch base, and the cache namespace. */
+  id: string;
+  /** Human label, the host by default. */
+  name: string;
+  addedAt: number;
+  /** This server's account on this device, or null while signed out. */
+  session: Session | null;
+  /** A link the user arrived by, kept until sign-up or join consumes it. */
+  invite: PendingInvite | null;
 }
 
 let dbHandle: Promise<IDBDatabase> | null = null;
@@ -179,67 +217,263 @@ function asMeter(value: unknown): StoredMeter | null {
   return { month: row.month, bytes: row.bytes };
 }
 
+function asPendingInvite(value: unknown): PendingInvite | null {
+  const row = asObject(value);
+  const kind = row.kind;
+  const token = row.token;
+  if (kind !== "signup" && kind !== "join") return null;
+  if (typeof token !== "string" || token.length === 0) return null;
+  return { kind, token };
+}
+
+function asServer(value: unknown): StoredServer | null {
+  const row = asObject(value);
+  const id = typeof row.id === "string" ? serverIdOf(row.id) : null;
+  if (id === null) return null;
+  const name = typeof row.name === "string" && row.name.length > 0 ? row.name : serverLabel(id);
+  const addedAt = isUint(row.addedAt) ? row.addedAt : 0;
+  return { id, name, addedAt, session: asSession(row.session), invite: asPendingInvite(row.invite) };
+}
+
 function assertCursor(value: number): void {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new RangeError("cursor: expected a safe uint");
   }
 }
 
+// ---- server list ----
+//
+// The list is device state: which communities this client knows and which one is on screen.
+// A server's account lives inside its row, so one server being signed in says nothing about
+// the next one.
+
+async function readServers(): Promise<StoredServer[]> {
+  const value = await read(KEY_SERVERS);
+  if (!Array.isArray(value)) return [];
+  return value.map(asServer).filter((row): row is StoredServer => row !== null);
+}
+
+async function writeServers(servers: readonly StoredServer[]): Promise<void> {
+  await write(KEY_SERVERS, servers);
+}
+
+/** Every server this device knows, in the order they were added. */
+export async function listServers(): Promise<StoredServer[]> {
+  return [...(await readServers())].sort((a, b) => a.addedAt - b.addedAt || a.id.localeCompare(b.id));
+}
+
+async function getServer(id: string): Promise<StoredServer | null> {
+  return (await readServers()).find((row) => row.id === id) ?? null;
+}
+
+/** Adds a server once. Called on boot for the serving origin, so a first visit seeds itself. */
+export async function ensureServer(id: string, name?: string): Promise<StoredServer> {
+  const canonical = serverIdOf(id);
+  if (canonical === null) throw new RangeError(`server: expected an http(s) origin, got ${id}`);
+  const servers = await readServers();
+  const existing = servers.find((row) => row.id === canonical);
+  if (existing) return existing;
+  const row: StoredServer = {
+    id: canonical,
+    name: name?.trim() || serverLabel(canonical),
+    addedAt: Date.now(),
+    session: null,
+    invite: null,
+  };
+  servers.push(row);
+  await writeServers(servers);
+  return row;
+}
+
+/** The server on screen. A stale id (a removed server) reads as none, never as another entry. */
+export async function getActiveServerId(): Promise<string | null> {
+  const value = await read(KEY_ACTIVE);
+  if (typeof value !== "string") return null;
+  return (await getServer(value))?.id ?? null;
+}
+
+export async function setActiveServer(id: string): Promise<void> {
+  if ((await getServer(id)) === null) throw new Error(`active server: unknown server ${id}`);
+  await write(KEY_ACTIVE, id);
+}
+
+// ---- account ----
+
+/** This server's stored session, or null while signed out. */
+export async function getSession(server: string): Promise<Session | null> {
+  return (await getServer(server))?.session ?? null;
+}
+
+export async function setSession(server: string, session: Session | null): Promise<void> {
+  const canonical = serverIdOf(server);
+  if (canonical === null) throw new RangeError(`session: expected an http(s) origin, got ${server}`);
+  const servers = await readServers();
+  let row = servers.find((entry) => entry.id === canonical);
+  if (!row) {
+    row = { id: canonical, name: serverLabel(canonical), addedAt: Date.now(), session: null, invite: null };
+    servers.push(row);
+  }
+  row.session = session === null ? null : { ...session };
+  await writeServers(servers);
+}
+
+/** The active server's account, or null when it is signed out (or no server is active). */
+export async function getActiveAccount(): Promise<Account | null> {
+  const id = await getActiveServerId();
+  if (id === null) return null;
+  const session = await getSession(id);
+  return session === null ? null : { server: id, ...session };
+}
+
+export async function setPendingInvite(server: string, invite: PendingInvite | null): Promise<void> {
+  const servers = await readServers();
+  const row = servers.find((entry) => entry.id === server);
+  if (!row) throw new Error(`pending invite: unknown server ${server}`);
+  row.invite = invite === null ? null : { ...invite };
+  await writeServers(servers);
+}
+
+export async function getPendingInvite(server: string): Promise<PendingInvite | null> {
+  return (await getServer(server))?.invite ?? null;
+}
+
+/** Every key in the one object store, for the two whole-device operations (remove, migrate). */
+function allKeys(): Promise<string[]> {
+  return openStore().then(
+    (database) =>
+      new Promise<string[]>((resolve, reject) => {
+        const request = database.transaction(STORE, "readonly").objectStore(STORE).getAllKeys();
+        request.onsuccess = () => {
+          resolve(request.result.filter((key): key is string => typeof key === "string"));
+        };
+        request.onerror = () => {
+          reject(request.error);
+        };
+      }),
+  );
+}
+
+/**
+ * Forgets one server: its account, invite, cursor, outbox and every cached event. Removing a
+ * community from the list must not leave its posts readable under a key nobody lists.
+ */
+export async function removeServer(server: string): Promise<void> {
+  const servers = (await readServers()).filter((row) => row.id !== server);
+  await writeServers(servers);
+  // Read the pointer itself: once the row is gone, getActiveServerId() would already read null.
+  if ((await read(KEY_ACTIVE)) === server) {
+    await write(KEY_ACTIVE, servers[0]?.id ?? null);
+  }
+  const namespace = `${server} `;
+  const doomed = (await allKeys()).filter(
+    (key) => key.includes(namespace) || key === rangeKey(server) || key === meterKey(server),
+  );
+  for (const key of doomed) await remove(key);
+  // Downloaded image bytes are indexed by account, so their owner key starts with the server.
+  const index = await readMediaIndex();
+  const keep = index.filter((entry) => !entry.owner.startsWith(namespace));
+  if (keep.length !== index.length) await write(MEDIA_INDEX, keep);
+}
+
+/**
+ * Moves a device from the single-server shell to the server list without losing its account,
+ * cursor or cache. Runs once: the presence of the `servers` row means it already happened.
+ * A fresh device gets one seeded, signed-out entry for the origin that served the app.
+ */
+export async function migrateLegacy(server: string): Promise<boolean> {
+  const canonical = serverIdOf(server);
+  if (canonical === null) throw new RangeError(`migrate: expected an http(s) origin, got ${server}`);
+  const existing = await read(KEY_SERVERS);
+  if (Array.isArray(existing)) return false;
+
+  const session = asSession(await read("session"));
+  const entries: StoredServer[] = [
+    {
+      id: canonical,
+      name: serverLabel(canonical),
+      addedAt: Date.now(),
+      session,
+      invite: null,
+    },
+  ];
+  const written: [string, unknown][] = [];
+  const deleted: string[] = [];
+  for (const key of await allKeys()) {
+    if (key === "session") {
+      deleted.push(key);
+      continue;
+    }
+    if (key === "range" || key === "meter") {
+      written.push([key === "range" ? rangeKey(canonical) : meterKey(canonical), await read(key)]);
+      deleted.push(key);
+      continue;
+    }
+    if (session === null) continue;
+    // `<kind>:<username>[:<scope>]` was the whole key space of the single-server shell.
+    const parts = key.split(":");
+    if (parts.length < 2 || parts[1] !== session.username) continue;
+    const rest = parts.slice(2);
+    const target = `${parts[0]}:${canonical} ${session.username}${rest.length > 0 ? `:${rest.join(":")}` : ""}`;
+    written.push([target, await read(key)]);
+    deleted.push(key);
+  }
+
+  for (const [key, value] of written) await write(key, value);
+  await writeServers(entries);
+  await write(KEY_ACTIVE, canonical);
+  for (const key of deleted) await remove(key);
+  return true;
+}
+
 // ---- cursor ----
 //
-// Scoped by account. A cursor belongs to the events one account has applied; sharing it
-// between accounts would skip the second account's first events.
+// Scoped by server and account. A cursor belongs to the events one account has applied;
+// sharing it between accounts, or between two servers, would skip a log.
 
 /** Last applied seq, or null when this account has never synced on this device. */
-export async function getStoredCursor(username: string): Promise<number | null> {
-  return asCursor(await read(cursorKey(username)));
+export async function getStoredCursor(account: AccountKey): Promise<number | null> {
+  return asCursor(await read(cursorKey(account)));
 }
 
 /** Last applied seq; a fresh account is at 0. */
-export async function getCursor(username: string): Promise<number> {
-  return (await getStoredCursor(username)) ?? 0;
+export async function getCursor(account: AccountKey): Promise<number> {
+  return (await getStoredCursor(account)) ?? 0;
 }
 
-export async function setCursor(username: string, value: number): Promise<void> {
+export async function setCursor(account: AccountKey, value: number): Promise<void> {
   assertCursor(value);
-  await write(cursorKey(username), value);
-}
-
-// ---- session ----
-
-export async function getSession(): Promise<Session | null> {
-  return asSession(await read(KEY_SESSION));
-}
-
-export async function setSession(session: Session | null): Promise<void> {
-  await write(KEY_SESSION, session);
+  await write(cursorKey(account), value);
 }
 
 // ---- server version range ----
+//
+// Per server: two servers can run different builds, and a cached range from the other one
+// would either warn about an update that is not there or hide one that is.
 
 /** Cached [vMin, vMax], used to warn about updates before the server refuses the request. */
-export async function getRange(): Promise<VersionRange | null> {
-  return asRange(await read(KEY_RANGE));
+export async function getRange(server: string): Promise<VersionRange | null> {
+  return asRange(await read(rangeKey(server)));
 }
 
-export async function setRange(range: VersionRange): Promise<void> {
-  await write(KEY_RANGE, range);
+export async function setRange(server: string, range: VersionRange): Promise<void> {
+  await write(rangeKey(server), range);
 }
 
 // ---- data meter ----
 //
-// Only the month is stored. The session counter starts at zero on every page load, which is
-// what "this session" means; the month survives reloads (ADR 0018).
+// One month row per server, so the bill can say which community spent the bytes. The session
+// counter starts at zero on every page load, which is what "this session" means; the month
+// survives reloads (ADR 0018, ADR 0020).
 
-/** Last stored month total, or null when this device has never metered a request. */
-export async function getMeter(): Promise<StoredMeter | null> {
-  return asMeter(await read(KEY_METER));
+/** Last stored month total for one server, or null when it has never metered a request. */
+export async function getMeter(server: string): Promise<StoredMeter | null> {
+  return asMeter(await read(meterKey(server)));
 }
 
-export async function setMeter(meter: StoredMeter): Promise<void> {
+export async function setMeter(server: string, meter: StoredMeter): Promise<void> {
   if (!isMonthKey(meter.month)) throw new RangeError("meter: expected a YYYY-MM month");
   if (!isUint(meter.bytes)) throw new RangeError("meter: expected a safe uint");
-  await write(KEY_METER, meter);
+  await write(meterKey(server), meter);
 }
 
 // ---- groups, posts, members, profiles ----
@@ -472,22 +706,22 @@ export interface ApplyOptions {
 }
 
 /** Applies a sync response's events. Safe to call with events at or below the stored cursor. */
-export async function applyEvents(username: string, events: Event[], options: ApplyOptions = {}): Promise<void> {
+export async function applyEvents(account: AccountKey, events: Event[], options: ApplyOptions = {}): Promise<void> {
   if (events.length === 0) return;
 
-  const groups = await readMap(groupsKey(username), asGroup);
-  const dms = await readMap(dmsKey(username), asDm);
-  const profiles = await readMap(profilesKey(username), asProfile);
+  const groups = await readMap(groupsKey(account), asGroup);
+  const dms = await readMap(dmsKey(account), asDm);
+  const profiles = await readMap(profilesKey(account), asProfile);
   const scopes = [...new Set(events.map((e) => e.scope).filter((scope) => scope > 0))];
   const posts = new Map<number, Record<string, StoredPost>>();
   const members = new Map<number, Record<string, StoredMember>>();
   const reactions = new Map<number, Record<string, StoredReaction>>();
   const bans = new Map<number, Record<string, StoredBan>>();
   for (const scope of scopes) {
-    posts.set(scope, await readMap(postsKey(username, scope), asPost));
-    members.set(scope, await readMap(membersKey(username, scope), asMember));
-    reactions.set(scope, await readMap(reactionsKey(username, scope), asReaction));
-    bans.set(scope, await readMap(bansKey(username, scope), asBan));
+    posts.set(scope, await readMap(postsKey(account, scope), asPost));
+    members.set(scope, await readMap(membersKey(account, scope), asMember));
+    reactions.set(scope, await readMap(reactionsKey(account, scope), asReaction));
+    bans.set(scope, await readMap(bansKey(account, scope), asBan));
   }
 
   const touchedPosts = new Set<number>();
@@ -639,12 +873,12 @@ export async function applyEvents(username: string, events: Event[], options: Ap
             ...Object.values(dms).map((dm) => dm.id),
           ]);
           for (const scope of knownScopes) {
-            const postMap = posts.get(scope) ?? (await readMap(postsKey(username, scope), asPost));
+            const postMap = posts.get(scope) ?? (await readMap(postsKey(account, scope), asPost));
             posts.set(scope, postMap);
             for (const [key, post] of Object.entries(postMap)) {
               if (post.author === event.user) delete postMap[key];
             }
-            const reactionMap = reactions.get(scope) ?? (await readMap(reactionsKey(username, scope), asReaction));
+            const reactionMap = reactions.get(scope) ?? (await readMap(reactionsKey(account, scope), asReaction));
             reactions.set(scope, reactionMap);
             for (const [key, reaction] of Object.entries(reactionMap)) {
               if (reaction.user === event.user) delete reactionMap[key];
@@ -676,7 +910,7 @@ export async function applyEvents(username: string, events: Event[], options: Ap
   // events an unsent op still points at are never candidates (ADR 0013).
   if (touchedPosts.size > 0 || touchedReactions.size > 0) {
     const protectedSeqs = new Set<number>(options.protectedSeqs ?? []);
-    for (const op of await getPendingOps(username)) {
+    for (const op of await getPendingOps(account)) {
       if (op.parent !== undefined && op.parent > 0) protectedSeqs.add(op.parent);
       if (op.target !== undefined && op.target > 0) protectedSeqs.add(op.target);
     }
@@ -701,35 +935,35 @@ export async function applyEvents(username: string, events: Event[], options: Ap
     }
   }
 
-  const writes = [write(groupsKey(username), groups), write(profilesKey(username), profiles)];
-  if (touchedDms) writes.push(write(dmsKey(username), dms));
-  for (const scope of touchedPosts) writes.push(write(postsKey(username, scope), posts.get(scope) ?? {}));
-  for (const scope of touchedMembers) writes.push(write(membersKey(username, scope), members.get(scope) ?? {}));
-  for (const scope of touchedReactions) writes.push(write(reactionsKey(username, scope), reactions.get(scope) ?? {}));
-  for (const scope of touchedBans) writes.push(write(bansKey(username, scope), bans.get(scope) ?? {}));
+  const writes = [write(groupsKey(account), groups), write(profilesKey(account), profiles)];
+  if (touchedDms) writes.push(write(dmsKey(account), dms));
+  for (const scope of touchedPosts) writes.push(write(postsKey(account, scope), posts.get(scope) ?? {}));
+  for (const scope of touchedMembers) writes.push(write(membersKey(account, scope), members.get(scope) ?? {}));
+  for (const scope of touchedReactions) writes.push(write(reactionsKey(account, scope), reactions.get(scope) ?? {}));
+  for (const scope of touchedBans) writes.push(write(bansKey(account, scope), bans.get(scope) ?? {}));
   await Promise.all(writes);
 
-  for (const scope of purgedScopes) await remove(gapsKey(username, scope));
+  for (const scope of purgedScopes) await remove(gapsKey(account, scope));
   await recordGaps(
-    username,
+    account,
     gapEvents.filter((gap) => !purgedScopes.has(gap.scope)),
   );
 }
 
 /** Merges gap markers into the stored holes, keyed by marker seq so a retried sync is a no-op. */
-async function recordGaps(username: string, gaps: readonly StoredGap[]): Promise<void> {
+async function recordGaps(account: AccountKey, gaps: readonly StoredGap[]): Promise<void> {
   const scopes = new Set(gaps.map((gap) => gap.scope));
   for (const scope of scopes) {
-    const stored = await getGaps(username, scope);
+    const stored = await getGaps(account, scope);
     const bySeq = new Map(stored.map((gap) => [gap.seq, gap]));
     for (const gap of gaps) if (gap.scope === scope) bySeq.set(gap.seq, gap);
-    await setGaps(username, scope, [...bySeq.values()].sort((a, b) => a.before - b.before));
+    await setGaps(account, scope, [...bySeq.values()].sort((a, b) => a.before - b.before));
   }
 }
 
 /** Holes in one scope, nearest to the oldest cached content first. */
-export async function getGaps(username: string, scope: number): Promise<StoredGap[]> {
-  const value = await read(gapsKey(username, scope));
+export async function getGaps(account: AccountKey, scope: number): Promise<StoredGap[]> {
+  const value = await read(gapsKey(account, scope));
   if (!Array.isArray(value)) return [];
   return value
     .map(asGap)
@@ -737,9 +971,9 @@ export async function getGaps(username: string, scope: number): Promise<StoredGa
     .sort((a, b) => a.before - b.before);
 }
 
-export async function setGaps(username: string, scope: number, gaps: readonly StoredGap[]): Promise<void> {
-  if (gaps.length === 0) await remove(gapsKey(username, scope));
-  else await write(gapsKey(username, scope), gaps);
+export async function setGaps(account: AccountKey, scope: number, gaps: readonly StoredGap[]): Promise<void> {
+  if (gaps.length === 0) await remove(gapsKey(account, scope));
+  else await write(gapsKey(account, scope), gaps);
 }
 
 // ---- media bytes ----
@@ -860,17 +1094,17 @@ export async function mediaCacheBytes(): Promise<number> {
   return (await readMediaIndex()).reduce((sum, entry) => sum + entry.bytes, 0);
 }
 
-export async function getGroups(username: string): Promise<StoredGroup[]> {
-  return Object.values(await readMap(groupsKey(username), asGroup)).sort((a, b) => a.seq - b.seq);
+export async function getGroups(account: AccountKey): Promise<StoredGroup[]> {
+  return Object.values(await readMap(groupsKey(account), asGroup)).sort((a, b) => a.seq - b.seq);
 }
 
-export async function getPosts(username: string, scope: number): Promise<StoredPost[]> {
-  return Object.values(await readMap(postsKey(username, scope), asPost)).sort((a, b) => a.seq - b.seq);
+export async function getPosts(account: AccountKey, scope: number): Promise<StoredPost[]> {
+  return Object.values(await readMap(postsKey(account, scope), asPost)).sort((a, b) => a.seq - b.seq);
 }
 
 /** Latest reaction per account, target and emoji; callers tally what is still on. */
-export async function getReactions(username: string, scope: number): Promise<StoredReaction[]> {
-  return Object.values(await readMap(reactionsKey(username, scope), asReaction)).sort((a, b) => a.seq - b.seq);
+export async function getReactions(account: AccountKey, scope: number): Promise<StoredReaction[]> {
+  return Object.values(await readMap(reactionsKey(account, scope), asReaction)).sort((a, b) => a.seq - b.seq);
 }
 
 /**
@@ -878,18 +1112,18 @@ export async function getReactions(username: string, scope: number): Promise<Sto
  * taps on a flaky link become on then off instead of two "on" ops.
  */
 export async function nextReactionOn(
-  username: string,
+  account: AccountKey,
   scope: number,
   target: number,
   emoji: number,
   self: number,
 ): Promise<boolean> {
-  const stored = (await getReactions(username, scope)).find(
+  const stored = (await getReactions(account, scope)).find(
     (row) => row.target === target && row.emoji === emoji && row.user === self,
   );
   let on = stored?.on === true;
   // A failed tap was never applied, so the next tap decides from the synced cache again.
-  for (const op of await getPendingOps(username)) {
+  for (const op of await getPendingOps(account)) {
     if (op.tag !== Tag.Reaction || op.scope !== scope || op.target !== target || op.emoji !== emoji) continue;
     if (typeof op.on === "boolean") on = op.on;
   }
@@ -928,47 +1162,47 @@ export function tallyReactions(rows: readonly StoredReaction[], self: number | n
 }
 
 /** DM conversations cached on this device, in the order they were opened. */
-export async function getDmScopes(username: string): Promise<StoredDm[]> {
-  return Object.values(await readMap(dmsKey(username), asDm)).sort((a, b) => a.seq - b.seq);
+export async function getDmScopes(account: AccountKey): Promise<StoredDm[]> {
+  return Object.values(await readMap(dmsKey(account), asDm)).sort((a, b) => a.seq - b.seq);
 }
 
 /** One DM thread, oldest first. Messages share the post store: a seq names exactly one scope. */
-export async function getDmMessages(username: string, scope: number): Promise<StoredPost[]> {
-  return getPosts(username, scope);
+export async function getDmMessages(account: AccountKey, scope: number): Promise<StoredPost[]> {
+  return getPosts(account, scope);
 }
 
-export async function getMembers(username: string, scope: number): Promise<StoredMember[]> {
-  return Object.values(await readMap(membersKey(username, scope), asMember)).sort((a, b) => a.user - b.user);
+export async function getMembers(account: AccountKey, scope: number): Promise<StoredMember[]> {
+  return Object.values(await readMap(membersKey(account, scope), asMember)).sort((a, b) => a.user - b.user);
 }
 
 /** Accounts currently banned from one group. Unban rows are kept but filtered out here. */
-export async function getBans(username: string, scope: number): Promise<StoredBan[]> {
-  return Object.values(await readMap(bansKey(username, scope), asBan))
+export async function getBans(account: AccountKey, scope: number): Promise<StoredBan[]> {
+  return Object.values(await readMap(bansKey(account, scope), asBan))
     .filter((row) => row.banned)
     .sort((a, b) => a.seq - b.seq);
 }
 
-export async function getProfiles(username: string): Promise<Map<number, StoredProfile>> {
-  const rows = await readMap(profilesKey(username), asProfile);
+export async function getProfiles(account: AccountKey): Promise<Map<number, StoredProfile>> {
+  const rows = await readMap(profilesKey(account), asProfile);
   return new Map(Object.values(rows).map((row) => [row.user, row]));
 }
 
-export async function getProfile(username: string, user: number): Promise<StoredProfile | null> {
-  return (await getProfiles(username)).get(user) ?? null;
+export async function getProfile(account: AccountKey, user: number): Promise<StoredProfile | null> {
+  return (await getProfiles(account)).get(user) ?? null;
 }
 
 // ---- this account's wire id ----
 
-/** Scoped by username: one device can sign into a second account without inheriting an id. */
-export async function getSelf(username: string): Promise<number | null> {
-  const value = await read(selfKey(username));
+/** Scoped by server and account: one device can hold the same username on two servers. */
+export async function getSelf(account: AccountKey): Promise<number | null> {
+  const value = await read(selfKey(account));
   return isUint(value) && value > 0 ? value : null;
 }
 
-export async function setSelf(username: string, value: number): Promise<void> {
-  if (username.length === 0) throw new RangeError("self: expected a username");
+export async function setSelf(account: AccountKey, value: number): Promise<void> {
+  if (account.username.length === 0) throw new RangeError("self: expected an account");
   if (!isUint(value) || value === 0) throw new RangeError("self: expected a positive uint");
-  await write(selfKey(username), value);
+  await write(selfKey(account), value);
 }
 
 // ---- outbox ----
@@ -1036,30 +1270,30 @@ function asStoredOp(value: unknown): StoredOp | null {
   return op;
 }
 
-export async function getOutbox(username: string): Promise<StoredOp[]> {
-  const rows = await read(outboxKey(username));
+export async function getOutbox(account: AccountKey): Promise<StoredOp[]> {
+  const rows = await read(outboxKey(account));
   if (!Array.isArray(rows)) return [];
   return rows.map(asStoredOp).filter((op): op is StoredOp => op !== null);
 }
 
 /** Queues one op with a fresh device-chosen cid. It stays queued until an ack arrives. */
-export async function enqueueOp(username: string, op: Omit<StoredOp, "cid">): Promise<StoredOp> {
+export async function enqueueOp(account: AccountKey, op: Omit<StoredOp, "cid">): Promise<StoredOp> {
   const cid = Array.from(crypto.getRandomValues(new Uint8Array(8)));
   const stored: StoredOp = { ...op, cid };
-  const outbox = await getOutbox(username);
+  const outbox = await getOutbox(account);
   outbox.push(stored);
-  await write(outboxKey(username), outbox);
+  await write(outboxKey(account), outbox);
   return stored;
 }
 
 /** Ops that still need a server answer, oldest first. Failed rows are deliberately left out. */
-export async function getPendingOps(username: string): Promise<StoredOp[]> {
-  return (await getOutbox(username)).filter((op) => op.failed === undefined);
+export async function getPendingOps(account: AccountKey): Promise<StoredOp[]> {
+  return (await getOutbox(account)).filter((op) => op.failed === undefined);
 }
 
 /** Ops the server refused for good, kept for the draft text and the discard action. */
-export async function getFailedOps(username: string): Promise<StoredOp[]> {
-  return (await getOutbox(username)).filter((op) => op.failed !== undefined);
+export async function getFailedOps(account: AccountKey): Promise<StoredOp[]> {
+  return (await getOutbox(account)).filter((op) => op.failed !== undefined);
 }
 
 /**
@@ -1068,10 +1302,10 @@ export async function getFailedOps(username: string): Promise<StoredOp[]> {
  * retrying can never succeed (ADR 0013). Other nacks drop the row, as before: resending
  * would produce the same refusal.
  */
-export async function settleOutbox(username: string, acks: readonly Ack[]): Promise<StoredOp[]> {
+export async function settleOutbox(account: AccountKey, acks: readonly Ack[]): Promise<StoredOp[]> {
   if (acks.length === 0) return [];
   const byCid = new Map(acks.map((ack) => [cidHex(ack.cid), ack]));
-  const outbox = await getOutbox(username);
+  const outbox = await getOutbox(account);
   const failed: StoredOp[] = [];
   const kept: StoredOp[] = [];
   for (const op of outbox) {
@@ -1087,13 +1321,13 @@ export async function settleOutbox(username: string, acks: readonly Ack[]): Prom
       kept.push(row);
     }
   }
-  await write(outboxKey(username), kept);
+  await write(outboxKey(account), kept);
   return failed;
 }
 
 /** Removes one failed op after the user has copied its text. */
-export async function discardOutbox(username: string, cid: ArrayLike<number>): Promise<void> {
-  await removeOutbox(username, [cid]);
+export async function discardOutbox(account: AccountKey, cid: ArrayLike<number>): Promise<void> {
+  await removeOutbox(account, [cid]);
 }
 
 function cidHex(cid: ArrayLike<number>): string {
@@ -1103,11 +1337,11 @@ function cidHex(cid: ArrayLike<number>): string {
 }
 
 /** Drops every named op. Success acks use settleOutbox; discard uses this. */
-export async function removeOutbox(username: string, cids: readonly ArrayLike<number>[]): Promise<void> {
+export async function removeOutbox(account: AccountKey, cids: readonly ArrayLike<number>[]): Promise<void> {
   if (cids.length === 0) return;
   const done = new Set(cids.map((cid) => cidHex(cid)));
-  const outbox = await getOutbox(username);
-  await write(outboxKey(username), outbox.filter((op) => !done.has(cidHex(op.cid))));
+  const outbox = await getOutbox(account);
+  await write(outboxKey(account), outbox.filter((op) => !done.has(cidHex(op.cid))));
 }
 
 function toWireMedia(media: StoredMedia | undefined): Media | null {

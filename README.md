@@ -1,11 +1,12 @@
 # brr-chat
 
 A small, data-saving social network for groups and DMs, built for slow, expensive, intermittent
-connections. Each server is an isolated community. The client can hold accounts on several servers.
-Messages composed offline wait in a durable outbox and drain when the link returns; the local
-event cache is capped at 2,000 per scope and the media cache at 50 MB (ADR 0013). An
-always-visible data meter counts bytes on the wire for this tab session and this calendar
-month; both survive reloads (ADR 0018).
+connections. Each server is an isolated community. The client holds several servers at once, like
+networks in an IRC client: one account, one cursor and one `/sync` per server, added by a link or
+a QR code (ADR 0020). Messages composed offline wait in a durable outbox and drain when the link
+returns; the local event cache is capped at 2,000 per scope and the media cache at 50 MB
+(ADR 0013). An always-visible data meter counts bytes on the wire for this tab session and this
+calendar month, split by server once there is more than one; both survive reloads (ADR 0018).
 
 | Path | What |
 |---|---|
@@ -29,6 +30,10 @@ bun run --cwd apps/web build          # build the app shell and regenerate the s
 export BETTER_AUTH_SECRET=$(openssl rand -hex 32)   # signs sessions; never defaulted (ADR 0007)
 bun run --cwd apps/server dev         # serve /, /sync and auth + recovery on http://localhost:3000
 ```
+
+Open **Add server** to paste a server address or an invite link from another server, or to scan
+its QR code with the camera or an image file. The code is decoded on the device. Each server's
+account, cursor and cached messages stay separate; **Sync** catches up every signed-in server.
 
 Signup shows one recovery code, once, and will not finish until its last group is typed back.
 Keep it: there is no email recovery and no admin reset (ADR 0006).

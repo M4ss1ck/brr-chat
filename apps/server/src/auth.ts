@@ -20,22 +20,12 @@ function sanitizeHost(host: string): string {
 
 export async function initAuth(db: Database, opts: AuthInitOptions) {
   const safeHost = sanitizeHost(opts.host);
-  let baseOrigin = `http://${safeHost}`;
-  try {
-    baseOrigin = new URL(opts.baseURL).origin;
-  } catch {
-    // fallback to http://${safeHost}
-  }
 
-  const trustedOrigins = Array.from(
-    new Set([
-      baseOrigin,
-      `http://${safeHost}`,
-      `https://${safeHost}`,
-      `http://${opts.host.replace(/^https?:\/\//i, "")}`,
-      `https://${opts.host.replace(/^https?:\/\//i, "")}`,
-    ]),
-  );
+  // A client is served by one server and talks to the others directly (#18, ADR 0020), so
+  // the origin it calls from cannot be known in advance. `*` is safe here because sessions
+  // are bearer tokens, not cookies, and the server strips the cookie it would set: there is
+  // no ambient authority for a foreign origin to borrow.
+  const trustedOrigins = ["*"];
 
   const authOptions = {
     database: db,

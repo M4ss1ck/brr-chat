@@ -20,6 +20,7 @@ import {
   setRange,
   settleOutbox,
   toWireOp,
+  type Account,
   type StoredOp,
 } from "./store.ts";
 
@@ -76,10 +77,10 @@ export interface DrainResult {
  * ack. A network failure throws with the outbox untouched, so the next online event retries
  * the same cids and the server deduplicates them.
  */
-export async function drainOutbox(base: string, token: string, username: string): Promise<DrainResult> {
-  const pending = (await getPendingOps(username)).map(toWireOp);
-  const outcome = await syncAndPersist(base, token, username, pending);
-  const failed = outcome.kind === "ok" ? await settleOutbox(username, outcome.response.acks) : [];
+export async function drainOutbox(account: Account): Promise<DrainResult> {
+  const pending = (await getPendingOps(account)).map(toWireOp);
+  const outcome = await syncAndPersist(account, pending);
+  const failed = outcome.kind === "ok" ? await settleOutbox(account, outcome.response.acks) : [];
   return { outcome, failed };
 }
 
@@ -91,29 +92,24 @@ export async function drainOutbox(base: string, token: string, username: string)
  * The returned response is the whole catch-up: final cursor, every ack, and the events from
  * every page, so callers keep talking to one response.
  */
-export async function syncAndPersist(
-  base: string,
-  token: string,
-  username: string,
-  outbox: Op[] = [],
-): Promise<SyncOutcome> {
-  let cursor = await getCursor(username);
+export async function syncAndPersist(account: Account, outbox: Op[] = []): Promise<SyncOutcome> {
+  let cursor = await getCursor(account);
   let pending = outbox;
   const events: Event[] = [];
   const acks: SyncResponse["acks"] = [];
   let skipped = 0;
 
   for (;;) {
-    const response = await postSyncRequest(base, token, buildSyncRequest(cursor, pending));
-    await setRange(response.range);
+    const response = await postSyncRequest(account.server, account.token, buildSyncRequest(cursor, pending));
+    await setRange(account.server, response.range);
     const outcome = classifySyncResponse(response);
     if (outcome.kind === "upgrade") return outcome;
 
-    await applyEvents(username, response.events);
+    await applyEvents(account, response.events);
     const previous = cursor;
     cursor = response.cursor;
     // Events first, cursor second: a failed IndexedDB write cannot strand them behind it.
-    await setCursor(username, cursor);
+    await setCursor(account, cursor);
     events.push(...response.events);
     acks.push(...response.acks);
     skipped += response.skipped;

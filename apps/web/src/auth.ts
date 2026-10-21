@@ -1,7 +1,8 @@
 // Auth over plain fetch (ADR 0014): BetterAuth endpoints called directly, with the bare
 // 32-char session token (ADR 0007). No better-auth/client bundle in the app shell.
 import { meteredFetch } from "./meter.ts";
-import { getSession, setSession, type Session } from "./store.ts";
+import { serverIdOf } from "./servers.ts";
+import { getSession, setSession, type Account, type Session } from "./store.ts";
 
 
 export const SIGN_UP_PATH = "/api/recovery/sign-up";
@@ -20,8 +21,23 @@ interface AuthPayload {
 }
 
 interface Exchange {
-  session: Session;
+  session: Account;
   recoveryCode: string;
+}
+
+/**
+ * A request's base is the server it goes to. Every session write is keyed by that origin, so
+ * signing in to a second server cannot overwrite the first one's account (ADR 0020).
+ */
+function serverOf(base: string): string {
+  const server = serverIdOf(base);
+  if (server === null) throw new Error(`auth: expected an http(s) server, got ${base}`);
+  return server;
+}
+
+async function remember(server: string, session: Session): Promise<Account> {
+  await setSession(server, session);
+  return { server, ...session };
 }
 
 async function postJson(
@@ -67,8 +83,8 @@ async function exchange(
   const session = sessionFrom(payload, res, path, username);
   const recoveryCode = codeFrom(payload, res, path);
   if (options.pending === true) session.recoveryPending = true;
-  await setSession(session);
-  return { session, recoveryCode };
+  const stored = await remember(serverOf(base), session);
+  return { session: stored, recoveryCode };
 }
 
 /**
@@ -81,15 +97,14 @@ export function signUp(base: string, username: string, password: string, invite?
   return exchange(base, SIGN_UP_PATH, body, username, { pending: true });
 }
 
-/** Username + password sign-in on the same device, returning the stored session. */
-export async function signIn(base: string, username: string, password: string): Promise<Session> {
+/** Username + password sign-in on the same device, returning the stored account. */
+export async function signIn(base: string, username: string, password: string): Promise<Account> {
   const { res, payload } = await postJson(base, SIGN_IN_PATH, { username, password });
   const session = sessionFrom(payload, res, SIGN_IN_PATH, username);
   // A signup that never finished can still be signed in to; say so, so the UI asks for the
   // type-back instead of hiding it behind a sync that always 403s.
   if (!(await recoveryConfirmed(base, session.token))) session.recoveryPending = true;
-  await setSession(session);
-  return session;
+  return remember(serverOf(base), session);
 }
 
 /** True unless the server says otherwise; a failed check must not block signing in. */
@@ -102,16 +117,17 @@ async function recoveryConfirmed(base: string, token: string): Promise<boolean> 
 
 /** Finish signup by typing back the last group of the code (ADR 0006). */
 export async function confirmRecovery(base: string, group: string): Promise<void> {
-  const session = await getSession();
+  const server = serverOf(base);
+  const session = await getSession(server);
   if (!session) throw new Error("Sign in first.");
   const { res, payload } = await postJson(base, CONFIRM_PATH, { group }, session.token);
   if (!res.ok) throw failure(res, payload, CONFIRM_PATH);
-  await setSession({ ...session, recoveryPending: false });
+  await setSession(server, { ...session, recoveryPending: false });
 }
 
 /** Issue a new code; the old one dies. Needs a signed-in session. */
 export async function regenerateRecovery(base: string): Promise<string> {
-  const session = await getSession();
+  const session = await getSession(serverOf(base));
   if (!session) throw new Error("Sign in first.");
   const { res, payload } = await postJson(base, REGENERATE_PATH, {}, session.token);
   return codeFrom(payload, res, REGENERATE_PATH);
@@ -130,14 +146,15 @@ export function redeemRecovery(base: string, username: string, code: string): Pr
  * dropping it first would leave a live session this device can no longer revoke.
  */
 export async function signOut(base: string): Promise<void> {
-  const session = await getSession();
+  const server = serverOf(base);
+  const session = await getSession(server);
   if (!session) return;
-  const res = await meteredFetch(`${base}${SIGN_OUT_PATH}`, {
+  const res = await meteredFetch(`${server}${SIGN_OUT_PATH}`, {
     method: "POST",
     headers: { Authorization: bearerHeader(session.token) },
   });
   if (!res.ok) throw new Error(`${SIGN_OUT_PATH} failed with status ${res.status}`);
-  await setSession(null);
+  await setSession(server, null);
 }
 
 /** The one place the bare token becomes a header (ADR 0007). */

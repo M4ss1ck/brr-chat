@@ -13,6 +13,7 @@ import { applyEvents, closeStore, getCursor, getGaps, getPosts, setCursor } from
 import { HistoryHttpError, advanceGaps, loadHistory } from "../src/history.ts";
 
 const originalFetch = globalThis.fetch;
+const account = { server: "http://chat.local", token: "token", username: "alice" };
 
 function post(seq: number, text: string): Event {
   return { tag: Tag.Post, seq, ts: seq, author: 9, scope: 3, text, media: null };
@@ -48,8 +49,8 @@ describe("loadHistory", () => {
   });
 
   test("asks for one page before the oldest cached event and caches it", async () => {
-    await applyEvents("alice", [post(50, "newer")]);
-    await setCursor("alice", 100);
+    await applyEvents(account, [post(50, "newer")]);
+    await setCursor(account, 100);
 
     const requests: ReturnType<typeof decodeHistoryRequest>[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -57,26 +58,26 @@ describe("loadHistory", () => {
       return historyResponse({ events: [post(40, "older")], more: true });
     }) as unknown as typeof fetch;
 
-    const outcome = await loadHistory("http://chat.local", "token", "alice", 3, 50);
+    const outcome = await loadHistory(account, 3, 50);
     expect(outcome.kind).toBe("ok");
     if (outcome.kind !== "ok") throw new Error("expected an in-range response");
 
     expect(requests).toEqual([{ v: 1, scope: 3, before: 50, limit: 100 }]);
     expect(outcome.response.more).toBe(true);
-    expect((await getPosts("alice", 3)).map((row) => row.text)).toEqual(["older", "newer"]);
+    expect((await getPosts(account, 3)).map((row) => row.text)).toEqual(["older", "newer"]);
     // History is reading, not catch-up: the sync cursor must not move.
-    expect(await getCursor("alice")).toBe(100);
+    expect(await getCursor(account)).toBe(100);
   });
 
   test("a page fetched into a full cache is shown, not evicted by its own write", async () => {
     const full: Event[] = Array.from({ length: 2000 }, (_, index) => post(5_001 + index, `cached ${index + 1}`));
-    await applyEvents("alice", full);
+    await applyEvents(account, full);
 
     globalThis.fetch = (async () =>
       historyResponse({ events: [post(4_901, "older 1"), post(4_902, "older 2")], more: false })) as unknown as typeof fetch;
-    await loadHistory("http://chat.local", "token", "alice", 3, 5_001);
+    await loadHistory(account, 3, 5_001);
 
-    const rows = await getPosts("alice", 3);
+    const rows = await getPosts(account, 3);
     expect(rows).toHaveLength(2000);
     expect(rows.map((row) => row.text)).toContain("older 1");
     expect(rows.map((row) => row.text)).toContain("older 2");
@@ -85,14 +86,14 @@ describe("loadHistory", () => {
 
   test("a refused request surfaces the HTTP status", async () => {
     globalThis.fetch = (async () => new Response("Unauthorized", { status: 401 })) as unknown as typeof fetch;
-    await expect(loadHistory("http://chat.local", "token", "alice", 3, 50)).rejects.toBeInstanceOf(HistoryHttpError);
+    await expect(loadHistory(account, 3, 50)).rejects.toBeInstanceOf(HistoryHttpError);
   });
 
   test("a gap marker is cached and a retried sync cannot duplicate the hole", async () => {
     const gap: Event = { tag: Tag.Gap, seq: 50, ts: 1, author: 0, scope: 3, after: 10, before: 50, count: 39 };
-    await applyEvents("alice", [gap]);
-    await applyEvents("alice", [gap]);
-    expect(await getGaps("alice", 3)).toEqual([{ scope: 3, after: 10, before: 50, count: 39, seq: 50 }]);
+    await applyEvents(account, [gap]);
+    await applyEvents(account, [gap]);
+    expect(await getGaps(account, 3)).toEqual([{ scope: 3, after: 10, before: 50, count: 39, seq: 50 }]);
   });
 
   test("a page shrinks the hole it filled and closes it at the hole's bottom", async () => {

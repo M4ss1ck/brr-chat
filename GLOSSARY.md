@@ -1,8 +1,14 @@
 # Glossary
 
 - **Server**: one isolated brr-chat community, a single binary plus one SQLite file. Never talks
-  to other servers.
-- **Account**: a user on one server. The same person on two servers has two unrelated accounts.
+  to other servers. Identified on a device by its origin (ADR 0020).
+- **Account**: a user on one server. The same person on two servers has two unrelated accounts;
+  a device holds one account per server.
+- **Server list**: the servers this device knows, each with its own account, cursor, outbox and
+  cached events. Adding one is a **server link** (a bare origin, `/signup/<token>` or
+  `/join/<token>`) or the QR code that encodes the same link (ADR 0020).
+- **Active server**: the entry in the server list whose groups, DMs and cursor are on screen.
+  Switching is local; it never merges two servers' logs.
 - **Recovery code**: 4×5 Crockford base32 characters shown once at signup and stored hashed. It is
   the only way back in when the password is lost and no session is left; losing it in that state
   loses the account (ADR 0006).
@@ -34,8 +40,9 @@
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.
 - **Cursor**: the last seq a client has applied. Sync returns everything after it.
-- **Outbox**: ops the device has queued and not yet had acked.
-- **Failed op**: a queued op the server refused for good (`NotFound`), kept locally with its
+- **Outbox**: ops one account on one server has queued and not yet had acked. It is per server,
+  like the cursor.
+- **Failed op**: a queued op one server refused for good (`NotFound`), kept locally with its
   drafted text and excluded from later syncs until the user discards it.
 - **Op**: a client's request to create an event, carrying a **cid**.
 - **cid**: 8 random bytes chosen by the device for an op, so retries never duplicate.

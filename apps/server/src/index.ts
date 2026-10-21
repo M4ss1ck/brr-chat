@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { createServerAdminService } from "./admin.ts";
+import { isPreflight, preflightResponse, withCors } from "./cors.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
 import { handleHistory } from "./history.ts";
 import { createInviteService } from "./invites.ts";
@@ -91,37 +92,43 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     quotaBytes: opts.mediaQuotaBytes ?? DEFAULT_MEDIA_QUOTA_BYTES,
   });
 
+  /** The app's routing table. One exit, so CORS and the cookie rule cannot be skipped. */
+  async function route(req: Request, ip?: string): Promise<Response> {
+    const url = new URL(req.url);
+    const recovered = await recovery.handle(req, url.pathname, ip);
+    if (recovered) return recovered;
+    const administered = await admin.handle(req, url.pathname);
+    if (administered) return administered;
+    const invited = await invites.handle(req, url.pathname);
+    if (invited) return invited;
+    const image = await media.handle(req, url);
+    if (image) return image;
+    if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
+      // The BetterAuth admin plugin mounts its own user-management routes under this base.
+      // They would be a second signup and ban path around registration policy and the purge
+      // transaction, so this server does not expose them; administration is /api/server.
+      if (url.pathname === "/api/auth/admin" || url.pathname.startsWith("/api/auth/admin/")) {
+        return new Response("Not Found", { status: 404 });
+      }
+      return auth.handler(req);
+    }
+    if (url.pathname === "/sync" && req.method === "POST") {
+      return handleSync(req, db, auth, limits);
+    }
+    if (url.pathname === "/history" && req.method === "POST") {
+      return handleHistory(req, db, auth);
+    }
+    const shell = serveShell(url.pathname, req.method, req.headers.get("accept-encoding"));
+    if (shell) return shell;
+    return new Response("Not Found", { status: 404 });
+  }
+
   return {
     db,
     auth,
     async fetch(req: Request, ip?: string): Promise<Response> {
-      const url = new URL(req.url);
-      const recovered = await recovery.handle(req, url.pathname, ip);
-      if (recovered) return recovered;
-      const administered = await admin.handle(req, url.pathname);
-      if (administered) return administered;
-      const invited = await invites.handle(req, url.pathname);
-      if (invited) return invited;
-      const image = await media.handle(req, url);
-      if (image) return image;
-      if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
-        // The BetterAuth admin plugin mounts its own user-management routes under this base.
-        // They would be a second signup and ban path around registration policy and the purge
-        // transaction, so this server does not expose them; administration is /api/server.
-        if (url.pathname === "/api/auth/admin" || url.pathname.startsWith("/api/auth/admin/")) {
-          return new Response("Not Found", { status: 404 });
-        }
-        return auth.handler(req);
-      }
-      if (url.pathname === "/sync" && req.method === "POST") {
-        return handleSync(req, db, auth, limits);
-      }
-      if (url.pathname === "/history" && req.method === "POST") {
-        return handleHistory(req, db, auth);
-      }
-      const shell = serveShell(url.pathname, req.method, req.headers.get("accept-encoding"));
-      if (shell) return shell;
-      return new Response("Not Found", { status: 404 });
+      if (isPreflight(req)) return preflightResponse();
+      return withCors(req, await route(req, ip));
     },
     close(): void {
       db.close();
