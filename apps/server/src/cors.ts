@@ -37,14 +37,39 @@ export function preflightResponse(): Response {
   return new Response(null, { status: 204, headers: PREFLIGHT_HEADERS });
 }
 
+/** BetterAuth's short-lived WebAuthn challenge cookie, plain or secure-prefixed (ADR 0021). */
+function isChallengeCookie(setCookie: string): boolean {
+  // BetterAuth prefixes its own cookies (`better-auth.better-auth-passkey`) and a secure
+  // origin adds `__Secure-` on top, so match the stable suffix.
+  const name = setCookie.slice(0, setCookie.indexOf("=")).trim();
+  return name.endsWith("better-auth-passkey");
+}
+
+/**
+ * The WebAuthn challenge is held in a cookie, so it only survives a same-origin passkey
+ * ceremony. `appOrigin` is the configured `baseURL`, not the listener address, so a reverse
+ * proxy that terminates TLS does not strip the challenge. It carries no identity: it is a
+ * random token for one in-flight challenge. Every other cookie, including the session, is
+ * still stripped (ADR 0020). A request without `Origin` is the browser's own same-origin GET.
+ */
+function sameOriginPasskey(req: Request, appOrigin: string): boolean {
+  if (!new URL(req.url).pathname.startsWith("/api/auth/passkey/")) return false;
+  const origin = req.headers.get("origin");
+  return origin === null || origin === appOrigin;
+}
+
 /**
  * Finishes a real response at the one exit of the app handler: CORS headers only when the
  * request came from another origin, and never a session cookie. A same-origin response pays
  * nothing, because bytes are money (ADR 0018).
  */
-export function withCors(req: Request, response: Response): Response {
+export function withCors(req: Request, response: Response, appOrigin: string): Response {
   const headers = new Headers(response.headers);
+  const challengeCookies = sameOriginPasskey(req, appOrigin)
+    ? headers.getSetCookie().filter(isChallengeCookie)
+    : [];
   headers.delete("set-cookie");
+  for (const cookie of challengeCookies) headers.append("set-cookie", cookie);
   const origin = req.headers.get("origin");
   if (origin !== null && origin !== new URL(req.url).origin) {
     for (const [name, value] of Object.entries(RESPONSE_HEADERS)) headers.set(name, value);

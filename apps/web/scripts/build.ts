@@ -26,6 +26,9 @@ const SHELL: readonly ShellFile[] = [
   { name: "icon.svg", contentType: "image/svg+xml", cacheControl: "max-age=86400" },
   // Loaded on demand by the Add-server panel, not part of the first load (ADR 0020).
   { name: "qr-scan.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
+  // Loaded on demand by the passkey buttons, so the WebAuthn library is not in the first
+  // load (ADR 0014, ADR 0021).
+  { name: "passkey.js", contentType: "text/javascript; charset=utf-8", cacheControl: "no-cache" },
 ];
 
 /** Paths the server answers. "/" and "/index.html" are the same document. */
@@ -37,6 +40,7 @@ const ROUTES: readonly { route: string; file: string }[] = [
   { route: "/manifest.webmanifest", file: "manifest.webmanifest" },
   { route: "/icon.svg", file: "icon.svg" },
   { route: "/qr-scan.js", file: "qr-scan.js" },
+  { route: "/passkey.js", file: "passkey.js" },
 ];
 
 const INDEX_HTML = `<!doctype html>
@@ -229,6 +233,7 @@ input[type="file"] { padding: .35rem; }
       <button type="button" id="sign-up">Create account</button>
       <button type="button" id="sign-in">Sign in</button>
     </form>
+    <button type="button" id="passkey-sign-in" hidden>Sign in with a passkey</button>
     <button type="button" id="show-recovery">Use a recovery code</button>
     <form id="recover-panel" hidden autocomplete="off">
       <h2>Recovery code</h2>
@@ -373,6 +378,11 @@ input[type="file"] { padding: .35rem; }
     </dl>
     <button type="button" id="sync">Sync</button>
     <button type="button" id="sign-out">Sign out</button>
+    <section id="passkey-panel" hidden>
+      <h2>Passkeys</h2>
+      <p class="note">A passkey signs you in with this device's screen lock, fingerprint or a security key. It never leaves the device; only its public half reaches the server.</p>
+      <button type="button" id="passkey-add">Add a passkey</button>
+    </section>
     <h2>Recovery code</h2>
     <p class="note">This code is the only way back in if you also lose your password and every signed-in device. Lose all of them and the account is gone: there is no email recovery and no admin reset.</p>
     <button type="button" id="regenerate">New recovery code</button>
@@ -425,6 +435,8 @@ async function bundle(): Promise<void> {
   await build({ ...shared, entryPoints: [join(webRoot, "src", "sw.ts")], outfile: join(distDir, "sw.js") });
   // The QR scanner is its own bundle so jsQR never rides in the app shell.
   await build({ ...shared, entryPoints: [join(webRoot, "src", "qr-scan.ts")], outfile: join(distDir, "qr-scan.js") });
+  // Same for the WebAuthn browser library: a password user never downloads it.
+  await build({ ...shared, entryPoints: [join(webRoot, "src", "passkey.ts")], outfile: join(distDir, "passkey.js") });
   writeFileSync(join(distDir, "index.html"), INDEX_HTML);
   writeFileSync(join(distDir, "manifest.webmanifest"), MANIFEST);
   writeFileSync(join(distDir, "icon.svg"), ICON);

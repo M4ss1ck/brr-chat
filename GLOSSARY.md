@@ -12,6 +12,9 @@
 - **Recovery code**: 4×5 Crockford base32 characters shown once at signup and stored hashed. It is
   the only way back in when the password is lost and no session is left; losing it in that state
   loses the account (ADR 0006).
+- **Passkey**: a WebAuthn credential held by the device, unlocked by its screen lock, fingerprint
+  or a security key. The server stores only the public key; sign-in is username-less because the
+  authenticator picks the account (ADR 0021).
 - **Scope**: what an event belongs to, either a **group** or a **DM** (two users). Scope 0
   means server-wide.
 - **Group**: a scope with members and roles (member, group admin, owner). Open (anyone can join)

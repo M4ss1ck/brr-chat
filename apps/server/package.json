@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
   },
   "dependencies": {
+    "@better-auth/passkey": "1.7.7",
     "@brr-chat/protocol": "workspace:*",
     "better-auth": "^1.7.7"
   }

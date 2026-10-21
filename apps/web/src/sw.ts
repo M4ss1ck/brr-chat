@@ -4,8 +4,8 @@
 // not need the service worker types hand-declared.
 const CACHE = "brr-shell-v1";
 const SHELL: readonly string[] = ["/", "/index.html", "/app.js", "/sw.js", "/manifest.webmanifest", "/icon.svg"];
-/** Fetched only when the Add-server panel opens; cached after the first use, not at install. */
-const LAZY: readonly string[] = ["/qr-scan.js"];
+/** Fetched only on the screen that needs it; cached after the first use, not at install. */
+const LAZY: readonly string[] = ["/qr-scan.js", "/passkey.js"];
 /** Never cached: credentials, sync payloads and media are always fresh from the server. */
 const NEVER_CACHE: readonly string[] = ["/api/auth/", "/sync", "/m/"];
 
