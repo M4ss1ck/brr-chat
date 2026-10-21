@@ -5,16 +5,19 @@ import type { Database } from "bun:sqlite";
 import {
   AckError,
   GAP_COVERED_TAGS,
+  MEDIA_THUMBHASH_MAX_BYTES,
   Role,
   Tag,
   decodeEventBytes,
   encodeEventBytes,
   type Ack,
   type Event,
+  type Media,
   type Op,
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
 import { AbuseLimiters } from "./limits.ts";
+import { attachMedia, liveMediaFor, removeMediaForEvent } from "./media-store.ts";
 import { isServerAdmin, tokenMatches } from "./settings.ts";
 
 /** How long a cid is remembered, so a retry returns the original seq (docs/PROTOCOL.md). */
@@ -342,6 +345,36 @@ function rememberOp(db: Database, actor: Actor, op: Op, tag: number, seq: number
   );
 }
 
+/**
+ * Media checks that do not write: the upload must belong to this account, not be attached
+ * yet, and carry the dimensions the server measured. Attaching happens after the event gets
+ * its seq, inside the same transaction.
+ */
+function mediaError(db: Database, actor: Actor, media: Media, now: number): AckError | null {
+  // The wire accepts up to 32 bytes for forward compatibility; the product's placeholder
+  // budget is 25, which is what keeps the whole media field under 40 B.
+  if (media.thumbhash.byteLength > MEDIA_THUMBHASH_MAX_BYTES) return AckError.Invalid;
+  const row = liveMediaFor(db, media.id, now);
+  if (!row || Number(row.owner) !== actor.wireId || row.event_seq !== null) return AckError.NotFound;
+  if (Number(row.full_width) !== media.w || Number(row.full_height) !== media.h) return AckError.Invalid;
+  return null;
+}
+
+/** Null when this op carries no image, otherwise the failure to return before writing. */
+function mediaFailure(db: Database, actor: Actor, media: Media | null, now: number): Failure | null {
+  if (media === null) return null;
+  const error = mediaError(db, actor, media, now);
+  return error === null ? null : { error };
+}
+
+/** Binds an already-validated upload to the event that shows it. */
+function attachUploaded(db: Database, media: Media, owner: number, seq: number, now: number): void {
+  if (attachMedia(db, media.id, owner, seq, media.w, media.h, now) !== "ok") {
+    // The check and this write are in one synchronous transaction, so this is an invariant.
+    throw new Error(`media ${media.id} could not be attached to event ${seq}`);
+  }
+}
+
 /** Applies one op. Every path returns an event seq or an ack error; nothing throws. */
 function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseLimiters): Applied | Failure {
   // The log works in seconds; the in-memory budgets work in milliseconds.
@@ -466,9 +499,10 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
       // Group scopes only: DMs have their own tag and their own slice.
       const denied = groupAccessError(db, actor, op.scope);
       if (denied !== null) return { error: denied };
-      if (op.text.trim().length === 0) return { error: AckError.Invalid };
-      // Media needs the upload pipeline (ADR 0011); accepting it here would silently drop it.
-      if (op.media !== null) return { error: AckError.Unsupported };
+      // A photo may stand alone; a post with neither text nor media is empty.
+      if (op.text.trim().length === 0 && op.media === null) return { error: AckError.Invalid };
+      const mediaDenied = mediaFailure(db, actor, op.media, now);
+      if (mediaDenied !== null) return mediaDenied;
       if (!limits.allowsMessage(actor.id, nowMs)) return { error: AckError.RateLimited };
       const seq = insertEvent(db, (next) => ({
         tag: Tag.Post,
@@ -477,16 +511,18 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
         author: actor.wireId,
         scope: op.scope,
         text: op.text,
-        media: null,
+        media: op.media,
       }));
+      if (op.media !== null) attachUploaded(db, op.media, actor.wireId, seq, now);
       return { seq, firstSeq: seq, state: false };
     }
     case Tag.Reply: {
       // One level only: a reply's parent must be a post in the same group.
       const denied = groupAccessError(db, actor, op.scope);
       if (denied !== null) return { error: denied };
-      if (op.text.trim().length === 0) return { error: AckError.Invalid };
-      if (op.media !== null) return { error: AckError.Unsupported };
+      if (op.text.trim().length === 0 && op.media === null) return { error: AckError.Invalid };
+      const mediaDenied = mediaFailure(db, actor, op.media, now);
+      if (mediaDenied !== null) return mediaDenied;
       const parent = headerFor(db, op.parent);
       if (!parent) return { error: AckError.NotFound };
       // A reply is not a valid parent, even in the right scope: that is Invalid, not NotFound.
@@ -502,8 +538,9 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
         scope: op.scope,
         parent: op.parent,
         text: op.text,
-        media: null,
+        media: op.media,
       }));
+      if (op.media !== null) attachUploaded(db, op.media, actor.wireId, seq, now);
       return { seq, firstSeq: seq, state: false };
     }
     case Tag.Reaction: {
@@ -548,6 +585,8 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
         target: op.target,
       }));
       db.query("INSERT INTO deleted_events (scope, target, seq) VALUES (?, ?, ?)").run(op.scope, op.target, seq);
+      // The image has no reader left, so its bytes stop counting against the quota.
+      removeMediaForEvent(db, op.target);
       return { seq, firstSeq: seq, state: false };
     }
     case Tag.Ban: {
@@ -667,9 +706,11 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
     }
     case Tag.Dm: {
       if (op.peer === 0 || op.peer === actor.wireId) return { error: AckError.Invalid };
-      if (op.text.trim().length === 0) return { error: AckError.Invalid };
-      // Media needs the upload pipeline (ADR 0011); accepting it here would silently drop it.
-      if (op.media !== null) return { error: AckError.Unsupported };
+      if (op.text.trim().length === 0 && op.media === null) return { error: AckError.Invalid };
+      // Validate the upload before opening a thread: a bad image must not spend the daily
+      // new-thread budget or create a scope.
+      const mediaDenied = mediaFailure(db, actor, op.media, now);
+      if (mediaDenied !== null) return mediaDenied;
 
       let scope = op.scope;
       let opening = false;
@@ -741,8 +782,9 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
         scope,
         peer: op.peer,
         text: op.text,
-        media: null,
+        media: op.media,
       }));
+      if (op.media !== null) attachUploaded(db, op.media, actor.wireId, seq, now);
       firstSeq = created ? scope : seq;
       return { seq, firstSeq, state: false };
     }
@@ -861,6 +903,18 @@ const VISIBLE_SQL = `
     AND ${BLOCKED_AUTHOR_SQL}
   )
 `;
+
+/**
+ * Whether one viewer may see one event. Media uses this to answer `GET /m/{id}` with the
+ * same visibility rules as `/sync`, so a non-member or a blocked viewer cannot fetch the
+ * bytes behind a placeholder they were never sent.
+ */
+export function eventVisibleTo(db: Database, viewer: number, seq: number): boolean {
+  const row = db
+    .query(`SELECT 1 AS ok FROM events e WHERE e.seq = ? AND (${VISIBLE_SQL})`)
+    .get(seq, viewer, viewer, viewer, viewer, viewer, viewer) as { ok: number } | null;
+  return row !== null;
+}
 
 function decodeRows(rows: EventRow[]): Event[] {
   const events: Event[] = [];

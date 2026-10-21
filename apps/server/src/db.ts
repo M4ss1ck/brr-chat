@@ -153,6 +153,25 @@ CREATE TABLE IF NOT EXISTS recovery_codes (
 )
 `.trim();
 
+// Uploaded image variants (ADR 0011). Bytes live in the same SQLite file as the log, so a
+// deployment is still one binary and one file. `event_seq` is the post, reply or DM that
+// shows the image; NULL means uploaded but not posted yet.
+const CREATE_MEDIA_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS media (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner INTEGER NOT NULL,
+  preview BLOB NOT NULL,
+  preview_width INTEGER NOT NULL,
+  preview_height INTEGER NOT NULL,
+  full BLOB NOT NULL,
+  full_width INTEGER NOT NULL,
+  full_height INTEGER NOT NULL,
+  bytes INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  event_seq INTEGER
+)
+`.trim();
+
 export function enforceDbFilePermissions(dbPath: string): void {
   if (!dbPath || dbPath === ":memory:") return;
   for (const suffix of ["", "-wal", "-shm"]) {
@@ -193,6 +212,7 @@ export function openDb(dbPath: string): Database {
   db.exec(CREATE_DM_SCOPES_TABLE_SQL);
   db.exec(CREATE_USER_BLOCKS_TABLE_SQL);
   db.exec(CREATE_PRIVATE_EVENTS_TABLE_SQL);
+  db.exec(CREATE_MEDIA_TABLE_SQL);
   db.exec(CREATE_SERVER_SETTINGS_TABLE_SQL);
   // Open registration is the only safe first-run default: a server that cannot accept its
   // first account cannot be administered at all. An install can close it in one request.
@@ -208,6 +228,7 @@ export function openDb(dbPath: string): Database {
   // One live token per group, and no two groups may share one. SQLite allows many NULLs.
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS chat_groups_invite_token ON chat_groups(invite_token);");
   db.exec("CREATE INDEX IF NOT EXISTS outbox_created ON outbox_ops(created_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS media_event ON media(event_seq);");
   db.exec(CREATE_RECOVERY_TABLE_SQL);
   return db;
 }

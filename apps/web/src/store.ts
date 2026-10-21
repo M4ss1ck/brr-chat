@@ -1,7 +1,7 @@
 // Local persistence for the PWA. IndexedDB only: no localStorage, no cookies, and every
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
-import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Op, type VersionRange } from "@brr-chat/protocol";
+import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Media, type Op, type VersionRange } from "@brr-chat/protocol";
 import { isMonthKey } from "./month.ts";
 
 const DB_NAME = "brr-chat";
@@ -236,6 +236,14 @@ export interface StoredGroup {
   open: boolean;
 }
 
+/** The inline image placeholder cached beside a post. Bytes are a plain array like cid. */
+export interface StoredMedia {
+  id: number;
+  w: number;
+  h: number;
+  thumbhash: number[];
+}
+
 export interface StoredPost {
   seq: number;
   ts: number;
@@ -244,6 +252,8 @@ export interface StoredPost {
   text: string;
   /** Seq of the post this replies to, or 0 for a top-level post. */
   parent: number;
+  /** Image placeholder, or null for a text-only post. The bytes are never cached. */
+  media: StoredMedia | null;
 }
 
 /** One account's latest reaction to one target and emoji. Toggling off keeps the record. */
@@ -323,6 +333,19 @@ function asGroup(value: unknown): StoredGroup | null {
   return { id: row.id, seq: row.seq, name: row.name, about: row.about, open: row.open };
 }
 
+function readMedia(value: unknown): StoredMedia | null {
+  const row = asObject(value);
+  if (!isUint(row.id) || row.id === 0 || !isUint(row.w) || row.w === 0 || !isUint(row.h) || row.h === 0) return null;
+  const thumbhash = row.thumbhash;
+  if (!Array.isArray(thumbhash) || thumbhash.length > 32) return null;
+  if (!thumbhash.every((byte) => isUint(byte) && byte <= 255)) return null;
+  return { id: row.id, w: row.w, h: row.h, thumbhash: thumbhash as number[] };
+}
+
+function toStoredMedia(media: Media | null): StoredMedia | null {
+  return media === null ? null : { id: media.id, w: media.w, h: media.h, thumbhash: [...media.thumbhash] };
+}
+
 function asPost(value: unknown): StoredPost | null {
   const row = asObject(value);
   if (!isUint(row.seq) || row.seq === 0) return null;
@@ -330,7 +353,17 @@ function asPost(value: unknown): StoredPost | null {
   if (typeof row.text !== "string") return null;
   // Rows written before replies existed have no parent field: they are top-level posts.
   if (row.parent !== undefined && !isUint(row.parent)) return null;
-  return { seq: row.seq, ts: row.ts, author: row.author, scope: row.scope, text: row.text, parent: isUint(row.parent) ? row.parent : 0 };
+  // Rows written before images existed have no media field: a text-only post.
+  const media = row.media === undefined || row.media === null ? null : readMedia(row.media);
+  return {
+    seq: row.seq,
+    ts: row.ts,
+    author: row.author,
+    scope: row.scope,
+    text: row.text,
+    parent: isUint(row.parent) ? row.parent : 0,
+    media,
+  };
 }
 
 function asReaction(value: unknown): StoredReaction | null {
@@ -457,6 +490,7 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
           scope: event.scope,
           text: event.text,
           parent: event.tag === Tag.Reply ? event.parent : 0,
+          media: toStoredMedia(event.media),
         };
         touchedPosts.add(event.scope);
         break;
@@ -768,6 +802,8 @@ export interface StoredOp {
   target?: number;
   emoji?: number;
   on?: boolean;
+  /** Inline image placeholder for a post, reply or DM. The upload happens before queueing. */
+  media?: StoredMedia;
 }
 
 function asStoredOp(value: unknown): StoredOp | null {
@@ -791,6 +827,10 @@ function asStoredOp(value: unknown): StoredOp | null {
   if (isUint(row.target)) op.target = row.target;
   if (isUint(row.emoji)) op.emoji = row.emoji;
   if (typeof row.on === "boolean") op.on = row.on;
+  if (row.media !== undefined && row.media !== null) {
+    const media = readMedia(row.media);
+    if (media) op.media = media;
+  }
   return op;
 }
 
@@ -822,14 +862,26 @@ export async function removeOutbox(username: string, cids: readonly Uint8Array[]
   await write(outboxKey(username), outbox.filter((op) => !done.has(hex(op.cid))));
 }
 
+function toWireMedia(media: StoredMedia | undefined): Media | null {
+  if (!media) return null;
+  return { id: media.id, w: media.w, h: media.h, thumbhash: new Uint8Array(media.thumbhash) };
+}
+
 /** Turns a stored row back into the protocol's op shape, with a real `cid` byte array. */
 export function toWireOp(op: StoredOp): Op {
   const cid = new Uint8Array(op.cid);
   switch (op.tag) {
     case Tag.Post:
-      return { cid, tag: Tag.Post, scope: op.scope, text: op.text ?? "", media: null };
+      return { cid, tag: Tag.Post, scope: op.scope, text: op.text ?? "", media: toWireMedia(op.media) };
     case Tag.Reply:
-      return { cid, tag: Tag.Reply, scope: op.scope, parent: op.parent ?? 0, text: op.text ?? "", media: null };
+      return {
+        cid,
+        tag: Tag.Reply,
+        scope: op.scope,
+        parent: op.parent ?? 0,
+        text: op.text ?? "",
+        media: toWireMedia(op.media),
+      };
     case Tag.Reaction:
       return {
         cid,
@@ -850,7 +902,7 @@ export function toWireOp(op: StoredOp): Op {
         scope: op.scope,
         peer: op.peer ?? 0,
         text: op.text ?? "",
-        media: null,
+        media: toWireMedia(op.media),
       };
     case Tag.GroupMeta:
       return {

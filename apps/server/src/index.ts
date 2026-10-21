@@ -6,6 +6,8 @@ import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
 import { handleHistory } from "./history.ts";
 import { createInviteService } from "./invites.ts";
 import { AbuseLimiters, DEFAULT_ABUSE_LIMITS, type AbuseLimitConfig } from "./limits.ts";
+import { createMediaService } from "./media.ts";
+import { DEFAULT_MEDIA_QUOTA_BYTES } from "./media-store.ts";
 import { serveShell } from "./pwa.ts";
 import { DEFAULT_RECOVERY_LIMITS, createRecoveryService, type RecoveryLimits } from "./recovery.ts";
 import { handleSync } from "./sync.ts";
@@ -23,6 +25,8 @@ export interface AppOptions {
   recoveryLimits?: Partial<RecoveryLimits>;
   /** Abuse budgets from ADR 0012; tests use it to shrink a window instead of waiting a day. */
   limits?: Partial<AbuseLimitConfig>;
+  /** Total media bytes the server stores; tests shrink it to reach the quota gate. */
+  mediaQuotaBytes?: number;
 }
 
 export type AuthInstance = Awaited<ReturnType<typeof initAuth>>;
@@ -83,6 +87,9 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
   );
   const invites = createInviteService(db, auth, baseURL, limits);
   const admin = createServerAdminService(db, auth, baseURL);
+  const media = createMediaService(db, auth, {
+    quotaBytes: opts.mediaQuotaBytes ?? DEFAULT_MEDIA_QUOTA_BYTES,
+  });
 
   return {
     db,
@@ -95,6 +102,8 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
       if (administered) return administered;
       const invited = await invites.handle(req, url.pathname);
       if (invited) return invited;
+      const image = await media.handle(req, url);
+      if (image) return image;
       if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
         // The BetterAuth admin plugin mounts its own user-management routes under this base.
         // They would be a second signup and ban path around registration policy and the purge
@@ -129,6 +138,8 @@ export interface CliOptions {
   baseURL: string;
   /** Absent when nothing set it: createApp then refuses to serve a real DB. */
   secret: string | undefined;
+  /** Total media bytes the server stores (ADR 0011). */
+  mediaQuotaBytes: number;
 }
 
 const DEFAULT_PORT = 3000;
@@ -164,17 +175,23 @@ export function parseCliOptions(argv: readonly string[], env: NodeJS.ProcessEnv 
   // default must be the URL the server is actually reachable at.
   const baseURL = firstValue(argv, ["--base-url"]) ?? env.BASE_URL ?? `http://${host}:${port}`;
   const secret = firstValue(argv, ["--secret"]) ?? env.BETTER_AUTH_SECRET;
-  return { port, dbPath, host, baseURL, secret };
+  const mediaQuotaBytes = Number(
+    firstValue(argv, ["--media-quota"]) ?? env.MEDIA_QUOTA_BYTES ?? DEFAULT_MEDIA_QUOTA_BYTES,
+  );
+  if (!Number.isSafeInteger(mediaQuotaBytes) || mediaQuotaBytes < 0) {
+    throw new Error(`media quota: expected a whole number of bytes, got ${mediaQuotaBytes}`);
+  }
+  return { port, dbPath, host, baseURL, secret, mediaQuotaBytes };
 }
 
 const USAGE = `brr-chat server
 
   bun apps/server/src/index.ts [--port 3000] [--db brr-chat.db] [--base-url http://host]
-                            [--secret <32+ chars>]
+                            [--secret <32+ chars>] [--media-quota <bytes>]
 
-  PORT, DB_PATH, BASE_URL and BETTER_AUTH_SECRET are read from the environment.
-  Flags override the environment. The app shell, the auth routes and /sync are all served
-  by this process.
+  PORT, DB_PATH, BASE_URL, BETTER_AUTH_SECRET and MEDIA_QUOTA_BYTES are read from the
+  environment. Flags override the environment. The app shell, the auth routes, /sync and
+  the image routes (/m) are all served by this process.
 `;
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
@@ -188,13 +205,16 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     host: opts.host,
     baseURL: opts.baseURL,
     secret: opts.secret,
+    mediaQuotaBytes: opts.mediaQuotaBytes,
   });
   const server = Bun.serve({
     port: opts.port,
     hostname: opts.host,
     fetch: (req, server) => app.fetch(req, server.requestIP(req)?.address),
-    // Sync is a single CBOR body; no request should hog a connection.
+    // A photo upload is capped at ~864 KB by the route itself; this is the HTTP-level
+    // backstop, kept large enough for a long offline outbox to drain in one /sync.
     idleTimeout: 30,
+    maxRequestBodySize: 8 * 1024 * 1024,
   });
 
   const stop = () => {

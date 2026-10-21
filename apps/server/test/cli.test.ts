@@ -21,4 +21,11 @@ describe("CLI options", () => {
     expect(opts.port).toBe(4017);
     expect(opts.dbPath).toBe("/tmp/chat.db");
   });
+
+  test("the media quota comes from the flag, then the environment, then 256 MB", () => {
+    expect(parseCliOptions([], {}).mediaQuotaBytes).toBe(256 * 1024 * 1024);
+    expect(parseCliOptions([], { MEDIA_QUOTA_BYTES: "1024" }).mediaQuotaBytes).toBe(1024);
+    expect(parseCliOptions(["--media-quota", "2048"], { MEDIA_QUOTA_BYTES: "1024" }).mediaQuotaBytes).toBe(2048);
+    expect(() => parseCliOptions(["--media-quota", "half"], {})).toThrow(/media quota/);
+  });
 });

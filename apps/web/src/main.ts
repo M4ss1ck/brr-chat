@@ -18,6 +18,7 @@ import { advanceGaps, loadHistory } from "./history.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
 import { formatBytes, meter, type MeterTotals } from "./meter.ts";
+import { mediaView, prepareImage, uploadImage, MediaUploadError, clearMediaCache } from "./media.ts";
 import { qrSvg } from "./qr.ts";
 import { syncAndPersist, SyncHttpError } from "./sync.ts";
 import {
@@ -45,6 +46,7 @@ import {
   type StoredBan,
   type StoredDm,
   type StoredGroup,
+  type StoredMedia,
   type StoredMember,
   type StoredPost,
   type StoredProfile,
@@ -58,6 +60,10 @@ let currentDm: number | null = null;
 let pendingDmPeer: number | null = null;
 /** Post being replied to in the composer, or null for a top-level post. */
 let replyingTo: number | null = null;
+/** A photo chosen for the next group post or reply; uploaded when the post is sent. */
+let pendingPostImage: File | null = null;
+/** A photo chosen for the next DM; uploaded when the message is sent. */
+let pendingDmImage: File | null = null;
 /** Taps are serialized, so the second tap sees the first one's new state. */
 let reactionQueue: Promise<void> = Promise.resolve();
 /** The invite link currently shown for this group, if any. */
@@ -96,6 +102,9 @@ interface ViewContext {
   self: number | null;
   /** This account's role in the open group; Role.None in a DM. */
   role: number;
+  /** Server origin and session token, so a tapped image can fetch with credentials. */
+  base: string;
+  token: string;
 }
 
 function el<T extends HTMLElement>(id: string): T | null {
@@ -335,6 +344,7 @@ function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
       currentDm = null;
       pendingDmPeer = null;
       cancelReply();
+      clearImages();
       void renderGroup();
       void renderDm();
       void refreshGroups();
@@ -394,6 +404,7 @@ function dmItem(
     currentGroup = null;
     pendingDmPeer = null;
     cancelReply();
+    clearImages();
     void renderGroup();
     void renderDm();
     void refreshDms();
@@ -467,7 +478,21 @@ function postItem(post: StoredPost, context: ViewContext, replies: StoredPost[] 
   text.className = "text";
   text.textContent = post.text;
 
-  body.append(meta, text);
+  body.append(meta);
+  if (post.text.length > 0) body.append(text);
+  if (post.media !== null) {
+    body.append(
+      mediaView(
+        {
+          id: post.media.id,
+          w: post.media.w,
+          h: post.media.h,
+          thumbhash: new Uint8Array(post.media.thumbhash),
+        },
+        { base: context.base, token: context.token },
+      ),
+    );
+  }
   // DMs are a flat thread: no reactions or reply affordance on a message.
   if (interactive) {
     const actions = document.createElement("div");
@@ -521,6 +546,63 @@ function cancelReply(): void {
   replyingTo = null;
   show("reply-note", false);
   setText("reply-label", "");
+}
+
+// ---- photos in the composer ----
+
+function imageIds(slot: "post" | "dm"): { input: string; note: string; clear: string } {
+  return slot === "post"
+    ? { input: "post-image", note: "post-image-note", clear: "post-image-clear" }
+    : { input: "dm-image", note: "dm-image-note", clear: "dm-image-clear" };
+}
+
+function chooseImage(slot: "post" | "dm"): void {
+  const ids = imageIds(slot);
+  const input = el<HTMLInputElement>(ids.input);
+  const file = input?.files?.[0] ?? null;
+  if (file !== null && file.type.length > 0 && !file.type.startsWith("image/")) {
+    message("Choose an image file.");
+    if (input) input.value = "";
+    return;
+  }
+  if (slot === "post") pendingPostImage = file;
+  else pendingDmImage = file;
+  show(ids.note, file !== null);
+  setText(ids.note, file === null ? "" : `Photo ready: ${file.name}`);
+  show(ids.clear, file !== null);
+}
+
+function clearImage(slot: "post" | "dm"): void {
+  const ids = imageIds(slot);
+  if (slot === "post") pendingPostImage = null;
+  else pendingDmImage = null;
+  const input = el<HTMLInputElement>(ids.input);
+  if (input) input.value = "";
+  show(ids.note, false);
+  setText(ids.note, "");
+  show(ids.clear, false);
+}
+
+/** Moving to another group or conversation drops whatever photo was being attached. */
+function clearImages(): void {
+  clearImage("post");
+  clearImage("dm");
+}
+
+function uploadFailure(err: unknown): string {
+  if (err instanceof MediaUploadError) return err.message;
+  return err instanceof Error ? err.message : "Could not send that photo.";
+}
+
+/** Resizes, encodes and uploads one photo; the post is queued only after the id exists. */
+async function uploadSelected(file: File): Promise<StoredMedia> {
+  const session = await getSession();
+  if (!session) throw new Error("Sign in first.");
+  message("Preparing photo…");
+  const prepared = await prepareImage(file);
+  message("Uploading photo…");
+  const uploaded = await uploadImage(location.origin, session.token, prepared);
+  return { id: uploaded.id, w: uploaded.w, h: uploaded.h, thumbhash: [...prepared.thumbhash] };
 }
 
 async function setMemberRole(user: number, role: number): Promise<void> {
@@ -652,6 +734,8 @@ async function renderGroup(): Promise<void> {
     reactions: tallyReactions(await getReactions(session.username, group.id), self),
     self,
     role: myRole,
+    base: location.origin,
+    token: session.token,
   };
   const posts = await getPosts(session.username, group.id);
   const roots = posts.filter((post) => post.parent === 0);
@@ -789,6 +873,7 @@ async function completeInvite(): Promise<void> {
     }
     pendingInvite = null;
     cancelReply();
+    clearImages();
     currentGroup = resolved.group;
     if (location.pathname.startsWith("/join/")) history.replaceState({}, "", "/");
     const response = await syncNow();
@@ -835,7 +920,14 @@ async function renderDm(): Promise<void> {
   setText("dm-title", `Direct message · ${name}`);
 
   const self = await getSelf(session.username);
-  const context: ViewContext = { profiles, reactions: new Map(), self, role: Role.None };
+  const context: ViewContext = {
+    profiles,
+    reactions: new Map(),
+    self,
+    role: Role.None,
+    base: location.origin,
+    token: session.token,
+  };
   const messages = scope === null ? [] : await getPosts(session.username, scope);
   const list = el("dm-messages");
   if (list) list.replaceChildren(...messages.map((message) => postItem(message, context, [], false)));
@@ -896,6 +988,8 @@ async function loadOlder(kind: "group" | "dm"): Promise<void> {
 
 /** Everything that follows a successful sign-up/in/recovery, including a pending link. */
 async function afterAuth(): Promise<void> {
+  // A session change must not inherit another account's downloaded images.
+  clearMediaCache();
   await refresh();
   await syncNow();
   await completeInvite();
@@ -1110,6 +1204,7 @@ async function createGroup(): Promise<void> {
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
   if (ack && "seq" in ack) {
     cancelReply();
+    clearImages();
     currentGroup = ack.seq;
     currentDm = null;
     pendingDmPeer = null;
@@ -1131,6 +1226,7 @@ async function joinGroup(group: StoredGroup): Promise<void> {
     role: Role.Member,
   });
   cancelReply();
+  clearImages();
   currentGroup = group.id;
   currentDm = null;
   pendingDmPeer = null;
@@ -1168,6 +1264,7 @@ async function openDm(): Promise<void> {
   pendingDmPeer = existing ? null : profile.user;
   currentDm = existing ? existing.id : null;
   cancelReply();
+  clearImages();
   clear("dm-username");
   await renderGroup();
   await renderDm();
@@ -1181,8 +1278,8 @@ async function sendDm(): Promise<void> {
     return;
   }
   const text = value("dm-text");
-  if (text.length === 0) {
-    message("Write something first.");
+  if (text.length === 0 && pendingDmImage === null) {
+    message("Write something or attach a photo first.");
     return;
   }
 
@@ -1202,10 +1299,27 @@ async function sendDm(): Promise<void> {
     return;
   }
 
+  let media: StoredMedia | null = null;
+  if (pendingDmImage !== null) {
+    try {
+      media = await uploadSelected(pendingDmImage);
+    } catch (err) {
+      message(uploadFailure(err));
+      return;
+    }
+  }
+
   // scope 0 lets the server open (or reuse) the single scope for this pair; a retry reuses
   // the same cid through the outbox, so it can never create a second conversation.
-  const queued = await enqueueOp(session.username, { tag: Tag.Dm, scope: scope ?? 0, peer: peer ?? 0, text });
+  const queued = await enqueueOp(session.username, {
+    tag: Tag.Dm,
+    scope: scope ?? 0,
+    peer: peer ?? 0,
+    text,
+    ...(media === null ? {} : { media }),
+  });
   clear("dm-text");
+  clearImage("dm");
   const response = await syncNow();
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
   if (ack && "seq" in ack) {
@@ -1226,8 +1340,8 @@ async function postMessage(): Promise<void> {
     message("Sign in first.");
     return;
   }
-  if (text.length === 0) {
-    message("Write something first.");
+  if (text.length === 0 && pendingPostImage === null) {
+    message("Write something or attach a photo first.");
     return;
   }
   if (currentGroup === null) {
@@ -1236,13 +1350,25 @@ async function postMessage(): Promise<void> {
   }
   const scope = currentGroup;
   const parent = replyingTo;
+
+  let media: StoredMedia | null = null;
+  if (pendingPostImage !== null) {
+    try {
+      media = await uploadSelected(pendingPostImage);
+    } catch (err) {
+      message(uploadFailure(err));
+      return;
+    }
+  }
+
   await enqueueOp(
     session.username,
     parent === null
-      ? { tag: Tag.Post, scope, text }
-      : { tag: Tag.Reply, scope, parent, text },
+      ? { tag: Tag.Post, scope, text, ...(media === null ? {} : { media }) }
+      : { tag: Tag.Reply, scope, parent, text, ...(media === null ? {} : { media }) },
   );
   clear("post-text");
+  clearImage("post");
   cancelReply();
   await syncNow();
 }
@@ -1272,7 +1398,9 @@ async function toggleReaction(target: number, emoji: number): Promise<void> {
 async function leave(): Promise<void> {
   try {
     await signOut(location.origin);
+    clearMediaCache();
     cancelReply();
+    clearImages();
     currentGroup = null;
     currentDm = null;
     pendingDmPeer = null;
@@ -1304,6 +1432,8 @@ function wire(): void {
   el<HTMLButtonElement>("recover")?.addEventListener("click", () => void recover());
   el<HTMLButtonElement>("create")?.addEventListener("click", () => void createGroup());
   el<HTMLButtonElement>("post")?.addEventListener("click", () => void postMessage());
+  el<HTMLInputElement>("post-image")?.addEventListener("change", () => chooseImage("post"));
+  el<HTMLButtonElement>("post-image-clear")?.addEventListener("click", () => clearImage("post"));
   el<HTMLButtonElement>("copy-invite")?.addEventListener("click", () => void copyInvite());
   el<HTMLButtonElement>("rotate-invite")?.addEventListener("click", () => void rotateCurrentInvite());
   el<HTMLButtonElement>("cancel-reply")?.addEventListener("click", () => {
@@ -1312,6 +1442,8 @@ function wire(): void {
   });
   el<HTMLButtonElement>("dm-start")?.addEventListener("click", () => void openDm());
   el<HTMLButtonElement>("dm-send")?.addEventListener("click", () => void sendDm());
+  el<HTMLInputElement>("dm-image")?.addEventListener("change", () => chooseImage("dm"));
+  el<HTMLButtonElement>("dm-image-clear")?.addEventListener("click", () => clearImage("dm"));
   el<HTMLButtonElement>("save-server-settings")?.addEventListener("click", () => void saveAdminSettings());
   el<HTMLButtonElement>("rotate-server-invite")?.addEventListener("click", () => void rotateAdminInvite());
   el<HTMLButtonElement>("copy-server-invite")?.addEventListener("click", () => void copyServerInvite());

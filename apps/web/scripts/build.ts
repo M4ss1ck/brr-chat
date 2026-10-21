@@ -124,6 +124,15 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 .post .reply { margin: 0 0 0 .2rem; padding: .2rem .5rem; font-size: .8rem; }
 .post .reply[aria-pressed="true"] { border-color: #d8c56a; }
 .post .delete { padding: .2rem .5rem; font-size: .8rem; color: #e0a090; }
+.post .media {
+  display: block; width: 100%; max-width: 22rem; margin: .45rem 0 0; padding: 0;
+  border: 1px solid #2f2e25; border-radius: .4rem; overflow: hidden;
+  background: #17170f; cursor: zoom-in;
+}
+.post .media img { display: block; width: 100%; height: auto; }
+.post .media.loading img { opacity: .55; }
+.post .media.failed::after { content: "Tap to retry"; display: block; padding: .4rem; color: #e0a090; font-size: .8rem; }
+input[type="file"] { padding: .35rem; }
 #member-list li, #banned-list li, #server-users li { font-size: .85rem; }
 #member-list button, #banned-list button, #server-users button { margin: 0; padding: .2rem .5rem; font-size: .78rem; }
 #server-invite-panel { margin: .6rem 0; padding: .6rem; border: 1px solid #4a4740; border-radius: .4rem; }
@@ -215,6 +224,11 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <label>Message
         <input id="post-text" autocomplete="off" autocapitalize="sentences">
       </label>
+      <label>Photo
+        <input id="post-image" type="file" accept="image/*">
+      </label>
+      <p id="post-image-note" class="note" hidden></p>
+      <button type="button" id="post-image-clear" hidden>Remove photo</button>
       <button type="button" id="post">Post</button>
     </section>
 
@@ -230,6 +244,11 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <label>Message
         <input id="dm-text" autocomplete="off" autocapitalize="sentences">
       </label>
+      <label>Photo
+        <input id="dm-image" type="file" accept="image/*">
+      </label>
+      <p id="dm-image-note" class="note" hidden></p>
+      <button type="button" id="dm-image-clear" hidden>Remove photo</button>
       <button type="button" id="dm-send">Send</button>
     </section>
 

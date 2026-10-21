@@ -25,6 +25,11 @@
   signup regardless of mode (ADR 0012).
 - **Server invite link**: a server's one URL (`/signup/<token>`) for creating an account in
   `invite` mode. A server admin can rotate it; the old link stops working at once (ADR 0017).
+- **Media**: a post, reply or DM image. The event carries only `id`, `w`, `h` and a ThumbHash
+  placeholder; the two WebP variants (320 px and 1280 px) are stored by the server and fetched
+  only when the user taps (ADR 0011, ADR 0019).
+- **Media quota**: the total bytes of stored image variants one server keeps (default 256 MB),
+  checked and spent at upload, returned when a post is deleted.
 - **Event**: one entry in the server's append-only log, `[tag, seq, ts, author, scope, ...]`.
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.

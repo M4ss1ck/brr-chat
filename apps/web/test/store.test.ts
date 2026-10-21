@@ -158,7 +158,7 @@ describe("store (IndexedDB)", () => {
       { group: 10, user: 1, role: Role.Owner, seq: 11 },
       { group: 10, user: 2, role: Role.Member, seq: 12 },
     ]);
-    expect(await getPosts("alice", 10)).toEqual([{ seq: 13, ts: 103, author: 1, scope: 10, text: "hola", parent: 0 }]);
+    expect(await getPosts("alice", 10)).toEqual([{ seq: 13, ts: 103, author: 1, scope: 10, text: "hola", parent: 0, media: null }]);
     expect((await getProfiles("alice")).get(1)).toEqual({
       user: 1,
       seq: 14,
@@ -179,8 +179,8 @@ describe("store (IndexedDB)", () => {
 
     expect(await getDmScopes("alice")).toEqual([{ id: 40, seq: 40, a: 1, b: 2 }]);
     expect(await getDmMessages("alice", 40)).toEqual([
-      { seq: 41, ts: 401, author: 1, scope: 40, text: "hola", parent: 0 },
-      { seq: 42, ts: 402, author: 2, scope: 40, text: "te oigo", parent: 0 },
+      { seq: 41, ts: 401, author: 1, scope: 40, text: "hola", parent: 0, media: null },
+      { seq: 42, ts: 402, author: 2, scope: 40, text: "te oigo", parent: 0, media: null },
     ]);
     // No session, no network: a reopened store still renders the conversation.
     await closeStore();
@@ -258,9 +258,66 @@ describe("store (IndexedDB)", () => {
       { tag: Tag.Reply, seq: 41, ts: 401, author: 2, scope: 10, parent: 40, text: "child", media: null },
     ]);
     expect(await getPosts("alice", 10)).toEqual([
-      { seq: 40, ts: 400, author: 1, scope: 10, text: "parent", parent: 0 },
-      { seq: 41, ts: 401, author: 2, scope: 10, text: "child", parent: 40 },
+      { seq: 40, ts: 400, author: 1, scope: 10, text: "parent", parent: 0, media: null },
+      { seq: 41, ts: 401, author: 2, scope: 10, text: "child", parent: 40, media: null },
     ]);
+  });
+
+  test("a post's image placeholder caches, and the image bytes never enter the store", async () => {
+    const thumbhash = [1, 2, 3, 4, 5, 6, 7, 8];
+    await applyEvents("alice", [
+      {
+        tag: Tag.Post,
+        seq: 80,
+        ts: 800,
+        author: 1,
+        scope: 10,
+        text: "",
+        media: { id: 9, w: 1280, h: 800, thumbhash: new Uint8Array(thumbhash) },
+      },
+    ]);
+
+    const [post] = await getPosts("alice", 10);
+    expect(post?.media).toEqual({ id: 9, w: 1280, h: 800, thumbhash });
+    expect(post?.text).toBe("");
+    // A reopened store renders the placeholder offline; the full bytes were never cached.
+    await closeStore();
+    expect((await getPosts("alice", 10))[0]?.media).toEqual({ id: 9, w: 1280, h: 800, thumbhash });
+    expect(await getPosts("bob", 10)).toEqual([]);
+  });
+
+  test("a post op round-trips its media placeholder through the outbox", async () => {
+    const media = { id: 7, w: 1280, h: 800, thumbhash: [9, 8, 7] };
+    const stored = await enqueueOp("alice", { tag: Tag.Post, scope: 5, text: "", media });
+    expect(toWireOp(stored)).toEqual({
+      cid: new Uint8Array(stored.cid),
+      tag: Tag.Post,
+      scope: 5,
+      text: "",
+      media: { id: 7, w: 1280, h: 800, thumbhash: new Uint8Array([9, 8, 7]) },
+    });
+    expect(await getOutbox("alice")).toEqual([stored]);
+  });
+
+  test("old rows and corrupt media read as text-only posts, never as garbage", async () => {
+    const store = await rawStore();
+    try {
+      await store.put("posts:alice:10", {
+        "90": { seq: 90, ts: 900, author: 1, scope: 10, text: "old", parent: 0 },
+        "91": {
+          seq: 91,
+          ts: 901,
+          author: 1,
+          scope: 10,
+          text: "bad",
+          parent: 0,
+          media: { id: "nine", w: 10, h: 10, thumbhash: [] },
+        },
+      });
+    } finally {
+      store.close();
+    }
+    expect((await getPosts("alice", 10)).map((post) => post.media)).toEqual([null, null]);
   });
 
   test("reaction counts resync without double-counting and keep the latest toggle", async () => {
@@ -305,7 +362,7 @@ describe("store (IndexedDB)", () => {
   test("a reaction row from before this shell reads as absent, never as garbage", async () => {
     const store = await rawStore();
     try {
-      await store.put("reactions:alice", { "40:2:2": { scope: 10, target: 40, emoji: 9, user: 2, on: true, seq: 1 } });
+      await store.put("reactions:alice:10", { "40:2:2": { scope: 10, target: 40, emoji: 9, user: 2, on: true, seq: 1 } });
     } finally {
       store.close();
     }
@@ -365,7 +422,7 @@ describe("store (IndexedDB)", () => {
       { tag: Tag.Post, seq: 75, ts: 705, author: 1, scope: 10, text: "still here", media: null },
     ]);
     expect(await getPosts("alice", 10)).toEqual([
-      { seq: 75, ts: 705, author: 1, scope: 10, text: "still here", parent: 0 },
+      { seq: 75, ts: 705, author: 1, scope: 10, text: "still here", parent: 0, media: null },
     ]);
     expect(await getReactions("alice", 10)).toEqual([]);
   });
