@@ -45,10 +45,10 @@ function acceptsBrotli(acceptEncoding: string | null): boolean {
  */
 export function serveShell(pathname: string, method: string, acceptEncoding: string | null = null): Response | null {
   // An invite link is a deep link into the same app. The shell reads the token from the
-  // path, so every /join/<token> serves the document instead of a 404.
+  // path, so every /join/<token> or /signup/<token> serves the document instead of a 404.
   const file =
     SHELL_ROUTES[pathname] ??
-    (/^\/join\/[A-Za-z0-9_-]+\/?$/.test(pathname) ? SHELL_ROUTES["/index.html"] : undefined);
+    (/^\/(?:join|signup)\/[A-Za-z0-9_-]+\/?$/.test(pathname) ? SHELL_ROUTES["/index.html"] : undefined);
   if (!file) return null;
   if (method !== "GET" && method !== "HEAD") {
     return new Response("Method Not Allowed", {

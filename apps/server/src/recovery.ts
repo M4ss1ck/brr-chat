@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { AuthInstance } from "./index.ts";
 import { FixedWindowCounter, type SignupBudget } from "./limits.ts";
+import { promoteBootstrapAdmin, readServerSettings, signupGate } from "./settings.ts";
 
 // Account recovery by code only (ADR 0006). The code is 4 groups of 5 Crockford base32
 // characters: 100 bits, shown once, stored as hashes. Signing up is not finished until the
@@ -202,6 +203,32 @@ export function createRecoveryService(
       );
     }
     const raw = await req.arrayBuffer();
+    // The invite is ours, not BetterAuth's. Read it before the account exists, then forward
+    // the body without it so an unknown field never reaches the user row. A body that is not
+    // JSON is left for BetterAuth to reject.
+    const bytes = new Uint8Array(raw);
+    let body: Record<string, unknown> | null = null;
+    try {
+      const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        body = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not JSON: no invite to read, and BetterAuth will answer with its own 400.
+    }
+    const invite = typeof body?.invite === "string" ? body.invite : null;
+    const policy = signupGate(readServerSettings(db), invite);
+    if (!policy.ok) {
+      signupBudget.refund(ip, now);
+      return json(policy.status, { error: policy.error });
+    }
+
+    let forwarded = raw;
+    if (body !== null && Object.hasOwn(body, "invite")) {
+      const { invite: _invite, ...rest } = body;
+      forwarded = new TextEncoder().encode(JSON.stringify(rest)).buffer;
+    }
+
     // Our path is an alias; BetterAuth only knows its own sign-up route.
     const authURL = new URL(req.url);
     authURL.pathname = "/api/auth/sign-up/email";
@@ -209,7 +236,7 @@ export function createRecoveryService(
       new Request(authURL.toString(), {
         method: "POST",
         headers: req.headers,
-        body: raw,
+        body: forwarded,
       }),
     );
     if (!upstream.ok) {
@@ -248,7 +275,15 @@ export function createRecoveryService(
     if (!row) return json(409, { error: "this account has no recovery code; regenerate one" });
     if (!confirmsLastGroup(typed, row)) return json(400, { error: "that is not the last group of your code" });
 
-    db.query("UPDATE recovery_codes SET confirmed = 1, updated_at = ? WHERE user_id = ?").run(Date.now(), session.user.id);
+    db.transaction(() => {
+      db.query("UPDATE recovery_codes SET confirmed = 1, updated_at = ? WHERE user_id = ?").run(
+        Date.now(),
+        session.user.id,
+      );
+      // Bootstrap happens only after signup is finished: an account that never types back its
+      // code must not hold the server's only admin role forever (ADR 0017).
+      promoteBootstrapAdmin(db, session.user.id);
+    })();
     return json(200, { confirmed: true });
   }
 
@@ -276,13 +311,20 @@ export function createRecoveryService(
       return json(429, { error: "too many attempts; try again later" }, { "Retry-After": String(gate.retryAfter) });
     }
 
-    const user = db.query("SELECT id FROM user WHERE lower(username) = ?").get(key) as { id: string } | null;
+    const user = db.query("SELECT id, banned FROM user WHERE lower(username) = ?").get(key) as {
+      id: string;
+      banned: number | null;
+    } | null;
     const row = user ? rowFor(db, user.id) : null;
     // Hash even when there is no row, so an unknown username costs the same as a wrong code.
     const expected = row?.code_hash ?? new Uint8Array(HASH_BYTES);
     const normalized = normalizeRecoveryCode(code);
     const matches = matchesCode(normalized, expected);
-    if (user === null || row === null || normalized.length !== RECOVERY_CODE_LENGTH || !matches) {
+    // A server ban is an access ban, not just a session revocation: a recovery code must not
+    // mint a fresh session for a banned account (ADR 0012, ADR 0017). The check stays after
+    // the hash so a banned username answers in the same time as any other wrong attempt.
+    const banned = Number(user?.banned) === 1;
+    if (user === null || row === null || banned || normalized.length !== RECOVERY_CODE_LENGTH || !matches) {
       return json(401, { error: "invalid username or recovery code" });
     }
 

@@ -29,6 +29,20 @@ bun run --cwd apps/server dev         # serve /, /sync and auth + recovery on ht
 Signup shows one recovery code, once, and will not finish until its last group is typed back.
 Keep it: there is no email recovery and no admin reset (ADR 0006).
 
+The first account on a fresh server is its **server admin** (ADR 0017). That account sees a
+"Server administration" panel: registration mode (open / invite / closed), an emergency freeze
+switch, the server invite link for `invite` mode (`/signup/<token>`), and every account
+with a server-wide ban switch. A server ban revokes all of that account's sessions, removes it
+from every group and DM, and tells its devices to purge those scopes. Change the policy over
+JSON if you prefer:
+
+```sh
+# TOKEN is any signed-in server admin's 32-char bearer token.
+curl -X POST http://localhost:3000/api/server/settings \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"invite","frozen":false}'
+```
+
 One binary, no files beside it:
 
 ```sh

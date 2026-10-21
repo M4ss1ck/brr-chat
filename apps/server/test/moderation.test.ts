@@ -100,6 +100,21 @@ function setServerAdmin(app: ServerApp, username: string): void {
   app.db.query("UPDATE user SET role = 'admin' WHERE username = ?").run(username);
 }
 
+/** A fresh session after a ban revoked the old one. */
+async function signIn(app: ServerApp, username: string): Promise<string> {
+  const res = await app.fetch(
+    new Request("http://chat.local/api/auth/sign-in/username", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "http://chat.local" },
+      body: JSON.stringify({ username, password: "password1234" }),
+    }),
+  );
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { token?: string };
+  if (body.token === undefined) throw new Error("sign in returned no token");
+  return body.token;
+}
+
 async function sync(app: ServerApp, token: string, cursor: number, outbox: Op[] = []): Promise<SyncResponse> {
   const res = await app.fetch(
     new Request("http://chat.local/sync", {
@@ -516,7 +531,10 @@ describe("Slice 6: group moderation", () => {
       const liftCid = cid();
       const lifted = await sync(app, dave.account.token, banned.cursor, [banOp(liftCid, 0, alice.wire, false)]);
       seqOf(lifted, liftCid);
-      expect(await syncStatus(app, alice.account.token, afterCarol.cursor)).toBe(200);
+      // The ban revoked the session; an unban restores the account, not the stolen token.
+      expect(await syncStatus(app, alice.account.token, afterCarol.cursor)).toBe(401);
+      const aliceAgain = await signIn(app, "alice");
+      expect(await syncStatus(app, aliceAgain, afterCarol.cursor)).toBe(200);
       // The ban removed access: an unban does not quietly restore group powers.
       expect(memberRole(app, groupId, alice.wire)).toBeNull();
     } finally {
@@ -578,7 +596,8 @@ describe("Slice 6: group moderation", () => {
       const liftCid = cid();
       const lifted = await sync(app, dave.account.token, banned.cursor, [banOp(liftCid, 0, alice.wire, false)]);
       seqOf(lifted, liftCid);
-      const back = await sync(app, alice.account.token, 0, []);
+      const backToken = await signIn(app, "alice");
+      const back = await sync(app, backToken, 0, []);
       expect(
         back.events.some((event) => event.tag === Tag.ScopeLeft && event.scope === groupId && event.purge),
       ).toBe(true);
@@ -686,6 +705,9 @@ describe("Slice 6: group moderation", () => {
       const alice = await client(app, "alice", 25);
       const bob = await client(app, "bob");
       const carol = await client(app, "carol");
+      // The first account on a fresh server is its bootstrap admin; this test is about a
+      // plain group owner, so take that role away first (ADR 0017).
+      app.db.query("UPDATE user SET role = 'user' WHERE username = 'alice'").run();
       const { groupId } = await groupWithMembers(app, alice, [{ client: bob }]);
 
       const deniedCid = cid();

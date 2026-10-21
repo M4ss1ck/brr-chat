@@ -2,7 +2,6 @@
 // current membership, appended as canonical event bytes, and projected into the small tables
 // that make the next sync cheap. See docs/PROTOCOL.md and ADR 0010.
 import type { Database } from "bun:sqlite";
-import { timingSafeEqual } from "node:crypto";
 import {
   AckError,
   Role,
@@ -15,6 +14,7 @@ import {
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
 import { AbuseLimiters } from "./limits.ts";
+import { isServerAdmin, tokenMatches } from "./settings.ts";
 
 /** How long a cid is remembered, so a retry returns the original seq (docs/PROTOCOL.md). */
 export const OUTBOX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -49,10 +49,7 @@ export function newInviteToken(): string {
 
 /** Constant-time comparison: a wrong token must not reveal how much of it was right. */
 export function inviteMatches(group: Pick<GroupRow, "invite_token">, token: string | null | undefined): boolean {
-  if (group.invite_token === null || typeof token !== "string" || token.length === 0) return false;
-  const expected = Buffer.from(group.invite_token, "utf8");
-  const actual = Buffer.from(token, "utf8");
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+  return tokenMatches(group.invite_token, token);
 }
 
 interface MemberRow {
@@ -197,14 +194,6 @@ function deletionFor(db: Database, scope: number, target: number): { seq: number
     | null;
 }
 
-/** BetterAuth stores several roles as a comma-separated list when a user has more than one. */
-function hasAdminRole(role: string | null): boolean {
-  return (role ?? "")
-    .split(",")
-    .map((part) => part.trim())
-    .includes("admin");
-}
-
 /** Writes the current membership row and its event. `author` is 0 for server-generated changes. */
 function setMembership(
   db: Database,
@@ -251,11 +240,6 @@ function recordScopeLeft(db: Database, userId: number, scope: number, now: numbe
      ON CONFLICT(user_id, scope) DO UPDATE SET seq = excluded.seq`,
   ).run(userId, scope, seq);
   return seq;
-}
-
-function isServerAdmin(db: Database, actor: Actor): boolean {
-  const row = db.query("SELECT role FROM user WHERE id = ?").get(actor.id) as { role: string | null } | null;
-  return hasAdminRole(row?.role ?? null);
 }
 
 /** Lifts a group ban with an event, so the log still says who stopped the ban and when. */
@@ -566,12 +550,15 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
 
       if (op.scope === 0) {
         // Server-wide ban: server admin only (ADR 0010).
-        if (!isServerAdmin(db, actor)) return { error: AckError.Forbidden };
+        if (!isServerAdmin(db, actor.id)) return { error: AckError.Forbidden };
         const target = serverUserFor(db, op.user);
         if (!target) return { error: AckError.NotFound };
         if (target.id === actor.id) return { error: AckError.Forbidden };
         if (op.on) {
           db.query("UPDATE user SET banned = 1 WHERE id = ?").run(target.id);
+          // Revoking every session is part of the ban, not a side effect: a token already in
+          // a client's hand must stop working now, even if the client never calls /sync.
+          db.query("DELETE FROM session WHERE userId = ?").run(target.id);
           // A server ban removes access everywhere, so every group membership goes, and an
           // owned group gets a successor in the same transaction.
           const memberships = db
@@ -589,8 +576,22 @@ function applyOp(db: Database, actor: Actor, op: Op, now: number, limits: AbuseL
             }
             recordScopeLeft(db, op.user, groupId, now);
           }
+          // DM scopes are access too: the banned account's device purges every conversation.
+          // The scope row stays, so the other participant keeps their side of the history.
+          const dms = db
+            .query("SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?")
+            .all(op.user, op.user) as { id: number }[];
+          for (const row of dms) recordScopeLeft(db, op.user, Number(row.id), now);
         } else {
           db.query("UPDATE user SET banned = 0 WHERE id = ?").run(target.id);
+          // DM scopes have no join: the pair row is the access. Clear their pending purge on
+          // unban so the restored account can see the conversation again; group purges stay,
+          // because a lifted ban does not restore group membership.
+          db.query(
+            `DELETE FROM scope_lefts
+             WHERE user_id = ?
+               AND scope IN (SELECT id FROM dm_scopes WHERE user_a = ? OR user_b = ?)`,
+          ).run(op.user, op.user, op.user);
         }
         const seq = insertEvent(db, (next) => ({
           tag: Tag.Ban,

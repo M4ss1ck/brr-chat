@@ -57,6 +57,13 @@ describe("shell contract", () => {
     expect(html).toContain('<dd id="session"></dd>');
   });
 
+  test("hidden panels stay hidden whatever display rule their element has", () => {
+    // show()/hide() in main.ts only toggles the hidden attribute. A label or section with an
+    // explicit display rule would otherwise win the cascade, so the stylesheet must pin it.
+    const html = read("index.html");
+    expect(html).toMatch(/\[hidden\]\s*\{\s*display:\s*none/);
+  });
+
   test("the document loads the bundle and the manifest, and the service worker path", () => {
     const html = read("index.html");
     expect(html).toContain('<script type="module" src="/app.js"></script>');

@@ -2,6 +2,17 @@
 // shell stays inside its byte budget (ADR 0014). Every element lookup is optional, so the
 // module also loads in a test or in a worker without a DOM.
 import { EMOJI_PALETTE, ResponseError, Role, Tag, type SyncResponse } from "@brr-chat/protocol";
+import {
+  getRegistration,
+  getServerSettings,
+  getServerUsers,
+  rotateServerInvite,
+  saveServerSettings,
+  type RegistrationMode,
+  type ServerInvite,
+  type ServerSettings,
+  type ServerUser,
+} from "./admin.ts";
 import { confirmRecovery, redeemRecovery, regenerateRecovery, signIn, signOut, signUp } from "./auth.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
@@ -51,10 +62,21 @@ let currentInvite: InviteLink | null = null;
 let loadingInviteGroup: number | null = null;
 /** A link token from /join/<token>, kept until the account can join. */
 let pendingInvite: string | null = inviteTokenFromLocation();
+/** A server invite from /signup/<token>, used for the next account created here. */
+let pendingServerInvite: string | null = serverInviteTokenFromLocation();
+/** Last admin view loaded, so a re-render does not flash the wrong switch positions. */
+let serverSettings: ServerSettings | null = null;
+/** Account whose admin view is cached; the panel is not refetched on every sync. */
+let adminLoadedFor: string | null = null;
 
 function inviteTokenFromLocation(): string | null {
   if (typeof location === "undefined") return null;
   return /^\/join\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
+}
+
+function serverInviteTokenFromLocation(): string | null {
+  if (typeof location === "undefined") return null;
+  return /^\/signup\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
 }
 
 interface ViewContext {
@@ -108,6 +130,172 @@ async function refresh(): Promise<void> {
   await refreshDms();
   await renderGroup();
   await renderDm();
+  if (session === null) await paintRegistration();
+  else show("registration-note", false);
+  await renderAdmin();
+}
+
+/** Sign-in screen state: whether accounts are welcome, and whether a link is required. */
+async function paintRegistration(): Promise<void> {
+  const input = el<HTMLInputElement>("signup-invite");
+  if (pendingServerInvite !== null && input && input.value.length === 0) input.value = pendingServerInvite;
+
+  const state = await getRegistration(location.origin);
+  if (state === null) {
+    show("registration-note", false);
+    show("signup-invite-label", pendingServerInvite !== null);
+    const button = el<HTMLButtonElement>("sign-up");
+    if (button) button.disabled = false;
+    return;
+  }
+
+  const blocked = state.frozen || state.mode === "closed";
+  const button = el<HTMLButtonElement>("sign-up");
+  if (button) button.disabled = blocked;
+  show("signup-invite-label", state.mode === "invite");
+  const note = state.frozen
+    ? "Signups are frozen right now."
+    : state.mode === "closed"
+      ? "This server is closed to new accounts."
+      : state.mode === "invite"
+        ? "This server is invite-only. Open a server invite link or paste its code."
+        : "";
+  setText("registration-note", note);
+  show("registration-note", note.length > 0);
+}
+
+function paintServerInvite(invite: ServerInvite | null): void {
+  setText("server-invite-link", invite === null ? "No server invite link yet. Generate one." : invite.link);
+  const qr = el("server-invite-qr");
+  if (qr) {
+    if (invite === null) qr.replaceChildren();
+    else qr.innerHTML = qrSvg(invite.qr);
+  }
+  show("copy-server-invite", invite !== null);
+}
+
+function paintServerUsers(users: ServerUser[], self: number | null): void {
+  const list = el("server-users");
+  if (!list) return;
+  list.replaceChildren(
+    ...users.map((user) => {
+      const item = document.createElement("li");
+      const label = document.createElement("span");
+      const badges = [
+        user.username,
+        user.admin ? "server admin" : "",
+        user.banned ? "banned" : "",
+        self !== null && user.user === self ? "you" : "",
+      ].filter((part) => part.length > 0);
+      label.textContent = badges.join(" · ");
+      item.append(label);
+      // Banning yourself is already refused by the server; do not offer it.
+      if (self === null || user.user !== self) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = user.banned ? "Unban" : "Ban";
+        button.addEventListener("click", () => void setServerBan(user.user, !user.banned));
+        item.append(button);
+      }
+      return item;
+    }),
+  );
+  show("no-server-users", users.length === 0);
+}
+
+async function renderAdmin(force = false): Promise<void> {
+  const session = await getSession();
+  if (!session) {
+    show("server-admin", false);
+    serverSettings = null;
+    adminLoadedFor = null;
+    return;
+  }
+  // The panel does not change on its own: one fetch per account per page load keeps sync
+  // traffic free of admin reads on a metered connection.
+  if (!force && adminLoadedFor === session.username) {
+    show("server-admin", serverSettings?.admin === true);
+    return;
+  }
+  try {
+    const settings = await getServerSettings(location.origin, session.token);
+    serverSettings = settings;
+    adminLoadedFor = session.username;
+    show("server-admin", settings.admin);
+    if (!settings.admin) return;
+
+    const select = el<HTMLSelectElement>("registration-mode");
+    if (select) select.value = settings.mode;
+    const frozen = el<HTMLInputElement>("registration-frozen");
+    if (frozen) frozen.checked = settings.frozen;
+    paintServerInvite(settings.invite);
+    paintServerUsers(await getServerUsers(location.origin, session.token), await getSelf(session.username));
+  } catch {
+    // A server that predates administration, or a dropped connection: keep the panel hidden
+    // rather than showing stale switches the admin cannot trust.
+    show("server-admin", false);
+  }
+}
+
+async function saveAdminSettings(): Promise<void> {
+  const session = await getSession();
+  if (!session) return;
+  const select = el<HTMLSelectElement>("registration-mode");
+  const frozen = el<HTMLInputElement>("registration-frozen");
+  if (!select) return;
+  const mode = select.value as RegistrationMode;
+  if (mode !== "open" && mode !== "invite" && mode !== "closed") return;
+  try {
+    const next = await saveServerSettings(location.origin, session.token, {
+      mode,
+      frozen: frozen?.checked === true,
+    });
+    serverSettings = next;
+    show("server-admin", next.admin);
+    paintServerInvite(next.invite);
+    message(next.frozen ? "Signups are frozen." : `Registration is ${next.mode}.`);
+    await paintRegistration();
+  } catch (err) {
+    message(err instanceof Error ? err.message : "Could not save server settings.");
+  }
+}
+
+async function rotateAdminInvite(): Promise<void> {
+  const session = await getSession();
+  if (!session) return;
+  try {
+    const next = await rotateServerInvite(location.origin, session.token);
+    serverSettings = next;
+    paintServerInvite(next.invite);
+    message("New server invite link ready. The old link no longer works.");
+  } catch (err) {
+    message(err instanceof Error ? err.message : "Could not rotate the server invite link.");
+  }
+}
+
+async function copyServerInvite(): Promise<void> {
+  const invite = serverSettings?.invite ?? null;
+  if (invite === null) {
+    message("Generate a server invite link first.");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(invite.link);
+    message("Server invite link copied.");
+  } catch {
+    message("Copying is not available here. Select the link instead.");
+  }
+}
+
+async function setServerBan(user: number, on: boolean): Promise<void> {
+  const session = await getSession();
+  if (!session) return;
+  const queued = await enqueueOp(session.username, { tag: Tag.Ban, scope: 0, user, on });
+  const response = await syncNow();
+  const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
+  if (ack && "error" in ack) message(explainAck(ack.error));
+  else message(on ? "Account banned server-wide. Its sessions are revoked." : "Account unbanned.");
+  await renderAdmin(true);
 }
 
 function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
@@ -665,7 +853,8 @@ async function syncNow(): Promise<SyncResponse | null> {
   }
 
   // The wire id is learned from the profile event this account publishes; no extra endpoint.
-  if ((await getSelf(session.username)) === null && !(await getOutbox(session.username)).some((op) => op.tag === Tag.Profile)) {
+  const knownSelf = await getSelf(session.username);
+  if (knownSelf === null && !(await getOutbox(session.username)).some((op) => op.tag === Tag.Profile)) {
     await enqueueOp(session.username, {
       tag: Tag.Profile,
       scope: 0,
@@ -700,6 +889,11 @@ async function syncNow(): Promise<SyncResponse | null> {
     setText("cursor", String(response.cursor));
     show("empty", response.events.length === 0 && response.cursor === 0 && (await getGroups(session.username)).length === 0);
     await refresh();
+    // The admin panel first rendered before this account had a wire id, so its account list
+    // was legitimately empty. Refetch once, now that the profile exists.
+    if (knownSelf === null && adminLoadedFor !== null && (await getSelf(session.username)) !== null) {
+      await renderAdmin(true);
+    }
     return response;
   } catch (err) {
     const text =
@@ -722,8 +916,20 @@ async function submit(mode: Mode): Promise<void> {
   }
   try {
     if (mode === "up") {
-      const { session, recoveryCode } = await signUp(location.origin, username, password);
+      const invite = value("signup-invite");
+      const { session, recoveryCode } = await signUp(
+        location.origin,
+        username,
+        password,
+        invite.length === 0 ? undefined : invite,
+      );
       setText("recovery-code", recoveryCode);
+      // The invite did its one job; do not leave a capability in the address bar.
+      if (pendingServerInvite !== null || location.pathname.startsWith("/signup/")) {
+        pendingServerInvite = null;
+        history.replaceState({}, "", "/");
+        clear("signup-invite");
+      }
       message(`Account created for ${session.username}. Save the code, then type its last group.`);
       await refresh();
       return;
@@ -1019,6 +1225,9 @@ function wire(): void {
   });
   el<HTMLButtonElement>("dm-start")?.addEventListener("click", () => void openDm());
   el<HTMLButtonElement>("dm-send")?.addEventListener("click", () => void sendDm());
+  el<HTMLButtonElement>("save-server-settings")?.addEventListener("click", () => void saveAdminSettings());
+  el<HTMLButtonElement>("rotate-server-invite")?.addEventListener("click", () => void rotateAdminInvite());
+  el<HTMLButtonElement>("copy-server-invite")?.addEventListener("click", () => void copyServerInvite());
 }
 
 function boot(): void {

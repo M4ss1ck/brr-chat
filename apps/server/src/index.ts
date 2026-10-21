@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
+import { createServerAdminService } from "./admin.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
 import { createInviteService } from "./invites.ts";
 import { AbuseLimiters, DEFAULT_ABUSE_LIMITS, type AbuseLimitConfig } from "./limits.ts";
@@ -80,6 +81,7 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     limits.signups,
   );
   const invites = createInviteService(db, auth, baseURL, limits);
+  const admin = createServerAdminService(db, auth, baseURL);
 
   return {
     db,
@@ -88,9 +90,17 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
       const url = new URL(req.url);
       const recovered = await recovery.handle(req, url.pathname, ip);
       if (recovered) return recovered;
+      const administered = await admin.handle(req, url.pathname);
+      if (administered) return administered;
       const invited = await invites.handle(req, url.pathname);
       if (invited) return invited;
       if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
+        // The BetterAuth admin plugin mounts its own user-management routes under this base.
+        // They would be a second signup and ban path around registration policy and the purge
+        // transaction, so this server does not expose them; administration is /api/server.
+        if (url.pathname === "/api/auth/admin" || url.pathname.startsWith("/api/auth/admin/")) {
+          return new Response("Not Found", { status: 404 });
+        }
         return auth.handler(req);
       }
       if (url.pathname === "/sync" && req.method === "POST") {

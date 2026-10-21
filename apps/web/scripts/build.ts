@@ -49,6 +49,9 @@ const INDEX_HTML = `<!doctype html>
 <style>
 :root { color-scheme: dark light; }
 * { box-sizing: border-box; }
+/* A hidden panel must stay hidden even when its element has a display rule (labels,
+   sections); every show()/hide() in the app relies on the hidden attribute alone. */
+[hidden] { display: none !important; }
 body {
   margin: 0 auto;
   max-width: 34rem;
@@ -61,7 +64,7 @@ h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
 h2 { font-size: 1.1rem; margin: 1.25rem 0 .25rem; }
 p { margin: .25rem 0; }
 label { display: block; margin: .6rem 0; font-size: .9rem; }
-input {
+input, select {
   display: block; width: 100%; margin-top: .2rem; padding: .55rem;
   border: 1px solid #4a4740; border-radius: .4rem;
   background: #17170f; color: inherit; font: inherit;
@@ -94,7 +97,7 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 #group-title { margin: .5rem 0 .1rem; }
 #invite-panel { margin: .6rem 0; padding: .6rem; border: 1px solid #4a4740; border-radius: .4rem; }
 #invite-link { font: .78rem/1.4 ui-monospace, monospace; }
-#invite-qr svg { width: 8rem; height: 8rem; background: #f2efe6; padding: .2rem; border-radius: .3rem; }
+#invite-qr svg, #server-invite-qr svg { width: 8rem; height: 8rem; background: #f2efe6; padding: .2rem; border-radius: .3rem; }
 .posts { display: grid; gap: .6rem; margin: .8rem 0; }
 .post { display: grid; grid-template-columns: 32px 1fr; gap: .55rem; align-items: start; }
 .avatar { border-radius: .35rem; background: #17170f; }
@@ -110,8 +113,11 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 .post .reply { margin: 0 0 0 .2rem; padding: .2rem .5rem; font-size: .8rem; }
 .post .reply[aria-pressed="true"] { border-color: #d8c56a; }
 .post .delete { padding: .2rem .5rem; font-size: .8rem; color: #e0a090; }
-#member-list li, #banned-list li { font-size: .85rem; }
-#member-list button, #banned-list button { margin: 0; padding: .2rem .5rem; font-size: .78rem; }
+#member-list li, #banned-list li, #server-users li { font-size: .85rem; }
+#member-list button, #banned-list button, #server-users button { margin: 0; padding: .2rem .5rem; font-size: .78rem; }
+#server-invite-panel { margin: .6rem 0; padding: .6rem; border: 1px solid #4a4740; border-radius: .4rem; }
+#server-invite-link { font: .78rem/1.4 ui-monospace, monospace; }
+#server-admin { margin: 1rem 0; padding: .75rem; border: 1px solid #6d6a5e; border-radius: .4rem; }
 .post.reply { margin-left: 1.1rem; padding-left: .55rem; border-left: 2px solid #2f2e25; }
 .post .replies { display: grid; gap: .5rem; margin: .5rem 0 0; }
 #reply-note { display: flex; align-items: center; gap: .4rem; }
@@ -130,6 +136,10 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <label>Password
         <input id="password" name="password" type="password" autocomplete="current-password" required>
       </label>
+      <label id="signup-invite-label" hidden>Server invite code
+        <input id="signup-invite" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="From your invite link">
+      </label>
+      <p id="registration-note" class="note" hidden></p>
       <button type="button" id="sign-up">Create account</button>
       <button type="button" id="sign-in">Sign in</button>
     </form>
@@ -224,6 +234,32 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
     </label>
     <label><input type="checkbox" id="create-private"> Invite-only (join by link or QR code)</label>
     <button type="button" id="create">Create group</button>
+
+    <section id="server-admin" hidden>
+      <h2>Server administration</h2>
+      <p class="note">This account administers the server. Changes apply to the next signup.</p>
+      <label>Registration
+        <select id="registration-mode">
+          <option value="open">Open: anyone can sign up</option>
+          <option value="invite">Invite: a server link is required</option>
+          <option value="closed">Closed: no new accounts</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="registration-frozen"> Freeze signups</label>
+      <button type="button" id="save-server-settings">Save registration</button>
+      <section id="server-invite-panel">
+        <h3>Server invite link</h3>
+        <output id="server-invite-link"></output>
+        <div id="server-invite-qr"></div>
+        <button type="button" id="copy-server-invite">Copy link</button>
+        <button type="button" id="rotate-server-invite">New link</button>
+        <p class="note">Needed only in invite mode. Anyone with this link can sign up while it is the live link. Rotating it stops the old link from working.</p>
+      </section>
+      <h3>Accounts</h3>
+      <ul id="server-users" class="list"></ul>
+      <p id="no-server-users" class="note" hidden>No synced accounts yet.</p>
+      <p class="note">A server ban revokes every session and removes the account from every group and DM.</p>
+    </section>
 
     <dl>
       <dt>you are</dt><dd id="self">unknown</dd>

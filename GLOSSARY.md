@@ -18,6 +18,13 @@
 - **Invite link**: an invite-only group's one URL (`/join/<token>`) and the QR code that encodes
   it. Group admins and the owner can rotate it; the old token stops working at once, while
   existing members stay (ADR 0016).
+- **Server admin**: the BetterAuth server-wide `admin` role, distinct from a group admin. The
+  first account on a fresh server becomes one so somebody can administer it (ADR 0017).
+- **Registration mode**: server policy for new accounts: `open`, `invite` (a server invite link
+  is required), or `closed` (no new accounts). A separate **freeze** switch rejects every
+  signup regardless of mode (ADR 0012).
+- **Server invite link**: a server's one URL (`/signup/<token>`) for creating an account in
+  `invite` mode. A server admin can rotate it; the old link stops working at once (ADR 0017).
 - **Event**: one entry in the server's append-only log, `[tag, seq, ts, author, scope, ...]`.
 - **Tag**: the integer that says what kind of event it is. Unknown tags are skipped.
 - **Seq**: an event's position in the log, also the id of what it creates.

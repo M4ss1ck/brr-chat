@@ -128,6 +128,18 @@ CREATE TABLE IF NOT EXISTS outbox_ops (
 )
 `.trim();
 
+// One row of server-wide policy (ADR 0012, ADR 0017): how signups are admitted, the emergency
+// freeze, and the single live server invite token. A singleton keeps every read a point lookup.
+const CREATE_SERVER_SETTINGS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS server_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  registration_mode TEXT NOT NULL,
+  registration_frozen INTEGER NOT NULL,
+  invite_token TEXT,
+  updated_at INTEGER NOT NULL
+)
+`.trim();
+
 // ADR 0006: only hashes ever reach the disk. `tail_hash` lets signup check the last group
 // without keeping the full code anywhere.
 const CREATE_RECOVERY_TABLE_SQL = `
@@ -181,6 +193,12 @@ export function openDb(dbPath: string): Database {
   db.exec(CREATE_DM_SCOPES_TABLE_SQL);
   db.exec(CREATE_USER_BLOCKS_TABLE_SQL);
   db.exec(CREATE_PRIVATE_EVENTS_TABLE_SQL);
+  db.exec(CREATE_SERVER_SETTINGS_TABLE_SQL);
+  // Open registration is the only safe first-run default: a server that cannot accept its
+  // first account cannot be administered at all. An install can close it in one request.
+  db.exec(
+    "INSERT OR IGNORE INTO server_settings (id, registration_mode, registration_frozen, invite_token, updated_at) VALUES (1, 'open', 0, NULL, 0);",
+  );
   db.exec(CREATE_OUTBOX_TABLE_SQL);
   db.exec("CREATE INDEX IF NOT EXISTS events_scope_seq ON events(scope, seq);");
   db.exec("CREATE INDEX IF NOT EXISTS events_tag_scope ON events(tag, scope);");
