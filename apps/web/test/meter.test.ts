@@ -3,28 +3,63 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { DataMeter, formatBytes, requestWireBytes, responseWireBytes, type MeterStorage } from "../src/meter.ts";
+import {
+  DataMeter,
+  forgetServerMeter,
+  formatBytes,
+  migrateLegacyMeterSession,
+  requestWireBytes,
+  responseWireBytes,
+  type MeterStorage,
+} from "../src/meter.ts";
 import { monthOf } from "../src/month.ts";
 import type { StoredMeter } from "../src/store.ts";
+
+/** One server unless a test names more; `row`/`session` stay the first server's counters. */
+const DEFAULT_SERVER = "http://chat.local";
+
+type TestStorage = MeterStorage & {
+  servers: string[];
+  rows: Map<string, StoredMeter>;
+  sessions: Map<string, number>;
+  readonly row: StoredMeter | null;
+  readonly session: number;
+};
 
 function memoryStorage(
   initialMonth: StoredMeter | null = null,
   initialSession = 0,
-): MeterStorage & { row: StoredMeter | null; session: number } {
-  const storage = {
-    row: initialMonth,
-    session: initialSession,
-    async readMonth(): Promise<StoredMeter | null> {
-      return storage.row;
+  servers: string[] = [DEFAULT_SERVER],
+): TestStorage {
+  const rows = new Map<string, StoredMeter>();
+  if (initialMonth !== null) rows.set(DEFAULT_SERVER, { ...initialMonth });
+  const sessions = new Map<string, number>();
+  if (initialSession > 0) sessions.set(DEFAULT_SERVER, initialSession);
+  const storage: TestStorage = {
+    servers: [...servers],
+    rows,
+    sessions,
+    get row(): StoredMeter | null {
+      return rows.get(DEFAULT_SERVER) ?? null;
     },
-    async writeMonth(row: StoredMeter): Promise<void> {
-      storage.row = { ...row };
+    get session(): number {
+      return sessions.get(DEFAULT_SERVER) ?? 0;
     },
-    readSession(): number {
-      return storage.session;
+    async readServers(): Promise<string[]> {
+      return [...storage.servers];
     },
-    writeSession(bytes: number): void {
-      storage.session = bytes;
+    async readMonth(server: string): Promise<StoredMeter | null> {
+      const row = rows.get(server);
+      return row === undefined ? null : { ...row };
+    },
+    async writeMonth(server: string, row: StoredMeter): Promise<void> {
+      rows.set(server, { ...row });
+    },
+    readSession(server: string): number {
+      return sessions.get(server) ?? 0;
+    },
+    writeSession(server: string, bytes: number): void {
+      sessions.set(server, bytes);
     },
   };
   return storage;
@@ -317,4 +352,112 @@ describe("data meter", () => {
     });
     expect(meter.totals().sessionBytes).toBe(sent + received);
   });
+  test("two servers are counted separately and add up to the device total", async () => {
+    const other = "https://other.example";
+    const storage = memoryStorage(null, 0, [DEFAULT_SERVER, other]);
+    const meter = new DataMeter(storage, () => new Date(2026, 9, 20), fixedFetch().fetch);
+    await meter.load();
+    await meter.fetch(`${DEFAULT_SERVER}/sync`, { method: "POST", body: new Uint8Array(8) });
+    await meter.fetch(`${other}/sync`, { method: "POST", body: new Uint8Array(16) });
+    await meter.flush();
+
+    const rows = meter.servers();
+    expect(rows.map((row) => row.server)).toEqual([DEFAULT_SERVER, other]);
+    const first = rows[0];
+    const second = rows[1];
+    if (!first || !second) throw new Error("expected two server rows");
+    expect(first.monthBytes).toBeGreaterThan(0);
+    expect(second.monthBytes).toBeGreaterThan(first.monthBytes);
+    // The headline totals are the sum, not the last server's numbers.
+    expect(meter.totals().sessionBytes).toBe(first.sessionBytes + second.sessionBytes);
+    expect(meter.totals().monthBytes).toBe(first.monthBytes + second.monthBytes);
+    expect(storage.rows.get(DEFAULT_SERVER)).toEqual({ month: "2026-10", bytes: first.monthBytes });
+    expect(storage.rows.get(other)).toEqual({ month: "2026-10", bytes: second.monthBytes });
+    expect(storage.sessions.get(DEFAULT_SERVER)).toBe(first.sessionBytes);
+    expect(storage.sessions.get(other)).toBe(second.sessionBytes);
+  });
+
+  test("a server added after boot shows up on the next load, with its stored month", async () => {
+    const added = "https://new.example";
+    const storage = memoryStorage({ month: "2026-10", bytes: 500 }, 0);
+    const meter = new DataMeter(storage, () => new Date(2026, 9, 20), fixedFetch().fetch);
+    await meter.load();
+    expect(meter.servers().map((row) => row.server)).toEqual([DEFAULT_SERVER]);
+
+    storage.servers.push(added);
+    storage.rows.set(added, { month: "2026-10", bytes: 900 });
+    storage.sessions.set(added, 40);
+    await meter.load();
+
+    expect(meter.servers().map((row) => row.server)).toEqual([DEFAULT_SERVER, added]);
+    expect(meter.totals()).toEqual({ sessionBytes: 40, monthBytes: 1400, monthKey: "2026-10" });
+  });
+
+  test("the month rolls for every server, not only the one on screen", async () => {
+    const other = "https://other.example";
+    const storage = memoryStorage({ month: "2026-10", bytes: 500 }, 0, [DEFAULT_SERVER, other]);
+    storage.rows.set(other, { month: "2026-10", bytes: 700 });
+    let now = new Date(2026, 9, 31, 23, 59);
+    const meter = new DataMeter(storage, () => now, fixedFetch().fetch);
+    await meter.load();
+    expect(meter.totals().monthBytes).toBe(1200);
+
+    now = new Date(2026, 10, 1, 0, 1);
+    await meter.load();
+    await meter.flush();
+    expect(meter.totals()).toEqual({ sessionBytes: 0, monthBytes: 0, monthKey: "2026-11" });
+    expect(storage.rows.get(DEFAULT_SERVER)).toEqual({ month: "2026-11", bytes: 0 });
+    expect(storage.rows.get(other)).toEqual({ month: "2026-11", bytes: 0 });
+  });
+
+  test("the single-server tab counter moves to the serving server once, without overwriting", () => {
+    const values = new Map<string, string>([["brr-meter-session", "1234"]]);
+    const fake = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        values.set(key, value);
+      },
+      removeItem: (key: string) => {
+        values.delete(key);
+      },
+    };
+    const original = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+    Object.defineProperty(globalThis, "sessionStorage", { value: fake, configurable: true });
+    try {
+      migrateLegacyMeterSession(DEFAULT_SERVER);
+      expect(values.get(`brr-meter-session:${DEFAULT_SERVER}`)).toBe("1234");
+      expect(values.has("brr-meter-session")).toBe(false);
+
+      // A fresh count on the namespaced key wins over an old legacy value.
+      values.set("brr-meter-session", "9");
+      migrateLegacyMeterSession(DEFAULT_SERVER);
+      expect(values.get(`brr-meter-session:${DEFAULT_SERVER}`)).toBe("1234");
+
+      forgetServerMeter(DEFAULT_SERVER);
+      expect(values.has(`brr-meter-session:${DEFAULT_SERVER}`)).toBe(false);
+    } finally {
+      if (original === undefined) delete (globalThis as { sessionStorage?: unknown }).sessionStorage;
+      else Object.defineProperty(globalThis, "sessionStorage", original);
+    }
+  });
+
+  test("a removed server stops counting, even for a response already in flight", async () => {
+    const storage = memoryStorage();
+    const meter = new DataMeter(storage, () => new Date(2026, 9, 20), fixedFetch().fetch);
+    await meter.load();
+    await meter.fetch(`${DEFAULT_SERVER}/sync`, { method: "POST", body: new Uint8Array(8) });
+    await meter.flush();
+    const before = storage.rows.get(DEFAULT_SERVER)?.bytes ?? 0;
+    expect(before).toBeGreaterThan(0);
+
+    meter.forget(DEFAULT_SERVER);
+    // The server is gone from the list (removeServer does that), and a late fetch must not
+    // bring its bucket or its month row back.
+    storage.servers = [];
+    await meter.fetch(`${DEFAULT_SERVER}/sync`, { method: "POST", body: new Uint8Array(8) });
+    await meter.flush();
+    expect(meter.servers()).toEqual([]);
+    expect(storage.rows.get(DEFAULT_SERVER)?.bytes).toBe(before);
+  });
+
 });

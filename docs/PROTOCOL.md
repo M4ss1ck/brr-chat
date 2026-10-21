@@ -14,7 +14,7 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
 | Empty sync payload (request + response) | 1 KB | 19 B |
 | 100 text posts in one response, uncompressed | 20 KB | 13,859 B (17.1 B/post framing) |
 | Image placeholder (whole media field) | 40 B | 39 B worst case |
-| App shell, compressed | 150 KB | 6,491 B (apps/web) |
+| App shell, compressed | 150 KB | 61,072 B (apps/web, includes the QR reader and media) |
 
 ## Transport
 
@@ -140,6 +140,24 @@ to every member (ADR 0016).
 All four require a bearer session. A group admin or owner may read or rotate; a plain member
 gets `403`; a non-member gets `404` for a group they cannot see, and an unknown or rotated
 token gets `404`.
+
+## Several servers, one client
+
+The app is served by one server but may hold accounts on several, like networks in an IRC
+client (ADR 0001, ADR 0020). Nothing is forwarded between servers; each `/sync` goes straight
+to its own origin with its own bearer token and cursor.
+
+- A server is identified by its origin. Group, DM and event ids stay small integers local to
+  one server; the client namespaces its cache by origin so two logs cannot collide.
+- A server is added by a link: a bare origin, a server invite (`/signup/<token>`) or a group
+  invite (`/join/<token>`). A QR code encodes the same link and is decoded on the device.
+- Requests to an added server are cross-origin. Every server answers `OPTIONS` preflights and
+  sends `Access-Control-Allow-Origin: *` on foreign-origin responses. Authentication is the
+  bearer token, never a cookie: the server strips any session cookie it would set, so a
+  foreign origin has no ambient authority to borrow.
+- `/sync`, `/history`, the auth routes and the JSON invite and admin routes are all usable
+  this way. The wire format is unchanged; a server cannot tell a multi-server client from a
+  single-server one.
 
 ## Server administration
 

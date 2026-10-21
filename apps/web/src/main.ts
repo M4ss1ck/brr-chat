@@ -18,15 +18,28 @@ import { watchOnline } from "./connectivity.ts";
 import { advanceGaps, loadHistory } from "./history.ts";
 import { identicon } from "./identicon.ts";
 import { getInvite, resolveInvite, rotateInvite, type InviteLink } from "./invites.ts";
-import { formatBytes, meter, type MeterTotals } from "./meter.ts";
-import { mediaView, prepareImage, uploadImage, MediaUploadError, clearMediaCache } from "./media.ts";
-import { qrSvg } from "./qr.ts";
+import { clearMediaCache, mediaView, MediaUploadError, prepareImage, uploadImage } from "./media.ts";
+import { forgetServerMeter, formatBytes, meter, migrateLegacyMeterSession, type MeterTotals } from "./meter.ts";
+import { decodeQrFile, decodeQrFrame, qrSvg } from "./qr.ts";
+import { parseServerLink, serverLabel } from "./servers.ts";
 import { drainOutbox, SyncHttpError } from "./sync.ts";
 import { createSyncQueue } from "./sync-queue.ts";
 import {
+  accountKey,
   clearMediaBytes,
   discardOutbox,
+  ensureServer,
   enqueueOp,
+  getActiveAccount,
+  getActiveServerId,
+  getPendingInvite,
+  listServers,
+  migrateLegacy,
+  removeServer,
+  setActiveServer,
+  setPendingInvite,
+  type Account,
+  type StoredServer,
   getBans,
   getCursor,
   getDmScopes,
@@ -40,7 +53,6 @@ import {
   getRange,
   getReactions,
   getSelf,
-  getSession,
   nextReactionOn,
   setGaps,
   setSelf,
@@ -58,6 +70,12 @@ import {
 
 type Mode = "up" | "in";
 
+/** What one server's /sync produced, so several can be reported on one status line. */
+type SyncResult =
+  | { kind: "ok"; server: string; response: SyncResponse; warning: string | null; learnedSelf: boolean }
+  | { kind: "upgrade"; server: string; message: string }
+  | { kind: "error"; server: string; message: string };
+
 let currentGroup: number | null = null;
 let currentDm: number | null = null;
 /** Set while composing the first message to a peer; the scope does not exist until it is sent. */
@@ -74,29 +92,31 @@ let reactionQueue: Promise<void> = Promise.resolve();
 let currentInvite: InviteLink | null = null;
 /** Group whose invite request is in flight, so two renders do not fetch twice. */
 let loadingInviteGroup: number | null = null;
-/** A link token from /join/<token>, kept until the account can join. */
-let pendingInvite: string | null = inviteTokenFromLocation();
-/** A server invite from /signup/<token>, used for the next account created here. */
-let pendingServerInvite: string | null = serverInviteTokenFromLocation();
-/** Last admin view loaded, so a re-render does not flash the wrong switch positions. */
+/** The active server's account, or null while it is signed out. Re-read by refresh(). */
+let active: Account | null = null;
+/** The server on screen, and every server this device knows (like networks in IRC). */
+let activeServerId: string | null = null;
+let servers: StoredServer[] = [];
+/** Bumped on every server switch, so a render that started on the old server paints nothing. */
+let renderEpoch = 0;
+/** The admin view loaded for one server account; never reused for another (#18). */
 let serverSettings: ServerSettings | null = null;
-/** Account whose admin view is cached; the panel is not refetched on every sync. */
 let adminLoadedFor: string | null = null;
 /** Scopes where /history returned no older page, so "load older" stays hidden. */
 const historyExhausted = new Set<string>();
+/** Taps on the server picker are serialized, so two switches cannot race each other. */
+let switchQueue: Promise<void> = Promise.resolve();
+/** Camera preview for the in-app QR reader, when one is running. */
+let camera: MediaStream | null = null;
+let cameraTimer: ReturnType<typeof setTimeout> | null = null;
 
-function historyKey(username: string, scope: number): string {
-  return `${username}:${scope}`;
+
+function historyKey(account: Account, scope: number): string {
+  return `${account.server} ${account.username}:${scope}`;
 }
 
-function inviteTokenFromLocation(): string | null {
-  if (typeof location === "undefined") return null;
-  return /^\/join\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
-}
-
-function serverInviteTokenFromLocation(): string | null {
-  if (typeof location === "undefined") return null;
-  return /^\/signup\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
+function accountLabel(account: Account): string {
+  return `${account.username} @ ${serverLabel(account.server)}`;
 }
 
 interface ViewContext {
@@ -122,17 +142,46 @@ function setText(id: string, text: string): void {
   if (node) node.textContent = text;
 }
 
-/** The always-visible meter: this page session and this device's calendar month. */
+/**
+ * The always-visible meter: this page session and this device's calendar month, split by
+ * server once there is more than one, so a bill can be attributed (#18, ADR 0020).
+ */
 function paintMeter(totals: MeterTotals): void {
   setText("meter-session", formatBytes(totals.sessionBytes));
   setText("meter-month", formatBytes(totals.monthBytes));
+
+  const list = el<HTMLUListElement>("meter-servers-list");
+  const rows = meter.servers();
+  show("meter-servers", rows.length > 1);
+  if (!list) return;
+  list.replaceChildren(
+    ...rows.map((row) => {
+      const item = document.createElement("li");
+      const description = `${serverLabel(row.server)}: ${formatBytes(row.sessionBytes)} this session, ${formatBytes(row.monthBytes)} this month`;
+      item.title = description;
+      item.setAttribute("aria-label", description);
+      if (row.server === activeServerId) item.setAttribute("aria-current", "true");
+      const name = document.createElement("span");
+      name.textContent = serverLabel(row.server);
+      const session = document.createElement("span");
+      session.textContent = formatBytes(row.sessionBytes);
+      const month = document.createElement("span");
+      month.textContent = formatBytes(row.monthBytes);
+      item.append(name, session, month);
+      return item;
+    }),
+  );
 }
 
 /** Re-reads storage and rolls the local month; never blocks a request or a paint. */
-function refreshMeter(): void {
-  void meter.load().catch(() => {
+function loadMeter(): Promise<void> {
+  return meter.load().catch(() => {
     // A meter that cannot read storage still counts this session in memory.
   });
+}
+
+function refreshMeter(): void {
+  void loadMeter();
 }
 
 function show(id: string, visible: boolean): void {
@@ -188,12 +237,12 @@ function outboxLabel(op: StoredOp): string {
  * was offline (ADR 0013). The text stays selectable until the user taps discard.
  */
 async function renderOutbox(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) {
     show("outbox", false);
     return;
   }
-  const failed = await getFailedOps(session.username);
+  const failed = await getFailedOps(session);
   show("outbox", failed.length > 0);
   const list = el("outbox-list");
   if (!list) return;
@@ -211,7 +260,7 @@ async function renderOutbox(): Promise<void> {
       button.type = "button";
       button.textContent = "Discard";
       button.addEventListener("click", () => {
-        void discardFailedOp(session.username, op.cid);
+        void discardFailedOp(session, op.cid);
       });
       item.append(label, reason, button);
       return item;
@@ -219,22 +268,35 @@ async function renderOutbox(): Promise<void> {
   );
 }
 
-async function discardFailedOp(username: string, cid: readonly number[]): Promise<void> {
-  await discardOutbox(username, cid);
+async function discardFailedOp(account: Account, cid: readonly number[]): Promise<void> {
+  await discardOutbox(account, cid);
   message("Discarded.");
   await refresh();
 }
 
 async function refresh(): Promise<void> {
-  const session = await getSession();
+  servers = await listServers();
+  activeServerId = await getActiveServerId();
+  // A stale or missing pointer (a corrupted row) must not leave the app without a server.
+  if (activeServerId === null && servers[0] !== undefined) {
+    await setActiveServer(servers[0].id);
+    activeServerId = servers[0].id;
+  }
+  active = await getActiveAccount();
+  paintServers();
+  // The meter is already painted; the active row is highlighted, so repaint on each switch.
+  paintMeter(meter.totals());
+
+  const session = active;
   const pending = session?.recoveryPending === true;
   show("signed-out", session === null);
   show("signed-in", session !== null && !pending);
   show("confirm-panel", pending);
-  setText("account", session?.username ?? "");
+  if (session === null || pending) show("empty", false);
+  setText("account", session ? accountLabel(session) : "");
   setText("session", session ? "32-char bearer token, held on this device only" : "");
-  setText("cursor", String(session ? await getCursor(session.username) : 0));
-  const range = await getRange();
+  setText("cursor", String(session ? await getCursor(session) : 0));
+  const range = activeServerId === null ? null : await getRange(activeServerId);
   setText("range", range ? `v${range.min}..v${range.max}` : "unknown");
   await renderOutbox();
   await refreshGroups();
@@ -246,15 +308,210 @@ async function refresh(): Promise<void> {
   await renderAdmin();
 }
 
+/** The server switcher, always visible: you can pick a signed-out server before signing in. */
+function paintServers(): void {
+  const select = el<HTMLSelectElement>("server-select");
+  if (select) {
+    select.replaceChildren(
+      ...servers.map((server) => {
+        const option = document.createElement("option");
+        option.value = server.id;
+        option.textContent = server.session === null ? `${server.name} (signed out)` : server.name;
+        return option;
+      }),
+    );
+    if (activeServerId !== null) select.value = activeServerId;
+  }
+  show("server-remove", servers.length > 1);
+}
+
+/** The active server is a different log; nothing on screen from the last one may survive. */
+function resetView(): void {
+  renderEpoch += 1;
+  currentGroup = null;
+  currentDm = null;
+  pendingDmPeer = null;
+  replyingTo = null;
+  currentInvite = null;
+  loadingInviteGroup = null;
+  serverSettings = null;
+  adminLoadedFor = null;
+  historyExhausted.clear();
+  clearImages();
+  setText("recovery-code", "");
+  setText("new-code", "");
+  show("code-panel", false);
+  show("empty", false);
+}
+
+/** Switches the list selection and syncs that server once, because its cache may be stale. */
+async function switchServer(id: string): Promise<void> {
+  if (id === activeServerId) return;
+  if (!servers.some((server) => server.id === id)) return;
+  await setActiveServer(id);
+  resetView();
+  await refresh();
+  const session = await getActiveAccount();
+  if (session !== null && session.recoveryPending !== true) await syncNow();
+}
+
+function showAddServer(open: boolean): void {
+  show("add-server", open);
+  if (!open) stopCameraScan();
+}
+
+/**
+ * Adds a server from a link or a QR code's text. A server invite is kept beside the server
+ * until sign-up uses it; a group invite until the account can join.
+ */
+async function addServerLink(raw?: string): Promise<void> {
+  stopCameraScan();
+  const link = parseServerLink(raw ?? value("server-link"));
+  if (link === null) {
+    message("That is not a server link. Use a server address or an invite link from that server.");
+    return;
+  }
+  await ensureServer(link.server);
+  if (link.invite !== null) await setPendingInvite(link.server, link.invite);
+  await setActiveServer(link.server);
+  resetView();
+  clear("server-link");
+  showAddServer(false);
+  message(`Added ${serverLabel(link.server)}.`);
+  await refresh();
+  await refreshMeter();
+
+  const session = await getActiveAccount();
+  if (session === null) await paintRegistration();
+  else if (session.recoveryPending !== true) await syncNow();
+}
+
+/** A screenshot or photo of a code: the same link, without a camera permission. */
+async function addServerFromQrImage(): Promise<void> {
+  const input = el<HTMLInputElement>("server-qr-file");
+  const file = input?.files?.[0];
+  if (!file) {
+    message("Choose an image that contains a server QR code.");
+    return;
+  }
+  try {
+    const text = await decodeQrFile(file);
+    if (text === null) {
+      message("No QR code found in that image.");
+      return;
+    }
+    await addServerLink(text);
+  } catch {
+    message("That image could not be read.");
+  } finally {
+    if (input) input.value = "";
+  }
+}
+
+/** Live camera scan. Frames are decoded locally; no image ever leaves the device. */
+async function startCameraScan(): Promise<void> {
+  const video = el<HTMLVideoElement>("qr-video");
+  if (!video) return;
+  if (navigator.mediaDevices?.getUserMedia === undefined) {
+    message("This browser cannot open the camera. Choose an image instead.");
+    return;
+  }
+  stopCameraScan();
+  try {
+    camera = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  } catch {
+    message("The camera is unavailable or was refused. Choose an image instead.");
+    return;
+  }
+  video.srcObject = camera;
+  video.hidden = false;
+  show("qr-stop", true);
+  void video.play().catch(() => {});
+  message("Point the camera at a server QR code.");
+
+  const tick = (): void => {
+    if (camera === null) return;
+    let text: string | null = null;
+    try {
+      text = decodeQrFrame(video);
+    } catch {
+      text = null;
+    }
+    if (text !== null) {
+      stopCameraScan();
+      void addServerLink(text);
+      return;
+    }
+    cameraTimer = setTimeout(tick, 350);
+  };
+  cameraTimer = setTimeout(tick, 350);
+}
+
+function stopCameraScan(): void {
+  if (cameraTimer !== null) {
+    clearTimeout(cameraTimer);
+    cameraTimer = null;
+  }
+  camera?.getTracks().forEach((track) => track.stop());
+  camera = null;
+  const video = el<HTMLVideoElement>("qr-video");
+  if (video) {
+    video.srcObject = null;
+    video.hidden = true;
+  }
+  show("qr-stop", false);
+}
+
+/** Forgets a server after revoking its session, so a removed community leaves no live token. */
+async function removeActiveServer(): Promise<void> {
+  const id = activeServerId;
+  if (id === null) return;
+  if (servers.length <= 1) {
+    message("Keep at least one server.");
+    return;
+  }
+  const label = serverLabel(id);
+  if (!confirm(`Remove ${label} from this device? Its cached messages and session are deleted.`)) return;
+
+  // A sync already in flight could write its cache back after the delete.
+  await lastSync.get(id)?.catch(() => {});
+  const session = await getActiveAccount();
+  if (session !== null) {
+    try {
+      await signOut(session.server);
+    } catch (err) {
+      // The old sign-out rule applies to removal too: no silent local delete while the token
+      // lives. A server that is gone for good can still be removed, with a second confirmation.
+      const why = err instanceof Error ? err.message : "Could not revoke the session.";
+      if (!confirm(`${why}\n\nRemove ${label} anyway? Its session stays valid on that server until it expires.`)) {
+        return;
+      }
+    }
+  }
+  await removeServer(id);
+  forgetServerMeter(id);
+  resetView();
+  await refresh();
+  await refreshMeter();
+  message(`${label} removed.`);
+}
+
 /** Sign-in screen state: whether accounts are welcome, and whether a link is required. */
 async function paintRegistration(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) {
+    show("registration-note", false);
+    return;
+  }
+  const pending = await getPendingInvite(server);
+  const invite = pending?.kind === "signup" ? pending.token : null;
   const input = el<HTMLInputElement>("signup-invite");
-  if (pendingServerInvite !== null && input && input.value.length === 0) input.value = pendingServerInvite;
+  if (invite !== null && input && input.value.length === 0) input.value = invite;
 
-  const state = await getRegistration(location.origin);
+  const state = await getRegistration(server);
   if (state === null) {
     show("registration-note", false);
-    show("signup-invite-label", pendingServerInvite !== null);
+    show("signup-invite-label", invite !== null);
     const button = el<HTMLButtonElement>("sign-up");
     if (button) button.disabled = false;
     return;
@@ -263,7 +520,7 @@ async function paintRegistration(): Promise<void> {
   const blocked = state.frozen || state.mode === "closed";
   const button = el<HTMLButtonElement>("sign-up");
   if (button) button.disabled = blocked;
-  show("signup-invite-label", state.mode === "invite");
+  show("signup-invite-label", state.mode === "invite" || invite !== null);
   const note = state.frozen
     ? "Signups are frozen right now."
     : state.mode === "closed"
@@ -315,7 +572,8 @@ function paintServerUsers(users: ServerUser[], self: number | null): void {
 }
 
 async function renderAdmin(force = false): Promise<void> {
-  const session = await getSession();
+  const epoch = renderEpoch;
+  const session = await getActiveAccount();
   if (!session) {
     show("server-admin", false);
     serverSettings = null;
@@ -324,14 +582,15 @@ async function renderAdmin(force = false): Promise<void> {
   }
   // The panel does not change on its own: one fetch per account per page load keeps sync
   // traffic free of admin reads on a metered connection.
-  if (!force && adminLoadedFor === session.username) {
+  if (!force && adminLoadedFor === `${session.server} ${session.username}`) {
     show("server-admin", serverSettings?.admin === true);
     return;
   }
   try {
-    const settings = await getServerSettings(location.origin, session.token);
+    const settings = await getServerSettings(session.server, session.token);
+    if (epoch !== renderEpoch) return;
     serverSettings = settings;
-    adminLoadedFor = session.username;
+    adminLoadedFor = `${session.server} ${session.username}`;
     show("server-admin", settings.admin);
     if (!settings.admin) return;
 
@@ -340,7 +599,7 @@ async function renderAdmin(force = false): Promise<void> {
     const frozen = el<HTMLInputElement>("registration-frozen");
     if (frozen) frozen.checked = settings.frozen;
     paintServerInvite(settings.invite);
-    paintServerUsers(await getServerUsers(location.origin, session.token), await getSelf(session.username));
+    paintServerUsers(await getServerUsers(session.server, session.token), await getSelf(session));
   } catch {
     // A server that predates administration, or a dropped connection: keep the panel hidden
     // rather than showing stale switches the admin cannot trust.
@@ -349,7 +608,7 @@ async function renderAdmin(force = false): Promise<void> {
 }
 
 async function saveAdminSettings(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) return;
   const select = el<HTMLSelectElement>("registration-mode");
   const frozen = el<HTMLInputElement>("registration-frozen");
@@ -357,7 +616,7 @@ async function saveAdminSettings(): Promise<void> {
   const mode = select.value as RegistrationMode;
   if (mode !== "open" && mode !== "invite" && mode !== "closed") return;
   try {
-    const next = await saveServerSettings(location.origin, session.token, {
+    const next = await saveServerSettings(session.server, session.token, {
       mode,
       frozen: frozen?.checked === true,
     });
@@ -372,10 +631,10 @@ async function saveAdminSettings(): Promise<void> {
 }
 
 async function rotateAdminInvite(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) return;
   try {
-    const next = await rotateServerInvite(location.origin, session.token);
+    const next = await rotateServerInvite(session.server, session.token);
     serverSettings = next;
     paintServerInvite(next.invite);
     message("New server invite link ready. The old link no longer works.");
@@ -399,9 +658,9 @@ async function copyServerInvite(): Promise<void> {
 }
 
 async function setServerBan(user: number, on: boolean): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) return;
-  const queued = await enqueueOp(session.username, { tag: Tag.Ban, scope: 0, user, on });
+  const queued = await enqueueOp(session, { tag: Tag.Ban, scope: 0, user, on });
   const response = await syncNow();
   const ack = response?.acks.find((row) => row.cid.every((byte, i) => byte === queued.cid[i]));
   if (ack && "error" in ack) message(explainAck(ack.error));
@@ -441,22 +700,24 @@ function groupItem(group: StoredGroup, joining: boolean): HTMLLIElement {
 }
 
 async function refreshGroups(): Promise<void> {
-  const session = await getSession();
+  const epoch = renderEpoch;
+  const session = await getActiveAccount();
   const joinedList = el("groups-list");
   const openList = el("open-list");
   if (!session || !joinedList || !openList) return;
 
-  const self = await getSelf(session.username);
+  const self = await getSelf(session);
   setText("self", self === null ? "not known yet" : `#${self}`);
 
   const joined: StoredGroup[] = [];
   const open: StoredGroup[] = [];
-  for (const group of await getGroups(session.username)) {
-    const members = await getMembers(session.username, group.id);
+  for (const group of await getGroups(session)) {
+    const members = await getMembers(session, group.id);
     if (self !== null && members.some((member) => member.user === self)) joined.push(group);
     else if (group.open) open.push(group);
   }
 
+  if (epoch !== renderEpoch) return;
   joinedList.replaceChildren(...joined.map((group) => groupItem(group, false)));
   openList.replaceChildren(...open.map((group) => groupItem(group, true)));
   show("no-groups", joined.length === 0);
@@ -498,19 +759,21 @@ function dmItem(
 }
 
 async function refreshDms(): Promise<void> {
-  const session = await getSession();
+  const epoch = renderEpoch;
+  const session = await getActiveAccount();
   const list = el("dm-list");
   if (!session || !list) return;
 
-  const self = await getSelf(session.username);
-  const profiles = await getProfiles(session.username);
+  const self = await getSelf(session);
+  const profiles = await getProfiles(session);
   const rows: { dm: StoredDm; last: StoredPost | undefined }[] = [];
-  for (const dm of await getDmScopes(session.username)) {
-    const messages = await getPosts(session.username, dm.id);
+  for (const dm of await getDmScopes(session)) {
+    const messages = await getPosts(session, dm.id);
     rows.push({ dm, last: messages.at(-1) });
   }
   rows.sort((a, b) => (b.last?.seq ?? b.dm.seq) - (a.last?.seq ?? a.dm.seq));
 
+  if (epoch !== renderEpoch) return;
   list.replaceChildren(...rows.map(({ dm, last }) => dmItem(dm, self, profiles, last)));
   show("no-dms", rows.length === 0);
 }
@@ -673,37 +936,38 @@ function uploadFailure(err: unknown): string {
   return err instanceof Error ? err.message : "Could not send that photo.";
 }
 
-/** Resizes, encodes and uploads one photo; the post is queued only after the id exists. */
-async function uploadSelected(file: File): Promise<StoredMedia> {
-  const session = await getSession();
-  if (!session) throw new Error("Sign in first.");
+/**
+ * Resizes, encodes and uploads one photo. The account is passed in, not re-read: the post
+ * belongs to the server whose composer sent it, even if the user switches mid-upload.
+ */
+async function uploadSelected(file: File, account: Account): Promise<StoredMedia> {
   message("Preparing photo…");
   const prepared = await prepareImage(file);
   message("Uploading photo…");
-  const uploaded = await uploadImage(location.origin, session.token, prepared);
+  const uploaded = await uploadImage(account.server, account.token, prepared);
   return { id: uploaded.id, w: uploaded.w, h: uploaded.h, thumbhash: [...prepared.thumbhash] };
 }
 
 async function setMemberRole(user: number, role: number): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const scope = currentGroup;
   if (!session || scope === null) return;
-  await enqueueOp(session.username, { tag: Tag.Membership, scope, user, role });
+  await enqueueOp(session, { tag: Tag.Membership, scope, user, role });
   await syncNow();
 }
 
 async function setMemberBan(user: number, on: boolean): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const scope = currentGroup;
   if (!session || scope === null) return;
-  await enqueueOp(session.username, { tag: Tag.Ban, scope, user, on });
+  await enqueueOp(session, { tag: Tag.Ban, scope, user, on });
   await syncNow();
 }
 
 async function deletePost(post: StoredPost): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) return;
-  await enqueueOp(session.username, { tag: Tag.Delete, scope: post.scope, target: post.seq });
+  await enqueueOp(session, { tag: Tag.Delete, scope: post.scope, target: post.seq });
   await syncNow();
 }
 
@@ -763,22 +1027,24 @@ function banItem(ban: StoredBan, name: string, myRole: number): HTMLLIElement {
 async function renderGroup(): Promise<void> {
   const view = el("group-view");
   if (!view) return;
-  const session = await getSession();
+  const epoch = renderEpoch;
+  const session = await getActiveAccount();
   if (!session) {
     show("group-view", false);
     return;
   }
-  const group = currentGroup === null ? undefined : (await getGroups(session.username)).find((row) => row.id === currentGroup);
+  const group = currentGroup === null ? undefined : (await getGroups(session)).find((row) => row.id === currentGroup);
+  if (epoch !== renderEpoch) return;
   show("group-view", group !== undefined);
   if (!group) return;
 
   setText("group-title", group.name);
   setText("group-about", group.about.length > 0 ? group.about : group.open ? "Open group" : "Invite-only group");
-  const members = await getMembers(session.username, group.id);
+  const members = await getMembers(session, group.id);
   setText("group-members", `${members.length} ${members.length === 1 ? "member" : "members"}`);
 
-  const self = await getSelf(session.username);
-  const profiles = await getProfiles(session.username);
+  const self = await getSelf(session);
+  const profiles = await getProfiles(session);
   const myRole = members.find((member) => member.user === self)?.role ?? Role.None;
   const memberList = el("member-list");
   if (memberList) {
@@ -793,7 +1059,7 @@ async function renderGroup(): Promise<void> {
       ),
     );
   }
-  const bans = await getBans(session.username, group.id);
+  const bans = await getBans(session, group.id);
   const bannedList = el("banned-list");
   if (bannedList) {
     bannedList.replaceChildren(
@@ -810,14 +1076,15 @@ async function renderGroup(): Promise<void> {
 
   const context: ViewContext = {
     profiles,
-    reactions: tallyReactions(await getReactions(session.username, group.id), self),
+    reactions: tallyReactions(await getReactions(session, group.id), self),
     self,
     role: myRole,
-    base: location.origin,
+    base: session.server,
     token: session.token,
-    cacheKey: `${session.username}\u0000${location.origin}`,
+    cacheKey: accountKey(session),
   };
-  const posts = await getPosts(session.username, group.id);
+  const posts = await getPosts(session, group.id);
+  if (epoch !== renderEpoch) return;
   const roots = posts.filter((post) => post.parent === 0);
   const knownParents = new Set(roots.map((post) => post.seq));
   const replies = new Map<number, StoredPost[]>();
@@ -839,11 +1106,11 @@ async function renderGroup(): Promise<void> {
     );
   }
   // A gap only says older events exist; the button is how the user pays for them (ADR 0009).
-  const gaps = await getGaps(session.username, group.id);
+  const gaps = await getGaps(session, group.id);
   const gap = gaps[0];
   show(
     "load-older",
-    (posts.length > 0 || gap !== undefined) && !historyExhausted.has(historyKey(session.username, group.id)),
+    (posts.length > 0 || gap !== undefined) && !historyExhausted.has(historyKey(session, group.id)),
   );
   setText(
     "load-older",
@@ -883,11 +1150,11 @@ function paintInvite(invite: InviteLink): void {
 }
 
 async function loadInvite(group: number): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) return;
   loadingInviteGroup = group;
   try {
-    const invite = await getInvite(location.origin, session.token, group);
+    const invite = await getInvite(session.server, session.token, group);
     // The user may have switched groups while this was in flight.
     if (currentGroup !== group) return;
     currentInvite = invite;
@@ -900,14 +1167,14 @@ async function loadInvite(group: number): Promise<void> {
 }
 
 async function rotateCurrentInvite(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const group = currentGroup;
   if (!session || group === null) {
     message("Open an invite-only group first.");
     return;
   }
   try {
-    const invite = await rotateInvite(location.origin, session.token, group);
+    const invite = await rotateInvite(session.server, session.token, group);
     if (currentGroup !== group) return;
     currentInvite = invite;
     paintInvite(invite);
@@ -930,19 +1197,22 @@ async function copyInvite(): Promise<void> {
   }
 }
 
-/** Resolves /join/<token> after sign-in, then joins through the normal outbox. */
+/** Resolves a stored /join token after sign-in, then joins through the normal outbox. */
 async function completeInvite(): Promise<void> {
-  const invite = pendingInvite;
-  if (invite === null) return;
-  const session = await getSession();
+  const server = activeServerId;
+  if (server === null) return;
+  const session = await getActiveAccount();
   if (!session || session.recoveryPending === true) return;
+  const pending = await getPendingInvite(server);
+  if (pending?.kind !== "join") return;
+  const invite = pending.token;
 
   try {
-    const resolved = await resolveInvite(location.origin, session.token, invite);
-    const self = await getSelf(session.username);
+    const resolved = await resolveInvite(session.server, session.token, invite);
+    const self = await getSelf(session);
     if (self === null) return;
     if (!resolved.joined) {
-      await enqueueOp(session.username, {
+      await enqueueOp(session, {
         tag: Tag.Membership,
         scope: resolved.group,
         user: self,
@@ -951,18 +1221,17 @@ async function completeInvite(): Promise<void> {
       });
       message(`Joining ${resolved.name}…`);
     }
-    pendingInvite = null;
+    await setPendingInvite(server, null);
     cancelReply();
     clearImages();
     currentGroup = resolved.group;
-    if (location.pathname.startsWith("/join/")) history.replaceState({}, "", "/");
     const response = await syncNow();
     const refused = response?.acks.find((row) => "error" in row);
     if (refused && "error" in refused) message(explainAck(refused.error));
     else message(resolved.joined ? `You are already in ${resolved.name}.` : `Joined ${resolved.name}.`);
   } catch (err) {
     // A rotated or mistyped link is a dead end; say so instead of retrying forever.
-    pendingInvite = null;
+    await setPendingInvite(server, null);
     message(err instanceof Error ? err.message : "That invite link is no longer valid.");
   }
 }
@@ -971,7 +1240,8 @@ async function completeInvite(): Promise<void> {
 async function renderDm(): Promise<void> {
   const view = el("dm-view");
   if (!view) return;
-  const session = await getSession();
+  const epoch = renderEpoch;
+  const session = await getActiveAccount();
   if (!session) {
     show("dm-view", false);
     return;
@@ -980,12 +1250,12 @@ async function renderDm(): Promise<void> {
   let peer = pendingDmPeer;
   const scope = currentDm;
   if (scope !== null) {
-    const dm = (await getDmScopes(session.username)).find((row) => row.id === scope);
+    const dm = (await getDmScopes(session)).find((row) => row.id === scope);
     if (!dm) {
       show("dm-view", false);
       return;
     }
-    const self = await getSelf(session.username);
+    const self = await getSelf(session);
     peer = self !== null && dm.a === self ? dm.b : dm.a;
   }
   if (peer === null) {
@@ -993,32 +1263,33 @@ async function renderDm(): Promise<void> {
     return;
   }
 
-  const profiles = await getProfiles(session.username);
+  const profiles = await getProfiles(session);
   const profile = profiles.get(peer);
   const name = profile?.displayName || profile?.username || `user #${peer}`;
+  if (epoch !== renderEpoch) return;
   show("dm-view", true);
   setText("dm-title", `Direct message · ${name}`);
 
-  const self = await getSelf(session.username);
+  const self = await getSelf(session);
   const context: ViewContext = {
     profiles,
     reactions: new Map(),
     self,
     role: Role.None,
-    base: location.origin,
+    base: session.server,
     token: session.token,
-    cacheKey: `${session.username}\u0000${location.origin}`,
+    cacheKey: accountKey(session),
   };
-  const messages = scope === null ? [] : await getPosts(session.username, scope);
+  const messages = scope === null ? [] : await getPosts(session, scope);
   const list = el("dm-messages");
   if (list) list.replaceChildren(...messages.map((message) => postItem(message, context, [], false)));
   show("dm-empty", messages.length === 0);
-  const gaps = scope === null ? [] : await getGaps(session.username, scope);
+  const gaps = scope === null ? [] : await getGaps(session, scope);
   const gap = gaps[0];
   show(
     "dm-load-older",
     (messages.length > 0 || gap !== undefined) &&
-      (scope === null || !historyExhausted.has(historyKey(session.username, scope))),
+      (scope === null || !historyExhausted.has(historyKey(session, scope))),
   );
   setText(
     "dm-load-older",
@@ -1034,12 +1305,12 @@ async function renderDm(): Promise<void> {
  * the same cache, so a gap and the normal sync view become one continuous thread.
  */
 async function loadOlder(kind: "group" | "dm"): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const scope = kind === "group" ? currentGroup : currentDm;
   if (!session || scope === null) return;
 
-  const cached = await getPosts(session.username, scope);
-  const gaps = await getGaps(session.username, scope);
+  const cached = await getPosts(session, scope);
+  const gaps = await getGaps(session, scope);
   const gap = gaps[0];
   // A hole sits above the old cache: fill it from its top edge, not below the oldest post.
   const before = gap?.before ?? cached[0]?.seq;
@@ -1048,14 +1319,14 @@ async function loadOlder(kind: "group" | "dm"): Promise<void> {
   const button = el<HTMLButtonElement>(kind === "group" ? "load-older" : "dm-load-older");
   if (button) button.disabled = true;
   try {
-    const outcome = await loadHistory(location.origin, session.token, session.username, scope, before);
+    const outcome = await loadHistory(session, scope, before);
     if (outcome.kind === "upgrade") {
       message(upgradeMessage(outcome.error, outcome.range));
       return;
     }
     const { response } = outcome;
-    if (gap) await setGaps(session.username, scope, advanceGaps(gaps, response));
-    else if (!response.more) historyExhausted.add(historyKey(session.username, scope));
+    if (gap) await setGaps(session, scope, advanceGaps(gaps, response));
+    else if (!response.more) historyExhausted.add(historyKey(session, scope));
     const older = response.events.filter((event) => isGapCoveredTag(event.tag)).length;
     message(older === 0 ? "No older messages." : `Loaded ${older} older ${older === 1 ? "message" : "messages"}.`);
   } catch (err) {
@@ -1072,18 +1343,21 @@ async function afterAuth(): Promise<void> {
   // A session change must not inherit another account's downloaded images.
   clearMediaCache();
   await refresh();
-  await syncNow();
+  // Signing in may have queued ops on any server this device holds; drain all of them.
+  await syncAll();
   await completeInvite();
 }
 
-async function identifySelf(username: string): Promise<void> {
-  if ((await getSelf(username)) !== null) return;
-  for (const profile of (await getProfiles(username)).values()) {
-    if (profile.username === username) {
-      await setSelf(username, profile.user);
-      return;
+/** True when this sync is what taught the device its own wire id on this server. */
+async function identifySelf(account: Account): Promise<boolean> {
+  if ((await getSelf(account)) !== null) return false;
+  for (const profile of (await getProfiles(account)).values()) {
+    if (profile.username === account.username) {
+      await setSelf(account, profile.user);
+      return true;
     }
   }
+  return false;
 }
 
 function explainAck(error: number): string {
@@ -1115,57 +1389,63 @@ function failedMessage(failed: readonly StoredOp[]): string {
     : `${failed.length} queued messages were not sent because what they point at no longer exists. Copy or discard them under Unsent.`;
 }
 
-async function runSync(): Promise<SyncResponse | null> {
-  const session = await getSession();
-  if (!session) {
-    message("Sign in first.");
-    return null;
-  }
+/**
+ * One /sync per server, serialized per account. `createSyncQueue` runs calls in order, so a tap
+ * that lands during an in-flight sync gets its own run afterwards (ADR 0013, ADR 0020). A new
+ * token gets a new queue: an old closure must never send a revoked session.
+ */
+const syncQueues = new Map<string, { token: string; run: () => Promise<SyncResult> }>();
+const lastSync = new Map<string, Promise<SyncResult>>();
 
+function syncAccount(account: Account): Promise<SyncResult> {
+  const key = accountKey(account);
+  let entry = syncQueues.get(key);
+  if (entry === undefined || entry.token !== account.token) {
+    const queued = { ...account };
+    entry = { token: account.token, run: createSyncQueue<SyncResult>(() => runSync(queued)) };
+    syncQueues.set(key, entry);
+  }
+  const result = entry.run();
+  lastSync.set(account.server, result);
+  return result;
+}
+
+async function runSync(account: Account): Promise<SyncResult> {
   // The wire id is learned from the profile event this account publishes; no extra endpoint.
-  const knownSelf = await getSelf(session.username);
-  if (knownSelf === null && !(await getPendingOps(session.username)).some((op) => op.tag === Tag.Profile)) {
-    await enqueueOp(session.username, {
+  const knownSelf = await getSelf(account);
+  if (knownSelf === null && !(await getPendingOps(account)).some((op) => op.tag === Tag.Profile)) {
+    await enqueueOp(account, {
       tag: Tag.Profile,
       scope: 0,
-      username: session.username,
-      displayName: session.username,
+      username: account.username,
+      displayName: account.username,
       bio: "",
     });
   }
 
   try {
-    const { outcome, failed } = await drainOutbox(location.origin, session.token, session.username);
+    const { outcome, failed } = await drainOutbox(account);
     if (outcome.kind === "upgrade") {
       const { range, error } = outcome;
-      message(upgradeMessage(error, range));
-      await refresh();
-      return null;
+      return { kind: "upgrade", server: account.server, message: upgradeMessage(error, range) };
     }
 
     const { response } = outcome;
-    await identifySelf(session.username);
-
+    const learnedSelf = knownSelf === null && (await identifySelf(account));
     // A failed row already has its own explanation under Unsent; do not repeat its ack text.
     const failure = response.acks.find(
-      (ack) =>
-        "error" in ack &&
-        !failed.some((op) => op.cid.every((byte, index) => byte === ack.cid[index])),
+      (ack) => "error" in ack && !failed.some((op) => op.cid.every((byte, index) => byte === ack.cid[index])),
     );
     const notes: string[] = [];
     if (failed.length > 0) notes.push(failedMessage(failed));
     if (failure && "error" in failure) notes.push(explainAck(failure.error));
-    message(notes.length > 0 ? notes.join(" ") : `In sync at ${response.cursor}.`);
-
-    setText("cursor", String(response.cursor));
-    show("empty", response.events.length === 0 && response.cursor === 0 && (await getGroups(session.username)).length === 0);
-    await refresh();
-    // The admin panel first rendered before this account had a wire id, so its account list
-    // was legitimately empty. Refetch once, now that the profile exists.
-    if (knownSelf === null && adminLoadedFor !== null && (await getSelf(session.username)) !== null) {
-      await renderAdmin(true);
-    }
-    return response;
+    return {
+      kind: "ok",
+      server: account.server,
+      response,
+      warning: notes.length > 0 ? notes.join(" ") : null,
+      learnedSelf,
+    };
   } catch (err) {
     const text =
       err instanceof SyncHttpError && err.status === 403
@@ -1173,18 +1453,62 @@ async function runSync(): Promise<SyncResponse | null> {
         : err instanceof Error
           ? err.message
           : "Sync failed.";
-    message(text);
-    return null;
+    return { kind: "error", server: account.server, message: text };
   }
 }
 
-/**
- * One sync at a time, in call order. A tap that lands during an in-flight sync gets its own
- * run afterwards: the earlier request was built before that op was queued.
- */
-const syncNow = createSyncQueue<SyncResponse | null>(runSync);
+/** Syncs the server on screen and reports it. Everything that sends an op goes through here. */
+async function syncNow(): Promise<SyncResponse | null> {
+  const session = await getActiveAccount();
+  if (!session) {
+    message("Sign in first.");
+    return null;
+  }
+
+  const result = await syncAccount(session);
+  if (result.kind !== "ok") {
+    message(result.message);
+    await refresh();
+    return null;
+  }
+
+  message(result.warning ?? `In sync at ${result.response.cursor}.`);
+  setText("cursor", String(result.response.cursor));
+  show("empty", result.response.events.length === 0 && result.response.cursor === 0 && (await getGroups(session)).length === 0);
+  await refresh();
+  // The admin panel first rendered before this account had a wire id, so its account list
+  // was legitimately empty. Refetch once, now that the profile exists.
+  if (result.learnedSelf && adminLoadedFor !== null) await renderAdmin(true);
+  return result.response;
+}
+
+/** One /sync per signed-in server, each with its own token and cursor (ADR 0001, ADR 0020). */
+async function syncAll(): Promise<void> {
+  const accounts = (await listServers()).flatMap((server) =>
+    server.session === null ? [] : [{ server: server.id, ...server.session }],
+  );
+  if (accounts.length === 0) {
+    message("Add a server and sign in first.");
+    return;
+  }
+  const results = await Promise.all(accounts.map((account) => syncAccount(account)));
+  message(
+    results
+      .map((result) => {
+        const name = serverLabel(result.server);
+        return result.kind === "ok" ? `${name} ${result.response.cursor}` : `${name}: ${result.message}`;
+      })
+      .join(" · "),
+  );
+  await refresh();
+}
 
 async function submit(mode: Mode): Promise<void> {
+  const server = activeServerId;
+  if (server === null) {
+    message("Add a server first.");
+    return;
+  }
   const username = value("username");
   const password = el<HTMLInputElement>("password")?.value ?? "";
   if (username.length === 0 || password.length === 0) {
@@ -1195,23 +1519,21 @@ async function submit(mode: Mode): Promise<void> {
     if (mode === "up") {
       const invite = value("signup-invite");
       const { session, recoveryCode } = await signUp(
-        location.origin,
+        server,
         username,
         password,
         invite.length === 0 ? undefined : invite,
       );
       setText("recovery-code", recoveryCode);
-      // The invite did its one job; do not leave a capability in the address bar.
-      if (pendingServerInvite !== null || location.pathname.startsWith("/signup/")) {
-        pendingServerInvite = null;
-        history.replaceState({}, "", "/");
-        clear("signup-invite");
-      }
+      // The invite did its one job. It never entered the address bar (it was stored beside
+      // the server), so only the form field and the stored copy have to go.
+      await setPendingInvite(server, null);
+      clear("signup-invite");
       message(`Account created for ${session.username}. Save the code, then type its last group.`);
       await refresh();
       return;
     }
-    const session = await signIn(location.origin, username, password);
+    const session = await signIn(server, username, password);
     message(`Signed in as ${session.username}.`);
   } catch (err) {
     message(err instanceof Error ? err.message : "Sign in failed.");
@@ -1221,13 +1543,15 @@ async function submit(mode: Mode): Promise<void> {
 }
 
 async function finishSignup(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) return;
   const group = value("recovery-group");
   if (group.length === 0) {
     message("Type the last group of your recovery code to finish.");
     return;
   }
   try {
-    await confirmRecovery(location.origin, group);
+    await confirmRecovery(server, group);
     setText("recovery-code", "");
     message("Recovery code confirmed. Signup is finished.");
   } catch (err) {
@@ -1238,9 +1562,11 @@ async function finishSignup(): Promise<void> {
 }
 
 async function newCode(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) return;
   try {
-    const code = await regenerateRecovery(location.origin);
-    const session = await getSession();
+    const code = await regenerateRecovery(server);
+    const session = await getActiveAccount();
     if (session?.recoveryPending === true) {
       setText("recovery-code", code);
       message("New code shown once. Type its last group to finish signup.");
@@ -1255,6 +1581,11 @@ async function newCode(): Promise<void> {
 }
 
 async function recover(): Promise<void> {
+  const server = activeServerId;
+  if (server === null) {
+    message("Add a server first.");
+    return;
+  }
   const username = value("recover-username");
   const code = value("recover-code");
   if (username.length === 0 || code.length === 0) {
@@ -1262,7 +1593,7 @@ async function recover(): Promise<void> {
     return;
   }
   try {
-    const { session, recoveryCode } = await redeemRecovery(location.origin, username, code);
+    const { session, recoveryCode } = await redeemRecovery(server, username, code);
     setText("new-code", recoveryCode);
     show("code-panel", true);
     show("recover-panel", false);
@@ -1275,7 +1606,7 @@ async function recover(): Promise<void> {
 }
 
 async function createGroup(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) {
     message("Sign in first.");
     return;
@@ -1286,8 +1617,8 @@ async function createGroup(): Promise<void> {
     return;
   }
   const privateGroup = el<HTMLInputElement>("create-private")?.checked === true;
-  const knownGroups = new Set((await getGroups(session.username)).map((group) => group.id));
-  const queued = await enqueueOp(session.username, {
+  const knownGroups = new Set((await getGroups(session)).map((group) => group.id));
+  const queued = await enqueueOp(session, {
     tag: Tag.GroupMeta,
     scope: 0,
     name,
@@ -1305,7 +1636,7 @@ async function createGroup(): Promise<void> {
   if (created === null) {
     // Another sync may have drained this op before the run this call belongs to. The group
     // is in the cache either way; pick the newest one with this name instead of losing it.
-    const named = (await getGroups(session.username))
+    const named = (await getGroups(session))
       .filter((group) => group.name === name && !knownGroups.has(group.id))
       .sort((a, b) => b.seq - a.seq);
     created = named[0]?.id ?? null;
@@ -1321,13 +1652,13 @@ async function createGroup(): Promise<void> {
 }
 
 async function joinGroup(group: StoredGroup): Promise<void> {
-  const session = await getSession();
-  const self = session ? await getSelf(session.username) : null;
+  const session = await getActiveAccount();
+  const self = session ? await getSelf(session) : null;
   if (!session || self === null) {
     message("Still syncing this account. Try again in a moment.");
     return;
   }
-  await enqueueOp(session.username, {
+  await enqueueOp(session, {
     tag: Tag.Membership,
     scope: group.id,
     user: self,
@@ -1343,7 +1674,7 @@ async function joinGroup(group: StoredGroup): Promise<void> {
 
 /** Resolves a username from the cached profile list, then opens its thread or starts one. */
 async function openDm(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) {
     message("Sign in first.");
     return;
@@ -1354,8 +1685,8 @@ async function openDm(): Promise<void> {
     message("Type the username of the person to message.");
     return;
   }
-  const self = await getSelf(session.username);
-  const profile = [...(await getProfiles(session.username)).values()].find((row) => row.username === username);
+  const self = await getSelf(session);
+  const profile = [...(await getProfiles(session)).values()].find((row) => row.username === username);
   if (!profile) {
     message("This device has not seen that account yet. Sync after they join the server.");
     return;
@@ -1365,7 +1696,7 @@ async function openDm(): Promise<void> {
     return;
   }
 
-  const existing = (await getDmScopes(session.username)).find(
+  const existing = (await getDmScopes(session)).find(
     (dm) => dm.a === profile.user || dm.b === profile.user,
   );
   currentGroup = null;
@@ -1380,7 +1711,7 @@ async function openDm(): Promise<void> {
 }
 
 async function sendDm(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   if (!session) {
     message("Sign in first.");
     return;
@@ -1394,12 +1725,12 @@ async function sendDm(): Promise<void> {
   let scope = currentDm;
   let peer = pendingDmPeer;
   if (scope !== null) {
-    const dm = (await getDmScopes(session.username)).find((row) => row.id === scope);
+    const dm = (await getDmScopes(session)).find((row) => row.id === scope);
     if (!dm) {
       message("That conversation is gone. Open it again.");
       return;
     }
-    const self = await getSelf(session.username);
+    const self = await getSelf(session);
     peer = self !== null && dm.a === self ? dm.b : dm.a;
   }
   if (scope === null && peer === null) {
@@ -1410,7 +1741,7 @@ async function sendDm(): Promise<void> {
   let media: StoredMedia | null = null;
   if (pendingDmImage !== null) {
     try {
-      media = await uploadSelected(pendingDmImage);
+      media = await uploadSelected(pendingDmImage, session);
     } catch (err) {
       message(uploadFailure(err));
       return;
@@ -1419,7 +1750,7 @@ async function sendDm(): Promise<void> {
 
   // scope 0 lets the server open (or reuse) the single scope for this pair; a retry reuses
   // the same cid through the outbox, so it can never create a second conversation.
-  await enqueueOp(session.username, {
+  await enqueueOp(session, {
     tag: Tag.Dm,
     scope: scope ?? 0,
     peer: peer ?? 0,
@@ -1431,7 +1762,7 @@ async function sendDm(): Promise<void> {
   await syncNow();
   // The cache holds the dm_scope event once it lands, so the conversation is selected by
   // peer. This does not depend on which queued sync consumed the op.
-  const dm = (await getDmScopes(session.username)).find((row) => row.a === peer || row.b === peer);
+  const dm = (await getDmScopes(session)).find((row) => row.a === peer || row.b === peer);
   if (dm) {
     currentDm = dm.id;
     pendingDmPeer = null;
@@ -1440,7 +1771,7 @@ async function sendDm(): Promise<void> {
 }
 
 async function postMessage(): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const text = value("post-text");
   if (!session) {
     message("Sign in first.");
@@ -1460,7 +1791,7 @@ async function postMessage(): Promise<void> {
   let media: StoredMedia | null = null;
   if (pendingPostImage !== null) {
     try {
-      media = await uploadSelected(pendingPostImage);
+      media = await uploadSelected(pendingPostImage, session);
     } catch (err) {
       message(uploadFailure(err));
       return;
@@ -1468,7 +1799,7 @@ async function postMessage(): Promise<void> {
   }
 
   await enqueueOp(
-    session.username,
+    session,
     parent === null
       ? { tag: Tag.Post, scope, text, ...(media === null ? {} : { media }) }
       : { tag: Tag.Reply, scope, parent, text, ...(media === null ? {} : { media }) },
@@ -1481,7 +1812,7 @@ async function postMessage(): Promise<void> {
 
 /** Toggles one palette emoji for this account: on when it was not on, off otherwise. */
 async function toggleReaction(target: number, emoji: number): Promise<void> {
-  const session = await getSession();
+  const session = await getActiveAccount();
   const scope = currentGroup;
   if (!session) {
     message("Sign in first.");
@@ -1491,29 +1822,25 @@ async function toggleReaction(target: number, emoji: number): Promise<void> {
     message("Open a group first.");
     return;
   }
-  const self = await getSelf(session.username);
+  const self = await getSelf(session);
   if (self === null) {
     message("Still syncing this account. Try again in a moment.");
     return;
   }
-  const on = await nextReactionOn(session.username, scope, target, emoji, self);
-  await enqueueOp(session.username, { tag: Tag.Reaction, scope, target, emoji, on });
+  const on = await nextReactionOn(session, scope, target, emoji, self);
+  await enqueueOp(session, { tag: Tag.Reaction, scope, target, emoji, on });
   await syncNow();
 }
 
 async function leave(): Promise<void> {
+  const session = await getActiveAccount();
+  if (!session) return;
   try {
-    await signOut(location.origin);
+    await signOut(session.server);
     clearMediaCache();
     // Signing out drops downloaded images from the durable cache too, not just this page.
     await clearMediaBytes().catch(() => undefined);
-    cancelReply();
-    clearImages();
-    currentGroup = null;
-    currentDm = null;
-    pendingDmPeer = null;
-    setText("new-code", "");
-    show("code-panel", false);
+    resetView();
     message("Signed out.");
   } catch (err) {
     message(err instanceof Error ? err.message : "Sign out failed.");
@@ -1530,7 +1857,19 @@ function wire(): void {
   el<HTMLButtonElement>("sign-up")?.addEventListener("click", () => void submit("up"));
   el<HTMLButtonElement>("sign-in")?.addEventListener("click", () => void submit("in"));
   el<HTMLButtonElement>("sign-out")?.addEventListener("click", () => void leave());
-  el<HTMLButtonElement>("sync")?.addEventListener("click", () => void syncNow());
+  el<HTMLButtonElement>("sync")?.addEventListener("click", () => void syncAll());
+  el<HTMLSelectElement>("server-select")?.addEventListener("change", (event) => {
+    const select = event.currentTarget as HTMLSelectElement;
+    const id = select.value;
+    switchQueue = switchQueue.then(() => switchServer(id)).catch(() => {});
+  });
+  el<HTMLButtonElement>("add-server-show")?.addEventListener("click", () => showAddServer(true));
+  el<HTMLButtonElement>("add-server-cancel")?.addEventListener("click", () => showAddServer(false));
+  el<HTMLButtonElement>("add-server-link")?.addEventListener("click", () => void addServerLink());
+  el<HTMLInputElement>("server-qr-file")?.addEventListener("change", () => void addServerFromQrImage());
+  el<HTMLButtonElement>("add-server-camera")?.addEventListener("click", () => void startCameraScan());
+  el<HTMLButtonElement>("qr-stop")?.addEventListener("click", stopCameraScan);
+  el<HTMLButtonElement>("server-remove")?.addEventListener("click", () => void removeActiveServer());
   el<HTMLButtonElement>("load-older")?.addEventListener("click", () => void loadOlder("group"));
   el<HTMLButtonElement>("dm-load-older")?.addEventListener("click", () => void loadOlder("dm"));
   el<HTMLButtonElement>("confirm")?.addEventListener("click", () => void finishSignup());
@@ -1569,13 +1908,36 @@ function watchMeterRollover(): void {
   }, Math.max(delay, 1000));
 }
 
-function boot(): void {
+/**
+ * The shell is served at /signup/<token> and /join/<token> too. Both are links into this app,
+ * so the token moves into the server list and the address bar goes back to "/" at once.
+ */
+async function captureLocationLink(): Promise<void> {
+  if (typeof location === "undefined") return;
+  if (!/^\/(?:signup|join)\//.test(location.pathname)) return;
+  const server = location.origin;
+  await ensureServer(server);
+  await setActiveServer(server);
+  const link = parseServerLink(location.href);
+  if (link?.invite) await setPendingInvite(server, link.invite);
+  else message("That invite link is not valid.");
+  // A capability never stays in the address bar, valid or not.
+  history.replaceState({}, "", "/");
+}
+
+async function boot(): Promise<void> {
   if (typeof document === "undefined") return;
   wire();
   // Painted before any request so the meter is on screen signed-in or signed-out, and read
   // before the first sync so the month's stored total is already counted.
   meter.subscribe(paintMeter);
-  refreshMeter();
+
+  // The single-server shell becomes the list without losing its session, cursor or cache.
+  await migrateLegacy(location.origin);
+  await ensureServer(location.origin);
+  migrateLegacyMeterSession(location.origin);
+  await captureLocationLink();
+  await loadMeter();
   watchMeterRollover();
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refreshMeter();
@@ -1583,8 +1945,10 @@ function boot(): void {
   // Coming back online is the one moment the durable outbox can drain without a tap.
   watchOnline(globalThis, () => {
     void (async () => {
-      const session = await getSession();
-      if (session && session.recoveryPending !== true) await syncNow();
+      const accounts = (await listServers()).filter(
+        (server) => server.session !== null && server.session.recoveryPending !== true,
+      );
+      if (accounts.length > 0) await syncAll();
     })();
   });
   if ("serviceWorker" in navigator) {
@@ -1592,11 +1956,10 @@ function boot(): void {
       // Without a service worker the app still works, it just refetches the shell.
     });
   }
-  void (async () => {
-    const session = await getSession();
-    if (session && session.recoveryPending !== true) await afterAuth();
-    else await refresh();
-  })();
+
+  const session = await getActiveAccount();
+  if (session && session.recoveryPending !== true) await afterAuth();
+  else await refresh();
 }
 
-boot();
+void boot();

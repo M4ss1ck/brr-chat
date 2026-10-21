@@ -14,7 +14,7 @@ import { bearerHeader } from "../src/auth.ts";
 import { meter } from "../src/meter.ts";
 import { uploadImage, type PreparedImage } from "../src/media.ts";
 import { buildSyncRequest, classifySyncResponse, postSyncRequest, syncAndPersist } from "../src/sync.ts";
-import { closeStore, getCursor, getRange, getSession, getStoredCursor } from "../src/store.ts";
+import { closeStore, ensureServer, getCursor, getRange, getSession, getStoredCursor, setSession, type Account } from "../src/store.ts";
 
 /** The DOM lib's BodyInit does not list Uint8Array; every runtime accepts it. */
 const cborBody = (bytes: Uint8Array): BodyInit => bytes as unknown as BodyInit;
@@ -49,12 +49,12 @@ function username(): string {
 let account = 0;
 
 /** Sign up, then finish the type-back so the account can sync (ADR 0006). */
-async function signUpConfirmed(): Promise<{ session: NonNullable<Awaited<ReturnType<typeof getSession>>>; recoveryCode: string }> {
+async function signUpConfirmed(): Promise<{ session: Account; recoveryCode: string }> {
   const exchange = await auth.signUp(base, username(), "password1234");
   await auth.confirmRecovery(base, exchange.recoveryCode.slice(-5));
-  const session = await getSession();
-  if (!session) throw new Error("signup confirmed without a stored session");
-  return { session, recoveryCode: exchange.recoveryCode };
+  const stored = await getSession(base);
+  if (!stored) throw new Error("signup confirmed without a stored session");
+  return { session: { server: base, ...stored }, recoveryCode: exchange.recoveryCode };
 }
 
 /** Forwards bytes verbatim between the client and the server and counts both directions. */
@@ -131,7 +131,7 @@ describe("PWA client (apps/web)", () => {
     expect(session.token.includes(".")).toBe(false);
     expect(session.recoveryPending).toBe(true);
     expect(recoveryCode).toMatch(/^[0-9A-Z]{5}(-[0-9A-Z]{5}){3}$/);
-    expect(await getSession()).toEqual(session);
+    expect(await getSession(base)).toEqual({ token: session.token, username: session.username, recoveryPending: true });
     expect(await bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
   });
 
@@ -143,7 +143,7 @@ describe("PWA client (apps/web)", () => {
     globalThis.indexedDB = new IDBFactory();
     await expect(auth.signUp(base, taken, "password1234")).rejects.toThrow(/status \d+/);
     await expect(auth.signIn(base, taken, "wrong-password")).rejects.toThrow(/status \d+/);
-    expect(await getSession()).toBeNull();
+    expect(await getSession(base)).toBeNull();
   });
 
   test("sign in after a restart returns the same account and clears nothing", async () => {
@@ -160,12 +160,12 @@ describe("PWA client (apps/web)", () => {
     const { session } = await signUpConfirmed();
     expect(bearerHeader(session.token)).toBe(`Bearer ${session.token}`);
     await auth.signOut(base);
-    expect(await getSession()).toBeNull();
+    expect(await getSession(base)).toBeNull();
 
     await expect(postSyncRequest(base, session.token, buildSyncRequest(0))).rejects.toThrow("status 401");
     const again = await auth.signIn(base, session.username, "password1234");
     expect(again.token).not.toBe(session.token);
-    const outcome = await syncAndPersist(base, again.token, again.username);
+    const outcome = await syncAndPersist(again);
     expect(outcome.kind).toBe("ok");
   });
 
@@ -177,8 +177,14 @@ describe("PWA client (apps/web)", () => {
       fetch: () => new Response("nope", { status: 500 }),
     });
     try {
-      await expect(auth.signOut(`http://127.0.0.1:${refusing.port}`)).rejects.toThrow("failed with status 500");
-      expect(await getSession()).toEqual(session);
+      const refusingBase = `http://127.0.0.1:${refusing.port}`;
+      // Sign-out is per server: give that server the same account so the call is made.
+      await ensureServer(refusingBase);
+      await setSession(refusingBase, { token: session.token, username: session.username });
+      await expect(auth.signOut(refusingBase)).rejects.toThrow("failed with status 500");
+      expect(await getSession(refusingBase)).toEqual({ token: session.token, username: session.username });
+      // The first server's session was never touched by the failed call.
+      expect(await getSession(base)).toEqual({ token: session.token, username: session.username });
     } finally {
       await refusing.stop(true);
     }
@@ -186,21 +192,21 @@ describe("PWA client (apps/web)", () => {
 
   test("syncs an empty server: cursor 0 stored, cached range, no events", async () => {
     const { session } = await signUpConfirmed();
-    const outcome = await syncAndPersist(base, session.token, session.username);
+    const outcome = await syncAndPersist(session);
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind !== "ok") return;
     expect(outcome.response.cursor).toBe(0);
     expect(outcome.response.events).toEqual([]);
     expect(outcome.response.more).toBe(false);
-    expect(await getStoredCursor(session.username)).toBe(0);
-    expect(await getCursor(session.username)).toBe(0);
-    expect(await getRange()).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
+    expect(await getStoredCursor(session)).toBe(0);
+    expect(await getCursor(session)).toBe(0);
+    expect(await getRange(base)).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
   });
 
   test("an out-of-range version answers with the upgrade error and moves no cursor", async () => {
     const { session } = await signUpConfirmed();
-    expect(await getStoredCursor(session.username)).toBeNull();
+    expect(await getStoredCursor(session)).toBeNull();
 
     const old = await postSyncRequest(base, session.token, buildSyncRequest(0, [], 0));
     expect(classifySyncResponse(old)).toEqual({
@@ -216,14 +222,14 @@ describe("PWA client (apps/web)", () => {
       range: { min: 1, max: 1 },
     });
 
-    expect(await getStoredCursor(session.username)).toBeNull();
+    expect(await getStoredCursor(session)).toBeNull();
   });
 
   test("a server that moved on: the range is cached and the cursor is not advanced", async () => {
     const { session } = await signUpConfirmed();
-    const first = await syncAndPersist(base, session.token, session.username);
+    const first = await syncAndPersist(session);
     expect(first.kind).toBe("ok");
-    expect(await getCursor(session.username)).toBe(0);
+    expect(await getCursor(session)).toBe(0);
 
     // Stand-in for the next server build: it accepts v2..v2, so this client is too old.
     const moved = Bun.serve({
@@ -234,8 +240,10 @@ describe("PWA client (apps/web)", () => {
           cborBody(encodeSyncResponse({ range: { min: 2, max: 2 }, cursor: 99, more: false, events: [], acks: [], skipped: 0, error: ResponseError.ClientTooNew })),
         ),
     });
+    const movedBase = `http://127.0.0.1:${moved.port}`;
     try {
-      const outcome = await syncAndPersist(`http://127.0.0.1:${moved.port}`, session.token, session.username);
+      const movedAccount = { server: movedBase, token: session.token, username: session.username };
+      const outcome = await syncAndPersist(movedAccount);
       expect(outcome).toEqual({ kind: "upgrade", error: ResponseError.ClientTooNew, range: { min: 2, max: 2 } });
     } finally {
       await moved.stop(true);
@@ -243,13 +251,15 @@ describe("PWA client (apps/web)", () => {
 
     // The cached range is what lets the UI say "update available" before the server
     // stops answering, and the local cursor must not move on a rejected response.
-    expect(await getRange()).toEqual({ min: 2, max: 2 });
-    expect(await getCursor(session.username)).toBe(0);
+    expect(await getRange(movedBase)).toEqual({ min: 2, max: 2 });
+    // A range belongs to one server: the first server's cached range must not be overwritten.
+    expect(await getRange(base)).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
+    expect(await getCursor(session)).toBe(0);
   });
 
   test("an unauthenticated sync throws instead of writing a cursor", async () => {
     await expect(postSyncRequest(base, "nope".repeat(8), buildSyncRequest(0))).rejects.toThrow("status 401");
-    expect(await getStoredCursor("nobody")).toBeNull();
+    expect(await getStoredCursor({ server: base, username: "nobody" })).toBeNull();
   });
 
   test("a request without a token throws", async () => {
@@ -278,8 +288,8 @@ describe("PWA client (apps/web)", () => {
     await expect(postSyncRequest(base, pending.token, buildSyncRequest(0))).rejects.toThrow("status 403");
 
     await auth.confirmRecovery(base, recoveryCode.slice(-5));
-    expect((await getSession())?.recoveryPending).toBeUndefined();
-    expect((await syncAndPersist(base, pending.token, pending.username)).kind).toBe("ok");
+    expect((await getSession(base))?.recoveryPending).toBeUndefined();
+    expect((await syncAndPersist(pending)).kind).toBe("ok");
 
     const next = await auth.regenerateRecovery(base);
     expect(next).not.toBe(recoveryCode);
@@ -290,8 +300,8 @@ describe("PWA client (apps/web)", () => {
     await expect(auth.redeemRecovery(base, account, recoveryCode)).rejects.toThrow(/invalid/);
     const redeemed = await auth.redeemRecovery(base, account, next);
     expect(redeemed.session.username).toBe(account);
-    expect(await getSession()).toEqual(redeemed.session);
-    expect((await syncAndPersist(base, redeemed.session.token, redeemed.session.username)).kind).toBe("ok");
+    expect(await getSession(base)).toEqual({ token: redeemed.session.token, username: redeemed.session.username });
+    expect((await syncAndPersist(redeemed.session)).kind).toBe("ok");
   });
 
   test("the data meter's count tracks the bytes a real socket carries", async () => {
@@ -367,7 +377,7 @@ describe("PWA client (apps/web)", () => {
     const { session } = await signUpConfirmed();
     const counter = await startWireCounter();
     try {
-      const outcome = await syncAndPersist(counter.base, session.token, session.username);
+      const outcome = await syncAndPersist({ ...session, server: counter.base });
       expect(outcome.kind).toBe("ok");
       const wireBytes = counter.totals();
       console.log(`empty sync wire bytes (client->server->client, real socket): ${wireBytes} B`);

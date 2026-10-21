@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@brr-chat/protocol": "workspace:*",
+    "jsqr": "^1.4.0",
     "qrcode-generator": "1.4.4",
     "thumbhash": "0.1.1"
   },

@@ -13,7 +13,7 @@ import {
 } from "@brr-chat/protocol";
 import { bearerHeader } from "./auth.ts";
 import { meteredFetch } from "./meter.ts";
-import { applyEvents, type StoredGap } from "./store.ts";
+import { applyEvents, type Account, type StoredGap } from "./store.ts";
 
 export const HISTORY_PATH = "/history";
 
@@ -71,19 +71,21 @@ export function classifyHistoryResponse(response: HistoryResponse): HistoryOutco
  * tap again; the stored sync cursor never moves, because history is not catch-up progress.
  */
 export async function loadHistory(
-  base: string,
-  token: string,
-  username: string,
+  account: Account,
   scope: number,
   before: number,
   limit: number = MAX_HISTORY_LIMIT,
 ): Promise<HistoryOutcome> {
-  const response = await postHistoryRequest(base, token, buildHistoryRequest(scope, before, limit));
+  const response = await postHistoryRequest(
+    account.server,
+    account.token,
+    buildHistoryRequest(scope, before, limit),
+  );
   const outcome = classifyHistoryResponse(response);
   // The page being shown is exempt from this batch's eviction; the next sync trims it if it
   // no longer belongs in the latest window.
   if (outcome.kind === "ok") {
-    await applyEvents(username, response.events, {
+    await applyEvents(account, response.events, {
       protectedSeqs: new Set(response.events.map((event) => event.seq)),
     });
   }

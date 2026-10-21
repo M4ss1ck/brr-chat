@@ -4,26 +4,36 @@
 // and content length the network stack adds, and the response status line, headers and body.
 // A compressed body uses Content-Length, which is the bytes actually downloaded.
 import { monthOf } from "./month.ts";
-import { getMeter, setMeter, type StoredMeter } from "./store.ts";
+import { serverOfUrl } from "./servers.ts";
+import { getMeter, listServers, setMeter, type StoredMeter } from "./store.ts";
 
-/** The two scopes the meter keeps: the tab session and the local calendar month. */
+/** Where the meter keeps its counters: one month row and one tab total per server. */
 export interface MeterStorage {
-  readMonth(): Promise<StoredMeter | null>;
-  writeMonth(row: StoredMeter): Promise<void>;
-  readSession(): number;
-  writeSession(bytes: number): void;
+  /** Every server this device knows, so a reload restores each month separately. */
+  readServers(): Promise<string[]>;
+  readMonth(server: string): Promise<StoredMeter | null>;
+  writeMonth(server: string, row: StoredMeter): Promise<void>;
+  readSession(server: string): number;
+  writeSession(server: string, bytes: number): void;
 }
 
+/** The two scopes the meter keeps: the tab session and the local calendar month. */
 export interface MeterTotals {
-  /** Bytes this tab session, across reloads. */
+  /** Bytes this tab session, across reloads and across every server. */
   sessionBytes: number;
-  /** Bytes in the device's current calendar month. */
+  /** Bytes in the device's current calendar month, across every server. */
   monthBytes: number;
 }
 
 export interface MeterState extends MeterTotals {
   /** The local month the total belongs to, `YYYY-MM`. */
   monthKey: string;
+}
+
+/** One server's share of the same two scopes (#18, ADR 0020). */
+export interface ServerMeterTotals extends MeterTotals {
+  /** Canonical origin, which is also how the server is named in the list. */
+  server: string;
 }
 
 type MeterListener = (totals: MeterTotals) => void;
@@ -129,12 +139,15 @@ function declaredLength(headers: Headers): number | null {
 }
 
 /**
- * Counts bytes in memory, persists the month, and notifies the UI. Persistence is queued so
- * two fast responses cannot write an older total after a newer one.
+ * Counts bytes in memory, persists each server's month, and notifies the UI. Persistence is
+ * queued so two fast responses cannot write an older total after a newer one. A request is
+ * charged to the origin it goes to, so one bar can answer "which community cost me this".
  */
 export class DataMeter {
-  private sessionBytes = 0;
-  private monthBytes = 0;
+  /** Per server: session and month counters, keyed by canonical origin. */
+  private readonly buckets = new Map<string, MeterTotals>();
+  /** Removed servers keep counting nothing, even for a response that was already in flight. */
+  private readonly forgotten = new Set<string>();
   private month = "";
   private loaded = false;
   private loading: Promise<void> | null = null;
@@ -147,8 +160,22 @@ export class DataMeter {
     private readonly fetchImpl: FetchImplementation = (input, init) => fetch(input, init),
   ) {}
 
+  /** Totals across every server: what the phone was billed, whatever community it was for. */
   totals(): MeterState {
-    return { sessionBytes: this.sessionBytes, monthBytes: this.monthBytes, monthKey: this.month };
+    let sessionBytes = 0;
+    let monthBytes = 0;
+    for (const bucket of this.buckets.values()) {
+      sessionBytes += bucket.sessionBytes;
+      monthBytes += bucket.monthBytes;
+    }
+    return { sessionBytes, monthBytes, monthKey: this.month };
+  }
+
+  /** The same totals split by server, in a stable order for the meter bar. */
+  servers(): ServerMeterTotals[] {
+    return [...this.buckets.entries()]
+      .map(([server, bucket]) => ({ server, sessionBytes: bucket.sessionBytes, monthBytes: bucket.monthBytes }))
+      .sort((a, b) => a.server.localeCompare(b.server));
   }
 
   /** The listener is called once immediately with the current totals, then after each change. */
@@ -160,9 +187,13 @@ export class DataMeter {
     };
   }
 
-  /** Reads the month from storage and rolls it if the calendar has moved on. */
+  /**
+   * Reads every server's month from storage and rolls them if the calendar has moved on.
+   * Called at boot, and again after a server is added so its row appears without a reload.
+   */
   async load(): Promise<void> {
-    await this.ensureLoaded();
+    if (this.loaded) await this.refreshServers();
+    else await this.ensureLoaded();
     this.roll();
   }
 
@@ -170,6 +201,13 @@ export class DataMeter {
   async flush(): Promise<void> {
     await this.ensureLoaded();
     await this.writeChain;
+  }
+
+  /** Drops one server's counters, for a server the user removed from the list. */
+  forget(server: string): void {
+    this.forgotten.add(server);
+    if (!this.buckets.delete(server)) return;
+    this.emit();
   }
 
   /**
@@ -180,7 +218,9 @@ export class DataMeter {
     await this.ensureLoaded();
     const request = new Request(input, init);
     const bodyBytes = init?.body === undefined ? await requestBodyByteLength(request) : bodyByteLength(init.body);
+    const server = serverOfUrl(request.url) ?? request.url;
     this.count(
+      server,
       requestWireBytes({
         method: request.method,
         url: request.url,
@@ -191,7 +231,7 @@ export class DataMeter {
 
     const response = await this.fetchImpl(request);
     try {
-      this.count(await this.responseBytes(response));
+      this.count(server, await this.responseBytes(response));
     } catch {
       // A meter that cannot read a header must not turn a good response into a failure.
     }
@@ -233,25 +273,48 @@ export class DataMeter {
 
   private async open(): Promise<void> {
     this.month = monthOf(this.now());
+    await this.refreshServers();
+    this.loaded = true;
+    this.emit();
+  }
+
+  /** Adds a bucket for a server this meter has not seen yet, restoring its stored month. */
+  private async refreshServers(): Promise<void> {
+    let servers: string[] = [];
     try {
-      this.sessionBytes = this.storage.readSession();
+      servers = await this.storage.readServers();
     } catch {
-      this.sessionBytes = 0;
+      // Private mode or a corrupt DB: requests still count in memory under their origin.
+      servers = [];
+    }
+    for (const server of servers) {
+      this.forgotten.delete(server);
+      if (this.buckets.has(server)) continue;
+      this.buckets.set(server, { sessionBytes: 0, monthBytes: 0 });
+      await this.loadBucket(server);
+    }
+  }
+
+  private async loadBucket(server: string): Promise<void> {
+    const bucket = this.buckets.get(server);
+    if (!bucket) return;
+    try {
+      bucket.sessionBytes = this.storage.readSession(server);
+    } catch {
+      bucket.sessionBytes = 0;
     }
     let stored: StoredMeter | null = null;
     try {
-      stored = await this.storage.readMonth();
+      stored = await this.storage.readMonth(server);
     } catch {
       // Private mode or a corrupt DB: the in-memory meter still works, it just cannot persist.
     }
     if (stored !== null && stored.month === this.month) {
-      this.monthBytes = stored.bytes;
+      bucket.monthBytes = stored.bytes;
     } else {
-      this.monthBytes = 0;
-      this.queueWrite();
+      bucket.monthBytes = 0;
+      this.queueWrite(server);
     }
-    this.loaded = true;
-    this.emit();
   }
 
   private roll(): void {
@@ -259,24 +322,32 @@ export class DataMeter {
     const month = monthOf(this.now());
     if (month === this.month) return;
     this.month = month;
-    this.monthBytes = 0;
+    for (const [server, bucket] of this.buckets) {
+      bucket.monthBytes = 0;
+      this.queueWrite(server);
+    }
     this.emit();
-    this.queueWrite();
   }
 
-  private count(bytes: number): void {
+  private count(server: string, bytes: number): void {
     const value = Math.round(bytes);
     if (!Number.isFinite(value) || value <= 0) return;
-    this.sessionBytes += value;
+    if (this.forgotten.has(server)) return;
+    let bucket = this.buckets.get(server);
+    if (!bucket) {
+      bucket = { sessionBytes: 0, monthBytes: 0 };
+      this.buckets.set(server, bucket);
+    }
+    bucket.sessionBytes += value;
     try {
-      this.storage.writeSession(this.sessionBytes);
+      this.storage.writeSession(server, bucket.sessionBytes);
     } catch {
       // Session persistence is a convenience; counting in memory must still work.
     }
     this.roll();
-    this.monthBytes += value;
+    bucket.monthBytes += value;
     this.emit();
-    this.queueWrite();
+    this.queueWrite(server);
   }
 
   private emit(): void {
@@ -284,23 +355,29 @@ export class DataMeter {
     for (const listener of this.listeners) listener(totals);
   }
 
-  private queueWrite(): void {
-    const row: StoredMeter = { month: this.month, bytes: this.monthBytes };
+  private queueWrite(server: string): void {
     this.writeChain = this.writeChain
-      .then(() => this.storage.writeMonth(row))
+      .then(() => {
+        // Read the bucket when the write lands: a coalesced total is better than a stale row,
+        // and a removed server must not get its month row recreated after deletion.
+        const bucket = this.buckets.get(server);
+        if (!bucket) return;
+        return this.storage.writeMonth(server, { month: this.month, bytes: bucket.monthBytes });
+      })
       .catch(() => {
         // A meter write must never break a request or a render.
       });
   }
 }
 
-const SESSION_KEY = "brr-meter-session";
+const SESSION_PREFIX = "brr-meter-session:";
+const LEGACY_SESSION_KEY = "brr-meter-session";
 
 /** SessionStorage is per tab and survives reloads; month storage is shared IndexedDB. */
-function readSessionBytes(): number {
+function readSessionBytes(server: string): number {
   if (typeof sessionStorage === "undefined") return 0;
   try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
+    const raw = sessionStorage.getItem(`${SESSION_PREFIX}${server}`);
     const value = raw === null ? 0 : Number(raw);
     return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   } catch {
@@ -308,16 +385,45 @@ function readSessionBytes(): number {
   }
 }
 
-function writeSessionBytes(bytes: number): void {
+function writeSessionBytes(server: string, bytes: number): void {
   if (typeof sessionStorage === "undefined") return;
   try {
-    sessionStorage.setItem(SESSION_KEY, String(bytes));
+    sessionStorage.setItem(`${SESSION_PREFIX}${server}`, String(bytes));
   } catch {
     // Private mode or quota: the in-memory session counter is still correct.
   }
 }
 
+/**
+ * One tab's session total used to live under one key. Hand it to the server that served the
+ * old shell, so an update does not restart the session counter mid-tab (#18).
+ */
+export function migrateLegacyMeterSession(server: string): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const legacy = sessionStorage.getItem(LEGACY_SESSION_KEY);
+    if (legacy === null) return;
+    const target = `${SESSION_PREFIX}${server}`;
+    if (sessionStorage.getItem(target) === null) sessionStorage.setItem(target, legacy);
+    sessionStorage.removeItem(LEGACY_SESSION_KEY);
+  } catch {
+    // No sessionStorage: nothing to move and nothing to lose.
+  }
+}
+
+/** Drops the tab's counter for a server the user removed from the list. */
+export function forgetServerMeter(server: string): void {
+  meter.forget(server);
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.removeItem(`${SESSION_PREFIX}${server}`);
+  } catch {
+    // Private mode: there is no stored counter to remove.
+  }
+}
+
 const browserStorage: MeterStorage = {
+  readServers: () => listServers().then((rows) => rows.map((row) => row.id)),
   readMonth: getMeter,
   writeMonth: setMeter,
   readSession: readSessionBytes,
