@@ -309,14 +309,22 @@ describe("Slice 4: groups, posts and visibility", () => {
     const app = await createApp({ dbPath: ":memory:", host: "chat.local", limits: { messagesPerMinute: 1000 } });
     try {
       const alice = await client(app, "alice", 25);
-      const createCid = cid();
-      const created = await sync(app, alice.account.token, alice.cursor, [groupOp(createCid, "Big", true)]);
-      const groupId = seqOf(created, createCid);
+      // Spread the posts over six groups so no scope reaches the 100-missed gap threshold:
+      // this test is about the 500-event page, not about gaps (history.test.ts covers those).
+      const groups: number[] = [];
+      let cursor = alice.cursor;
+      for (let index = 0; index < 6; index++) {
+        const createCid = cid();
+        const created = await sync(app, alice.account.token, cursor, [groupOp(createCid, `Big ${index}`, true)]);
+        groups.push(seqOf(created, createCid));
+        cursor = created.cursor;
+      }
 
-      const many = Array.from({ length: 501 }, (_, i) => postOp(cid(), groupId, `p${i}`));
-      const posted = await sync(app, alice.account.token, created.cursor, many);
+      const many = Array.from({ length: 501 }, (_, i) => postOp(cid(), groups[i % groups.length]!, `p${i}`));
+      const posted = await sync(app, alice.account.token, cursor, many);
       expect(posted.acks).toHaveLength(501);
       expect(posted.events.filter((event) => event.tag === Tag.Post)).toHaveLength(500);
+      expect(posted.events.some((event) => event.tag === Tag.Gap)).toBe(false);
       expect(posted.more).toBe(true);
 
       const rest = await sync(app, alice.account.token, posted.cursor, []);

@@ -3,6 +3,7 @@ import { SUPPORTED } from "@brr-chat/protocol";
 import { initAuth } from "./auth.ts";
 import { createServerAdminService } from "./admin.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
+import { handleHistory } from "./history.ts";
 import { createInviteService } from "./invites.ts";
 import { AbuseLimiters, DEFAULT_ABUSE_LIMITS, type AbuseLimitConfig } from "./limits.ts";
 import { serveShell } from "./pwa.ts";
@@ -105,6 +106,9 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
       }
       if (url.pathname === "/sync" && req.method === "POST") {
         return handleSync(req, db, auth, limits);
+      }
+      if (url.pathname === "/history" && req.method === "POST") {
+        return handleHistory(req, db, auth);
       }
       const shell = serveShell(url.pathname, req.method, req.headers.get("accept-encoding"));
       if (shell) return shell;

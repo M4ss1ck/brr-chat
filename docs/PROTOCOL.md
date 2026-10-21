@@ -75,9 +75,13 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
   cursor.
 - **Paging:** a response holds at most ~500 events or ~64 KB. `more = true` means "call again
   now".
-- **Gaps:** after a long time offline, if more than 100 events are missing in one scope, the
-  server sends a `Gap` event instead of the excess. The gap is filled only when the user asks
-  (`/history`).
+- **Gaps:** after a long time offline, if more than 100 missed **posts, replies, DMs or
+  reactions** are waiting in one scope, the server sends those newest 100 and a `Gap` event in
+  place of the excess. The gap is filled only when the user asks (`/history`). Control events
+  (membership, bans, deletes, profiles, group metadata) are always sent, however old they are,
+  so group state never goes stale behind a gap. A `Gap`'s `after` is the cursor the catch-up
+  started from and `before` is the seq of the first gap-covered event still sent, so `before`
+  is the right argument for the first `/history` call (ADR 0018).
 - **Fresh device or new join:** the server sends current state (profiles, group metadata,
   memberships, the viewer's `dm_scope` events) and a cursor at the head of the log. **No
   posts or DM messages.** Older posts load only when the user asks. A state snapshot may repeat an event at or below the device's previous cursor; the
@@ -102,7 +106,16 @@ HistoryResponse = [vMin: uint, vMax: uint, events: [* Event], more: bool, ? erro
 ```
 
 Returns visible events in `scope` with `seq < before`, newest first. `more` means older events
-exist.
+exist. Visibility is the same rule `/sync` applies: a non-member of an invite-only group, a
+non-participant in a DM, or a blocked author yields nothing.
+
+Only a tap pays for a gap. A client catching up on a device loops `/sync` while `more` is true,
+then fetches `/history` once per "load older" tap, starting at the oldest message it holds (or
+at a gap's `before`). The history page joins the same cache; it does not move the sync cursor.
+
+Measured catch-up (`apps/server/test/history.test.ts`): 840 posts missed over three weeks in one
+group arrive as 101 events — the newest 100 plus one gap — at about 2,000 B uncompressed and a
+few hundred bytes compressed on the wire, inside the 20 KB 100-post budget.
 
 ## Invite links
 

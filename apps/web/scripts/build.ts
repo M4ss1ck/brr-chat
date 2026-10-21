@@ -193,6 +193,7 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
       <ul id="member-list" class="list"></ul>
       <p id="banned-label" class="note" hidden>Banned</p>
       <ul id="banned-list" class="list"></ul>
+      <button type="button" id="load-older" hidden>Load older posts</button>
       <ul id="posts" class="posts"></ul>
       <p id="reply-note" class="note" hidden><span id="reply-label"></span> <button type="button" id="cancel-reply">Cancel</button></p>
       <label>Message
@@ -207,6 +208,7 @@ ul { list-style: none; padding: 0; margin: .4rem 0; }
 
     <section id="dm-view" hidden>
       <h3 id="dm-title"></h3>
+      <button type="button" id="dm-load-older" hidden>Load older messages</button>
       <ul id="dm-messages" class="posts"></ul>
       <p id="dm-empty" class="note" hidden>No messages yet. Say hi.</p>
       <label>Message

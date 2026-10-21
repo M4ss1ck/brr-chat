@@ -4,6 +4,7 @@
 import type { Database } from "bun:sqlite";
 import {
   AckError,
+  GAP_COVERED_TAGS,
   Role,
   Tag,
   decodeEventBytes,
@@ -23,6 +24,10 @@ export const GROUP_CREATE_MIN_AGE_SECONDS = 24 * 60 * 60;
 /** Paging: at most this many events, or this many bytes of stored event payload. */
 export const MAX_SYNC_EVENTS = 500;
 export const MAX_SYNC_BYTES = 64 * 1024;
+/** Past this many missed content events in one scope, catch-up sends a gap instead (ADR 0009). */
+export const GAP_AFTER_MISSED_EVENTS = 100;
+
+const GAP_TAG_LIST = GAP_COVERED_TAGS.join(", ");
 
 export interface Actor {
   /** BetterAuth's text id. */
@@ -876,39 +881,175 @@ export interface VisiblePage {
   cursor: number;
 }
 
-/** Events after `cursor` the viewer may see, oldest first, paged by count and bytes. */
-export function visibleEvents(db: Database, viewer: number, cursor: number): VisiblePage {
-  const rows = db
+/** VISIBLE_SQL binds the viewer six times, in order. */
+function viewerArgs(viewer: number): number[] {
+  return [viewer, viewer, viewer, viewer, viewer, viewer];
+}
+
+interface GapCutoff {
+  scope: number;
+  /** The device's cursor when the catch-up started. */
+  after: number;
+  /** First content event this sync still sends; the gap covers everything older. */
+  before: number;
+  /** Content events in (after, before) that are not sent. */
+  count: number;
+  /** Seq and ts of the last omitted event, so the marker has a real log position. */
+  seq: number;
+  ts: number;
+}
+
+/**
+ * One cutoff per scope that missed more than GAP_AFTER_MISSED_EVENTS content events. The
+ * newest GAP_AFTER_MISSED_EVENTS are still sent; the excess becomes a gap the user fills with
+ * /history (ADR 0009).
+ */
+function gapCutoffs(db: Database, viewer: number, cursor: number): GapCutoff[] {
+  const counts = db
     .query(
-      `SELECT e.seq, e.bytes FROM events e
-       WHERE e.seq > ? AND (${VISIBLE_SQL})
+      `SELECT e.scope AS scope, COUNT(*) AS n FROM events e
+       WHERE e.seq > ? AND e.scope <> 0 AND e.tag IN (${GAP_TAG_LIST}) AND (${VISIBLE_SQL})
+       GROUP BY e.scope
+       HAVING COUNT(*) > ?`,
+    )
+    .all(cursor, ...viewerArgs(viewer), GAP_AFTER_MISSED_EVENTS) as { scope: number; n: number }[];
+
+  const cuts: GapCutoff[] = [];
+  for (const row of counts) {
+    const scope = Number(row.scope);
+    const missed = Number(row.n) - GAP_AFTER_MISSED_EVENTS;
+    // The last omitted event and the first kept one are adjacent in this scope's content.
+    const pair = db
+      .query(
+        `SELECT e.seq, e.ts FROM events e
+         WHERE e.seq > ? AND e.scope = ? AND e.tag IN (${GAP_TAG_LIST}) AND (${VISIBLE_SQL})
+         ORDER BY e.seq ASC
+         LIMIT 2 OFFSET ?`,
+      )
+      .all(cursor, scope, ...viewerArgs(viewer), missed - 1) as { seq: number; ts: number }[];
+    const last = pair[0];
+    const first = pair[1];
+    if (!last || !first) continue;
+    cuts.push({
+      scope,
+      after: cursor,
+      before: Number(first.seq),
+      count: missed,
+      seq: Number(last.seq),
+      ts: Number(last.ts),
+    });
+  }
+  return cuts;
+}
+
+/**
+ * Rows after the cursor that this sync sends: everything visible, minus content older than a
+ * gap cutoff. Control events inside a gap range still travel, so membership, bans and deletes
+ * never go stale behind a gap.
+ */
+function visibleRows(db: Database, viewer: number, cursor: number, cuts: readonly GapCutoff[]): EventRow[] {
+  const base = `SELECT e.seq, e.bytes FROM events e
+    WHERE e.seq > ? AND (${VISIBLE_SQL})`;
+  if (cuts.length === 0) {
+    return db
+      .query(`${base} ORDER BY e.seq ASC LIMIT ?`)
+      .all(cursor, ...viewerArgs(viewer), MAX_SYNC_EVENTS + 1) as EventRow[];
+  }
+  const values = cuts.map(() => "(?, ?)").join(", ");
+  const params = cuts.flatMap((cut) => [cut.scope, cut.before]);
+  return db
+    .query(
+      `WITH gap_scope(scope, cutoff) AS (VALUES ${values})
+       ${base}
+         AND NOT EXISTS (
+           SELECT 1 FROM gap_scope g
+           WHERE g.scope = e.scope AND e.seq < g.cutoff AND e.tag IN (${GAP_TAG_LIST})
+         )
        ORDER BY e.seq ASC
        LIMIT ?`,
     )
-    .all(cursor, viewer, viewer, viewer, viewer, viewer, viewer, MAX_SYNC_EVENTS + 1) as EventRow[];
+    .all(...params, cursor, ...viewerArgs(viewer), MAX_SYNC_EVENTS + 1) as EventRow[];
+}
+
+function gapEvent(cut: GapCutoff): Event {
+  return {
+    tag: Tag.Gap,
+    seq: cut.seq,
+    ts: cut.ts,
+    author: 0,
+    scope: cut.scope,
+    after: cut.after,
+    before: cut.before,
+    count: cut.count,
+  };
+}
+
+/** Events after `cursor` the viewer may see, oldest first, paged by count and bytes. */
+export function visibleEvents(db: Database, viewer: number, cursor: number): VisiblePage {
+  const cuts = gapCutoffs(db, viewer, cursor);
+  const rows = visibleRows(db, viewer, cursor, cuts);
+
+  // A synthesized gap marker costs about the same as a small delete event; the exact byte
+  // count only matters for the page budget, so one estimate keeps the loop simple.
+  const GAP_BYTES = 32;
+  const entries: { event: Event; bytes: number }[] = [];
+  for (const row of rows) {
+    try {
+      const event = decodeEventBytes(row.bytes);
+      if (event) entries.push({ event, bytes: row.bytes.length });
+    } catch {
+      // A corrupt row is dropped, like an unknown tag: one bad event must not wedge sync.
+    }
+  }
+  for (const cut of cuts) entries.push({ event: gapEvent(cut), bytes: GAP_BYTES });
+  entries.sort((a, b) => a.event.seq - b.event.seq);
 
   const events: Event[] = [];
   let bytes = 0;
+  // A row the decoder drops still occupies a LIMIT slot, so the extra row is the only proof
+  // that this page is not the end.
   let more = rows.length > MAX_SYNC_EVENTS;
-  for (const row of rows) {
-    if (events.length >= MAX_SYNC_EVENTS || (events.length > 0 && bytes + row.bytes.length > MAX_SYNC_BYTES)) {
+  for (const entry of entries) {
+    if (events.length >= MAX_SYNC_EVENTS || (events.length > 0 && bytes + entry.bytes > MAX_SYNC_BYTES)) {
       more = true;
       break;
     }
-    let event: Event | null;
-    try {
-      event = decodeEventBytes(row.bytes);
-    } catch {
-      // A corrupt row is dropped, like an unknown tag: one bad event must not wedge sync.
-      continue;
-    }
-    if (!event) continue;
-    events.push(event);
-    bytes += row.bytes.length;
+    events.push(entry.event);
+    bytes += entry.bytes;
   }
 
   const last = events.at(-1);
   return { events, more, cursor: more && last ? last.seq : headCursor(db) };
+}
+
+export interface HistoryPage {
+  events: Event[];
+  more: boolean;
+}
+
+/**
+ * Older events in one visible scope, newest first. `more` means even older events exist.
+ * The caller has already capped `limit` (1..100, docs/PROTOCOL.md).
+ */
+export function historyEvents(
+  db: Database,
+  viewer: number,
+  scope: number,
+  before: number,
+  limit: number,
+): HistoryPage {
+  const rows = db
+    .query(
+      `SELECT e.seq, e.bytes FROM events e
+       WHERE e.scope = ? AND e.seq < ? AND (${VISIBLE_SQL})
+       ORDER BY e.seq DESC
+       LIMIT ?`,
+    )
+    .all(scope, before, ...viewerArgs(viewer), limit + 1) as EventRow[];
+
+  // Visibility is the access check: a scope the viewer cannot see yields no rows, and a
+  // rotated or guessed id reveals nothing.
+  return { events: decodeRows(rows.slice(0, limit)), more: rows.length > limit };
 }
 
 /** Events created by this batch that the viewer may see, regardless of their old cursor. */

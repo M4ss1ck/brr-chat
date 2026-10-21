@@ -70,10 +70,21 @@ const SCHEMA = {
 } as const satisfies Record<Tag, readonly (readonly [string, Kind])[]>;
 
 /** Tags a client may send in its outbox. The rest are server-generated. */
-const OP_TAGS: ReadonlySet<number> = new Set<Tag>([
+const OP_TAGS: ReadonlySet<number> = new Set<number>([
   Tag.Post, Tag.Reply, Tag.Dm, Tag.Reaction, Tag.Delete, Tag.Profile, Tag.GroupMeta, Tag.Membership, Tag.Ban,
   Tag.Block,
 ]);
+
+/**
+ * Tags a gap may cover (docs/PROTOCOL.md, ADR 0018): the content a user reads backwards on
+ * demand. Control events are never gapped, so membership, bans and deletes cannot go stale
+ * behind a marker. Shared so the server and the client agree on what a gap hid.
+ */
+export const GAP_COVERED_TAGS: readonly Tag[] = [Tag.Post, Tag.Reply, Tag.Dm, Tag.Reaction];
+
+export function isGapCoveredTag(tag: number): boolean {
+  return (GAP_COVERED_TAGS as readonly number[]).includes(tag);
+}
 
 // `media?` is a required field whose value may be null (a post without media). Only an
 // appended text field (`text?`, today just the membership invite) is optional on the object.
