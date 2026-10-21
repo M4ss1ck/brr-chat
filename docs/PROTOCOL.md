@@ -25,6 +25,7 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
   not been confirmed (ADR 0006).
 - Responses are brotli-compressed, or `dcz` (shared-dictionary) where the client supports it.
 - Media is never inline. `GET /m/{id}?w=<width>` fetches an image, and only when the user taps.
+  The upload is one `POST /m` multipart request; both require the bearer session (ADR 0019).
 
 ## Encoding rules
 
@@ -209,6 +210,53 @@ Media = [id: uint, w: uint, h: uint, thumbhash: bytes .size (0..32)]
 
 `thumbhash` is a [ThumbHash](https://evanw.github.io/thumbhash/) placeholder (about 21–25 bytes),
 shown blurred until the user taps to load `GET /m/{id}`.
+
+`text` may be empty when `media` is present: a photo with no caption is a complete post, reply
+or DM. A post with neither text nor media is `Invalid`. A ThumbHash longer than 25 bytes is
+also `Invalid`: the wire decoder accepts up to 32 for forward compatibility, but the product's
+whole media field must stay inside its 40 B budget.
+
+### Media upload and fetch
+
+Bytes travel beside `/sync`, not in it. Both routes need the bearer session; a device that has
+not finished signup gets `403`.
+
+```
+POST /m
+  Content-Type: multipart/form-data
+  fields: preview (WebP, longest edge <= 320 px), full (WebP, longest edge <= 1280 px)
+  each variant <= 400 KB
+  201 { id: uint, w: uint, h: uint, bytes: uint }   ; w/h are the full variant's measured size
+```
+
+The server does not re-encode. It checks the `RIFF....WEBP` container, reads the dimensions
+from the `VP8 `, `VP8L` or `VP8X` header, enforces the caps and the server's total media quota,
+and stores the bytes as-is. A refusal is JSON with a stable `code` and a human `error`:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | `missing_variant` | one of the two files is absent or empty |
+| 400 | `bad_body` | the multipart body could not be read |
+| 401 / 403 | `unauthorized` / `signup_incomplete` | no valid session, or signup not finished |
+| 404 | `not_found` | fetch only: unknown id, expired upload, deleted post, or no access |
+| 405 | `method` | upload needs POST, fetch needs GET |
+| 413 | `too_large` | a variant is over 400 KB, or the declared body is over the upload limit |
+| 415 | `not_webp` / `bad_body` | wrong bytes, or not a multipart body |
+| 422 | `dimensions` | a variant is longer than its edge, the full one is smaller than the preview, or their aspect ratios differ by more than 2% |
+| 507 | `quota` | the server's configured media byte budget is full |
+
+```
+GET /m/{id}?w=<width>
+  200 image/webp, Cache-Control: private, max-age=31536000, immutable
+  404 when the id is unknown, the viewer may not see its event, or the post was deleted
+```
+
+`?w=` is a hint, not a resize request: it snaps to the nearer of the two stored variants. An
+exact tie, a missing width, or an unusable one answers with the 320 px preview. Until an upload
+is attached to an event, only its uploader can fetch it; afterwards the event's own visibility
+rules apply. Deleting a post or reply removes its stored image and returns the bytes to the
+quota. An upload that is never posted expires after one hour and is no longer fetchable or
+attachable.
 
 ## Scopes and visibility
 

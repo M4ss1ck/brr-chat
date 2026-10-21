@@ -302,7 +302,8 @@ describe("Slice 5: direct messages", () => {
       const media = await sync(app, alice.account.token, unknown.cursor, [
         dmOp(mediaCid, 0, bob.wire, "photo", { id: 1, w: 10, h: 10, thumbhash: new Uint8Array(4) }),
       ]);
-      expect(ack(media, mediaCid)).toEqual({ error: AckError.Unsupported });
+      // Media uploads are real now: an id the server never stored is NotFound, not Unsupported.
+      expect(ack(media, mediaCid)).toEqual({ error: AckError.NotFound });
 
       const openCid = cid();
       const opened = await sync(app, alice.account.token, media.cursor, [dmOp(openCid, 0, bob.wire, "hi")]);

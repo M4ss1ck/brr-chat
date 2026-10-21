@@ -49,8 +49,13 @@ One binary, no files beside it:
 
 ```sh
 bun run --cwd apps/server compile     # build the shell, then compile to apps/server/dist/brr-chat
-bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, DB_PATH, BASE_URL, BETTER_AUTH_SECRET)
+bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, DB_PATH, BASE_URL, BETTER_AUTH_SECRET, MEDIA_QUOTA_BYTES)
 ```
+
+Photos are resized in the client to 320 px and 1280 px WebP variants with a ThumbHash
+placeholder, stored in the same SQLite file as the event log, and fetched only when the user
+taps. The total stored media is capped per server (`MEDIA_QUOTA_BYTES` or `--media-quota`,
+default 256 MB); an oversized, wrong-type, or over-quota upload is refused with a clear code.
 
 Changing the protocol: read `docs/PROTOCOL.md` "Evolution rules", then run
 `bun run --cwd packages/protocol freeze-fixtures` for any new fixture.

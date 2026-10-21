@@ -24,6 +24,8 @@ native-library bloat to the single-binary server (ADR 0002).
   stored files so a single binary deployment cannot exhaust disk. Oversized, wrong-type, or
   over-quota uploads are rejected with a clear ack.
 
+The transport (`POST /m`), tap-only authenticated fetch, and quota mechanics are in ADR 0019.
+
 ## Consequences
 - Zero image-processing native dependencies (`libvips`/`sharp`) in the compiled server binary, and
   near-zero server CPU per upload.

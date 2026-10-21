@@ -12,6 +12,7 @@ import { PROTOCOL_VERSION, ResponseError, encodeSyncResponse } from "@brr-chat/p
 import * as auth from "../src/auth.ts";
 import { bearerHeader } from "../src/auth.ts";
 import { meter } from "../src/meter.ts";
+import { uploadImage, type PreparedImage } from "../src/media.ts";
 import { buildSyncRequest, classifySyncResponse, postSyncRequest, syncAndPersist } from "../src/sync.ts";
 import { closeStore, getCursor, getRange, getSession, getStoredCursor } from "../src/store.ts";
 
@@ -310,6 +311,56 @@ describe("PWA client (apps/web)", () => {
     } finally {
       counter.stop();
     }
+  });
+
+  /** A WebP container with just enough header for the server's dimension check. */
+  function vp8lBytes(width: number, height: number, pad = 0): Uint8Array<ArrayBuffer> {
+    const bits = (width - 1) | ((height - 1) << 14);
+    const payload = [0x2f, bits & 0xff, (bits >>> 8) & 0xff, (bits >>> 16) & 0xff, (bits >>> 24) & 0xff];
+    const body = new Uint8Array(4 + 8 + payload.length);
+    body.set([...Buffer.from("WEBP")], 0);
+    body.set([...Buffer.from("VP8L")], 4);
+    body.set([payload.length, 0, 0, 0], 8);
+    body.set(payload, 12);
+    const file = new Uint8Array(8 + body.length + pad);
+    file.set([...Buffer.from("RIFF")], 0);
+    file.set([body.length & 0xff, (body.length >>> 8) & 0xff, (body.length >>> 16) & 0xff, (body.length >>> 24) & 0xff], 4);
+    file.set(body, 8);
+    return file;
+  }
+
+  test("a prepared photo uploads over the real socket and downloads only on request", async () => {
+    const { session } = await signUpConfirmed();
+    const previewBytes = vp8lBytes(320, 200, 10_000);
+    const fullBytes = vp8lBytes(1280, 800, 10_000);
+    const prepared: PreparedImage = {
+      preview: { blob: new Blob([previewBytes], { type: "image/webp" }), width: 320, height: 200 },
+      full: { blob: new Blob([fullBytes], { type: "image/webp" }), width: 1280, height: 800 },
+      thumbhash: new Uint8Array(21).fill(5),
+    };
+
+    const before = meter.totals().sessionBytes;
+    const uploaded = await uploadImage(base, session.token, prepared);
+    expect(uploaded).toMatchObject({ w: 1280, h: 800 });
+    expect(uploaded.bytes).toBe(previewBytes.byteLength + fullBytes.byteLength);
+
+    // The route is not public: a browser without the bearer token gets nothing.
+    expect((await fetch(`${base}/m/${uploaded.id}`)).status).toBe(401);
+
+    const headers = { Authorization: bearerHeader(session.token) };
+    const preview = await fetch(`${base}/m/${uploaded.id}?w=64`, { headers });
+    expect(preview.status).toBe(200);
+    expect(preview.headers.get("content-type")).toBe("image/webp");
+    expect([...new Uint8Array(await preview.arrayBuffer())]).toEqual([...previewBytes]);
+
+    const full = await fetch(`${base}/m/${uploaded.id}?w=1280`, { headers });
+    expect([...new Uint8Array(await full.arrayBuffer())]).toEqual([...fullBytes]);
+
+    // The upload body is the expensive direction; the meter must see it, not just headers.
+    // (The two downloads above use raw fetch in this test; mediaView uses the metered one.)
+    const counted = meter.totals().sessionBytes - before;
+    console.log(`data meter counted ${counted} B for an upload of ${uploaded.bytes} B`);
+    expect(counted).toBeGreaterThan(uploaded.bytes);
   });
 
   test("the empty sync round trip stays under 1 KB on the wire, bearer header included", async () => {
