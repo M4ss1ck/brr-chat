@@ -35,5 +35,8 @@
 - **Ack**: the server's answer for one op, either the seq created or an error.
 - **Gap**: a marker for events the server deliberately didn't send. Filled on request.
 - **History**: older events in one scope, fetched only when the user asks.
+- **Data meter**: the always-visible count of bytes this page session and this device's calendar
+  month. Every app request goes through it; the month survives reloads, the session does not
+  (ADR 0018).
 - **Protocol version**: the `v` in every request. Servers answer with the range they accept.
 - **Fixture**: a frozen encoded message from one protocol version, decoded by CI forever.

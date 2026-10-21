@@ -11,6 +11,7 @@ import { createApp } from "@brr-chat/server";
 import { PROTOCOL_VERSION, ResponseError, encodeSyncResponse } from "@brr-chat/protocol";
 import * as auth from "../src/auth.ts";
 import { bearerHeader } from "../src/auth.ts";
+import { meter } from "../src/meter.ts";
 import { buildSyncRequest, classifySyncResponse, postSyncRequest, syncAndPersist } from "../src/sync.ts";
 import { closeStore, getCursor, getRange, getSession, getStoredCursor } from "../src/store.ts";
 
@@ -290,6 +291,25 @@ describe("PWA client (apps/web)", () => {
     expect(redeemed.session.username).toBe(account);
     expect(await getSession()).toEqual(redeemed.session);
     expect((await syncAndPersist(base, redeemed.session.token, redeemed.session.username)).kind).toBe("ok");
+  });
+
+  test("the data meter's count tracks the bytes a real socket carries", async () => {
+    const { session } = await signUpConfirmed();
+    const counter = await startWireCounter();
+    try {
+      const before = meter.totals().session;
+      await postSyncRequest(counter.base, session.token, buildSyncRequest(0));
+      const counted = meter.totals().session - before;
+      const wire = counter.totals();
+      console.log(`data meter counted ${counted} B of ${wire} B on a real socket`);
+      // Both directions are counted, headers included. The meter sees fewer bytes than the
+      // TCP proxy because the browser adds headers it never exposes to page code; it must
+      // still account for most of the exchange, not just the payload.
+      expect(counted).toBeGreaterThan(wire * 0.5);
+      expect(counted).toBeLessThanOrEqual(wire);
+    } finally {
+      counter.stop();
+    }
   });
 
   test("the empty sync round trip stays under 1 KB on the wire, bearer header included", async () => {

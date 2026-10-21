@@ -33,6 +33,9 @@ function respondCborBrotli(res: SyncResponse): Response {
     headers: {
       "Content-Type": "application/cbor",
       "Content-Encoding": "br",
+      // The compressed size, so the client's data meter can count the bytes actually
+      // downloaded instead of the decompressed body (ADR 0018).
+      "Content-Length": String(compressed.byteLength),
     },
   });
 }

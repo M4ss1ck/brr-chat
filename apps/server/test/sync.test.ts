@@ -367,6 +367,8 @@ describe("Slice 2: POST /sync", () => {
         expect(res.status).toBe(200);
 
         const resBody = new Uint8Array(await res.arrayBuffer());
+        // The client's data meter counts the compressed bytes actually downloaded (ADR 0018).
+        expect(res.headers.get("content-length")).toBe(String(resBody.byteLength));
 
         let reqHeaderLines = "POST /sync HTTP/1.1\r\n";
         reqHeaders.forEach((value, key) => {

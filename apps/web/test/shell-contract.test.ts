@@ -57,6 +57,19 @@ describe("shell contract", () => {
     expect(html).toContain('<dd id="session"></dd>');
   });
 
+  test("the data meter is outside auth panels and sticks to the top, so it is always visible", () => {
+    const html = read("index.html");
+    const meter = html.indexOf('id="meter"');
+    expect(meter).toBeGreaterThan(-1);
+    // Signed out, the sign-in section is visible; signed in, the other one is. The meter must
+    // not live inside either, or one state would hide it.
+    expect(html.indexOf('id="signed-out"')).toBeGreaterThan(meter);
+    expect(html.indexOf('id="signed-in"')).toBeGreaterThan(meter);
+    expect(html).toMatch(/#meter\s*\{[^}]*position:\s*sticky/);
+    expect(html).toContain('id="meter-session"');
+    expect(html).toContain('id="meter-month"');
+  });
+
   test("hidden panels stay hidden whatever display rule their element has", () => {
     // show()/hide() in main.ts only toggles the hidden attribute. A label or section with an
     // explicit display rule would otherwise win the cascade, so the stylesheet must pin it.
