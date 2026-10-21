@@ -2,6 +2,7 @@
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
 import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Op, type VersionRange } from "@brr-chat/protocol";
+import { isMonthKey } from "./month.ts";
 
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
@@ -153,7 +154,7 @@ function asRange(value: unknown): VersionRange | null {
 
 function asMeter(value: unknown): StoredMeter | null {
   const row = asObject(value);
-  if (typeof row.month !== "string" || !/^\d{4}-\d{2}$/.test(row.month)) return null;
+  if (!isMonthKey(row.month)) return null;
   if (!isUint(row.bytes)) return null;
   return { month: row.month, bytes: row.bytes };
 }
@@ -216,7 +217,7 @@ export async function getMeter(): Promise<StoredMeter | null> {
 }
 
 export async function setMeter(meter: StoredMeter): Promise<void> {
-  if (!/^\d{4}-\d{2}$/.test(meter.month)) throw new RangeError("meter: expected a YYYY-MM month");
+  if (!isMonthKey(meter.month)) throw new RangeError("meter: expected a YYYY-MM month");
   if (!isUint(meter.bytes)) throw new RangeError("meter: expected a safe uint");
   await write(KEY_METER, meter);
 }

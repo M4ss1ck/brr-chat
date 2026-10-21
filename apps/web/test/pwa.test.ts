@@ -297,15 +297,15 @@ describe("PWA client (apps/web)", () => {
     const { session } = await signUpConfirmed();
     const counter = await startWireCounter();
     try {
-      const before = meter.totals().session;
+      const before = meter.totals().sessionBytes;
       await postSyncRequest(counter.base, session.token, buildSyncRequest(0));
-      const counted = meter.totals().session - before;
+      const counted = meter.totals().sessionBytes - before;
       const wire = counter.totals();
       console.log(`data meter counted ${counted} B of ${wire} B on a real socket`);
       // Both directions are counted, headers included. The meter sees fewer bytes than the
-      // TCP proxy because the browser adds headers it never exposes to page code; it must
-      // still account for most of the exchange, not just the payload.
-      expect(counted).toBeGreaterThan(wire * 0.5);
+      // TCP proxy because the browser adds headers it never exposes to page code, so it must
+      // land close to the real total, not merely above the payload (4 B + 11 B here).
+      expect(counted).toBeGreaterThan(wire * 0.7);
       expect(counted).toBeLessThanOrEqual(wire);
     } finally {
       counter.stop();

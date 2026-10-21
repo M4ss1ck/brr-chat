@@ -27,12 +27,13 @@ headers, and browser-added headers (User-Agent, Sec-Fetch-*) are not visible to 
   the meter uses `Content-Length` whenever it is present. If a chunked response has none, the
   meter counts the body the app receives; for an identity body that is the wire size, and for
   a compressed one it is an over-count rather than an under-count.
-- **Session is memory, month is storage.** "This session" starts at zero on every page load and
-  never touches storage. The monthly total lives in the existing IndexedDB `kv` store under
-  `meter`, one row `{ month, bytes }`, and reloads resume from it. The month key is the device's
-  local calendar month (`YYYY-MM`), not UTC: the boundary the user experiences is their own
-  midnight. A stored month that no longer matches is discarded and replaced with the new month
-  at zero, on load and again whenever a request or repaint crosses the boundary.
+- **Both scopes persist across reloads.** "This session" is the tab session: its bytes live in
+  `sessionStorage` under `brr-meter-session`, so a reload resumes them and closing the tab ends
+  them. The monthly total lives in the existing IndexedDB `kv` store under `meter`, one row
+  `{ month, bytes }`, shared by every tab. The month key is the device's local calendar month
+  (`YYYY-MM`), not UTC: the boundary the user experiences is their own midnight. A stored month
+  that no longer matches is discarded and replaced with the new month at zero, on load and
+  again whenever a request or repaint crosses the boundary.
 - **Always visible, outside auth.** The meter is a sticky bar at the top of the document, so it
   shows before sign-in and while scrolling. It is part of the shell, not a signed-in panel.
 - **Meter failures are invisible.** If IndexedDB is unavailable or quota-limited, the session
@@ -44,6 +45,7 @@ headers, and browser-added headers (User-Agent, Sec-Fetch-*) are not visible to 
 - A single tab is assumed for month accumulation. Two open tabs each keep their own in-memory
   month total and the last write wins, so the persisted month can lag by the other tab's usage.
   Cross-tab coordination is out of scope until multiple servers (#18) make it matter.
-- Session bytes reset on reload by design; only the month survives. Persisting the session
-  would require deciding whether a reload is a new session, which the product has not defined.
+- Session bytes follow the tab, not the auth session: signing out and back in on the same tab
+  keeps the count, while a new tab starts at zero. That matches the word "session" in the meter
+  and makes a reload keep both numbers, which is what the issue's "survives reloads" asks for.
 - No protocol change: `Content-Length` is HTTP metadata, not a CBOR field, so no version bump.

@@ -3,24 +3,28 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import {
-  DataMeter,
-  formatBytes,
-  monthOf,
-  requestWireBytes,
-  responseWireBytes,
-  type MeterStorage,
-} from "../src/meter.ts";
+import { DataMeter, formatBytes, requestWireBytes, responseWireBytes, type MeterStorage } from "../src/meter.ts";
+import { monthOf } from "../src/month.ts";
 import type { StoredMeter } from "../src/store.ts";
 
-function memoryStorage(initial: StoredMeter | null = null): MeterStorage & { row: StoredMeter | null } {
+function memoryStorage(
+  initialMonth: StoredMeter | null = null,
+  initialSession = 0,
+): MeterStorage & { row: StoredMeter | null; session: number } {
   const storage = {
-    row: initial,
-    async read(): Promise<StoredMeter | null> {
+    row: initialMonth,
+    session: initialSession,
+    async readMonth(): Promise<StoredMeter | null> {
       return storage.row;
     },
-    async write(row: StoredMeter): Promise<void> {
+    async writeMonth(row: StoredMeter): Promise<void> {
       storage.row = { ...row };
+    },
+    readSession(): number {
+      return storage.session;
+    },
+    writeSession(bytes: number): void {
+      storage.session = bytes;
     },
   };
   return storage;
@@ -156,24 +160,40 @@ describe("data meter", () => {
       headers: new Headers({ "Content-Type": "text/plain", "Content-Length": "2" }),
       bodyBytes: 2,
     });
-    expect(meter.totals()).toEqual({ session: sent + received, month: sent + received, monthKey: "2026-10" });
+    expect(meter.totals()).toEqual({ sessionBytes: sent + received, monthBytes: sent + received, monthKey: "2026-10" });
     expect(storage.row).toEqual({ month: "2026-10", bytes: sent + received });
   });
 
-  test("the monthly total survives a reload, the session total starts fresh", async () => {
+  test("both totals survive a reload, because a reload does not end the tab session", async () => {
     const storage = memoryStorage();
     let now = new Date(2026, 9, 20, 12, 0);
     const first = new DataMeter(storage, () => now, fixedFetch().fetch);
     await first.fetch("http://chat.local/sync", { method: "POST", body: new Uint8Array(8) });
     await first.flush();
-    const spent = first.totals().month;
+    const spent = first.totals().monthBytes;
     expect(spent).toBeGreaterThan(0);
 
-    // A reload builds a new meter over the same storage: the month is there, the session is 0.
+    // A reload builds a new meter over the same tab storage: both totals resume.
     now = new Date(2026, 9, 20, 13, 0);
     const reloaded = new DataMeter(storage, () => now, fixedFetch().fetch);
     await reloaded.load();
-    expect(reloaded.totals()).toEqual({ session: 0, month: spent, monthKey: "2026-10" });
+    expect(reloaded.totals()).toEqual({ sessionBytes: spent, monthBytes: spent, monthKey: "2026-10" });
+  });
+
+  test("a new tab starts a new session but inherits the month", async () => {
+    const firstTab = memoryStorage();
+    let now = new Date(2026, 9, 20, 12, 0);
+    const first = new DataMeter(firstTab, () => now, fixedFetch().fetch);
+    await first.fetch("http://chat.local/sync", { method: "POST", body: new Uint8Array(8) });
+    await first.flush();
+    const spent = first.totals().monthBytes;
+
+    // A second tab shares IndexedDB but has its own sessionStorage.
+    const nextTab = memoryStorage(firstTab.row, 0);
+    now = new Date(2026, 9, 20, 13, 0);
+    const meter = new DataMeter(nextTab, () => now, fixedFetch().fetch);
+    await meter.load();
+    expect(meter.totals()).toEqual({ sessionBytes: 0, monthBytes: spent, monthKey: "2026-10" });
   });
 
   test("the month rolls over on the local calendar and writes the new month", async () => {
@@ -181,18 +201,18 @@ describe("data meter", () => {
     let now = new Date(2026, 9, 31, 23, 59);
     const meter = new DataMeter(storage, () => now, fixedFetch().fetch);
     await meter.load();
-    expect(meter.totals()).toEqual({ session: 0, month: 5000, monthKey: "2026-10" });
+    expect(meter.totals()).toEqual({ sessionBytes: 0, monthBytes: 5000, monthKey: "2026-10" });
 
     now = new Date(2026, 10, 1, 0, 1);
     await meter.load();
-    expect(meter.totals()).toEqual({ session: 0, month: 0, monthKey: "2026-11" });
+    expect(meter.totals()).toEqual({ sessionBytes: 0, monthBytes: 0, monthKey: "2026-11" });
     await meter.flush();
     expect(storage.row).toEqual({ month: "2026-11", bytes: 0 });
 
     await meter.fetch("http://chat.local/sync", { method: "POST", body: new Uint8Array(1) });
     await meter.flush();
     expect(meter.totals().monthKey).toBe("2026-11");
-    expect(meter.totals().month).toBeGreaterThan(0);
+    expect(meter.totals().monthBytes).toBeGreaterThan(0);
     expect(storage.row?.month).toBe("2026-11");
   });
 
@@ -200,7 +220,7 @@ describe("data meter", () => {
     const storage = memoryStorage({ month: "2026-08", bytes: 9000 });
     const meter = new DataMeter(storage, () => new Date(2026, 9, 20), fixedFetch().fetch);
     await meter.load();
-    expect(meter.totals().month).toBe(0);
+    expect(meter.totals().monthBytes).toBe(0);
     await meter.flush();
     expect(storage.row).toEqual({ month: "2026-10", bytes: 0 });
   });
@@ -228,7 +248,27 @@ describe("data meter", () => {
       headers: new Headers({ "Content-Type": "text/plain", "Content-Length": "2" }),
       bodyBytes: 2,
     });
-    expect(meter.totals().session).toBe(sent + received);
+    expect(meter.totals().sessionBytes).toBe(sent + received);
+  });
+
+  test("a bodyless response does not bill the Content-Length it never sent", async () => {
+    const storage = memoryStorage();
+    const meter = new DataMeter(storage, () => new Date(2026, 9, 20), async () =>
+      new Response(null, { status: 204, statusText: "No Content", headers: { "Content-Length": "100" } }),
+    );
+    const response = await meter.fetch("http://chat.local/api", { method: "GET" });
+    expect(response.body).toBeNull();
+    expect(response.headers.get("content-length")).toBe("100");
+    await meter.flush();
+
+    const sent = requestWireBytes({ method: "GET", url: "http://chat.local/api", headers: new Headers(), bodyBytes: 0 });
+    const received = responseWireBytes({
+      status: 204,
+      statusText: "No Content",
+      headers: new Headers({ "Content-Length": "100" }),
+      bodyBytes: 0,
+    });
+    expect(meter.totals().sessionBytes).toBe(sent + received);
   });
 
   test("a failed request still costs the bytes that left the device", async () => {
@@ -245,7 +285,7 @@ describe("data meter", () => {
     };
     await expect(meter.fetch("http://chat.local/sync", init)).rejects.toThrow("offline");
     expect(requests).toBe(1);
-    expect(meter.totals().session).toBe(
+    expect(meter.totals().sessionBytes).toBe(
       requestWireBytes({
         method: "POST",
         url: "http://chat.local/sync",
@@ -275,6 +315,6 @@ describe("data meter", () => {
       headers: new Headers({ "Content-Type": "text/plain" }),
       bodyBytes: 5,
     });
-    expect(meter.totals().session).toBe(sent + received);
+    expect(meter.totals().sessionBytes).toBe(sent + received);
   });
 });

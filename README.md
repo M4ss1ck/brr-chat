@@ -2,8 +2,8 @@
 
 A small, data-saving social network for groups and DMs, built for slow, expensive, intermittent
 connections. Each server is an isolated community. The client can hold accounts on several servers.
-An always-visible data meter counts bytes on the wire for this session and this calendar month;
-the monthly total survives reloads (ADR 0018).
+An always-visible data meter counts bytes on the wire for this tab session and this calendar
+month; both survive reloads (ADR 0018).
 
 | Path | What |
 |---|---|

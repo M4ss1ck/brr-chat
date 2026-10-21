@@ -3,18 +3,22 @@
 // bytes, so this counts what is measurable: the request line, every header we set, the host
 // and content length the network stack adds, and the response status line, headers and body.
 // A compressed body uses Content-Length, which is the bytes actually downloaded.
+import { monthOf } from "./month.ts";
 import { getMeter, setMeter, type StoredMeter } from "./store.ts";
 
+/** The two scopes the meter keeps: the tab session and the local calendar month. */
 export interface MeterStorage {
-  read(): Promise<StoredMeter | null>;
-  write(row: StoredMeter): Promise<void>;
+  readMonth(): Promise<StoredMeter | null>;
+  writeMonth(row: StoredMeter): Promise<void>;
+  readSession(): number;
+  writeSession(bytes: number): void;
 }
 
 export interface MeterTotals {
-  /** Bytes this page session, since load. */
-  session: number;
+  /** Bytes this tab session, across reloads. */
+  sessionBytes: number;
   /** Bytes in the device's current calendar month. */
-  month: number;
+  monthBytes: number;
 }
 
 export interface MeterState extends MeterTotals {
@@ -31,9 +35,10 @@ function utf8Bytes(text: string): number {
   return textEncoder.encode(text).byteLength;
 }
 
-/** The device's local calendar month, `YYYY-MM`. Local on purpose: not UTC's month. */
-export function monthOf(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+function headerWireBytes(headers: Headers): number {
+  let total = 0;
+  for (const [name, value] of headers) total += utf8Bytes(`${name}: ${value}\r\n`);
+  return total;
 }
 
 /** Human units for the meter. Kept small and deterministic; tests pin the boundaries. */
@@ -66,15 +71,14 @@ export interface RequestFacts {
  */
 export function requestWireBytes(facts: RequestFacts): number {
   const url = new URL(facts.url);
-  let total = utf8Bytes(`${facts.method} ${url.pathname}${url.search} HTTP/1.1\r\n`);
+  const requestLine = utf8Bytes(`${facts.method} ${url.pathname}${url.search} HTTP/1.1\r\n`);
   const headers = new Headers(facts.headers);
   if (!headers.has("host")) headers.set("host", url.host);
   const bodyMethod = facts.method === "POST" || facts.method === "PUT" || facts.method === "PATCH";
   if ((facts.bodyBytes > 0 || bodyMethod) && !headers.has("content-length") && !headers.has("transfer-encoding")) {
     headers.set("content-length", String(facts.bodyBytes));
   }
-  for (const [name, value] of headers) total += utf8Bytes(`${name}: ${value}\r\n`);
-  return total + 2 + facts.bodyBytes;
+  return requestLine + headerWireBytes(headers) + 2 + facts.bodyBytes;
 }
 
 export interface ResponseFacts {
@@ -86,9 +90,12 @@ export interface ResponseFacts {
 
 /** Bytes a response costs on an HTTP/1.1 link: status line, headers, blank line and body. */
 export function responseWireBytes(facts: ResponseFacts): number {
-  let total = utf8Bytes(`HTTP/1.1 ${facts.status} ${facts.statusText}\r\n`);
-  for (const [name, value] of facts.headers) total += utf8Bytes(`${name}: ${value}\r\n`);
-  return total + 2 + facts.bodyBytes;
+  return (
+    utf8Bytes(`HTTP/1.1 ${facts.status} ${facts.statusText}\r\n`) +
+    headerWireBytes(facts.headers) +
+    2 +
+    facts.bodyBytes
+  );
 }
 
 /** Exact byte length of the usual BodyInit shapes, without consuming a stream. */
@@ -141,7 +148,7 @@ export class DataMeter {
   ) {}
 
   totals(): MeterState {
-    return { session: this.sessionBytes, month: this.monthBytes, monthKey: this.month };
+    return { sessionBytes: this.sessionBytes, monthBytes: this.monthBytes, monthKey: this.month };
   }
 
   /** The listener is called once immediately with the current totals, then after each change. */
@@ -192,7 +199,9 @@ export class DataMeter {
   }
 
   private async responseBytes(response: Response): Promise<number> {
-    const declared = declaredLength(response.headers);
+    // A bodyless response can still carry the length its body would have had (HEAD, 204, 304).
+    // Counting that would bill bytes the radio never received.
+    const declared = response.body === null ? null : declaredLength(response.headers);
     if (declared !== null) {
       return responseWireBytes({
         status: response.status,
@@ -224,9 +233,14 @@ export class DataMeter {
 
   private async open(): Promise<void> {
     this.month = monthOf(this.now());
+    try {
+      this.sessionBytes = this.storage.readSession();
+    } catch {
+      this.sessionBytes = 0;
+    }
     let stored: StoredMeter | null = null;
     try {
-      stored = await this.storage.read();
+      stored = await this.storage.readMonth();
     } catch {
       // Private mode or a corrupt DB: the in-memory meter still works, it just cannot persist.
     }
@@ -254,6 +268,11 @@ export class DataMeter {
     const value = Math.round(bytes);
     if (!Number.isFinite(value) || value <= 0) return;
     this.sessionBytes += value;
+    try {
+      this.storage.writeSession(this.sessionBytes);
+    } catch {
+      // Session persistence is a convenience; counting in memory must still work.
+    }
     this.roll();
     this.monthBytes += value;
     this.emit();
@@ -268,16 +287,41 @@ export class DataMeter {
   private queueWrite(): void {
     const row: StoredMeter = { month: this.month, bytes: this.monthBytes };
     this.writeChain = this.writeChain
-      .then(() => this.storage.write(row))
+      .then(() => this.storage.writeMonth(row))
       .catch(() => {
         // A meter write must never break a request or a render.
       });
   }
 }
 
+const SESSION_KEY = "brr-meter-session";
+
+/** SessionStorage is per tab and survives reloads; month storage is shared IndexedDB. */
+function readSessionBytes(): number {
+  if (typeof sessionStorage === "undefined") return 0;
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    const value = raw === null ? 0 : Number(raw);
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeSessionBytes(bytes: number): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.setItem(SESSION_KEY, String(bytes));
+  } catch {
+    // Private mode or quota: the in-memory session counter is still correct.
+  }
+}
+
 const browserStorage: MeterStorage = {
-  read: getMeter,
-  write: setMeter,
+  readMonth: getMeter,
+  writeMonth: setMeter,
+  readSession: readSessionBytes,
+  writeSession: writeSessionBytes,
 };
 
 /** The one meter the app uses. Tests construct their own with in-memory storage. */
