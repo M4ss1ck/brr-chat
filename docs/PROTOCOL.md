@@ -23,7 +23,17 @@ intermittent, billed per MB). Every rule below exists to send fewer bytes or few
 - `Authorization: Bearer <32-char session token>` (bare token, ADR 0007).
 - `/sync` answers `401` without a valid session, and `403` while a signup's recovery code has
   not been confirmed (ADR 0006).
-- Responses are brotli-compressed, or `dcz` (shared-dictionary) where the client supports it.
+- `/sync` responses are brotli-compressed, or `dcz` (dictionary-compressed zstd) when the
+  browser advertises the shared dictionary. The dictionary is `GET /sync-dict/brr-sync-v1`: public,
+  immutable, and advertised from the app document with
+  `Link: </sync-dict/brr-sync-v1>; rel="compression-dictionary"`. Its response carries
+  `Use-As-Dictionary: match="/sync", id="brr-sync-v1"`. A browser that stored it sends
+  `Available-Dictionary: :<sha256 of the dictionary>:` and `Dictionary-ID: "brr-sync-v1"`, plus
+  `dcz` in `Accept-Encoding`; the answer is `Content-Encoding: dcz` with RFC 9842's 40-byte
+  header (magic + dictionary hash) and a zstd stream primed with the dictionary. Every other
+  client gets brotli. dcz is chosen only when its body, plus the `Vary` header it needs, is
+  smaller than brotli, so a small sync never grows (ADR 0021). `/history` responses stay
+  brotli: it is a deliberate, less frequent fetch.
 - Media is never inline. `GET /m/{id}?w=<width>` fetches an image, and only when the user taps.
   The upload is one `POST /m` multipart request; both require the bearer session (ADR 0019).
 

@@ -12,7 +12,11 @@
 const PREFLIGHT_HEADERS: Readonly<Record<string, string>> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Accept-Encoding",
+  // The dictionary headers are what a browser attaches to /sync once it stored the shared
+  // dictionary (RFC 9842). Without them the preflight fails and the whole sync is blocked,
+  // not just the compression (issue #21).
+  "Access-Control-Allow-Headers":
+    "Authorization, Content-Type, Accept, Accept-Encoding, Available-Dictionary, Dictionary-ID",
   "Access-Control-Expose-Headers": "Content-Length, Content-Encoding",
   // Every preflight is pure cost on a metered link; cache the answer for a day.
   "Access-Control-Max-Age": "86400",

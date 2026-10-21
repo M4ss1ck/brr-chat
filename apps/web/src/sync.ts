@@ -1,5 +1,6 @@
-// Client side of POST /sync (docs/PROTOCOL.md): brotli is transparent to fetch, so the
-// response body decodes straight from the wire, and only IndexedDB is touched locally.
+// Client side of POST /sync (docs/PROTOCOL.md): brotli -- and dcz, where the browser stored
+// the shared dictionary -- is transparent to fetch, so the response body decodes straight
+// from the wire, and only IndexedDB is touched locally.
 import {
   PROTOCOL_VERSION,
   decodeSyncResponse,
@@ -45,7 +46,8 @@ export async function postSyncRequest(base: string, token: string, body: Uint8Ar
     headers: {
       "Content-Type": "application/cbor",
       Accept: "application/cbor",
-      "Accept-Encoding": "br",
+      // No Accept-Encoding here: it is a forbidden header in browsers, which send their own
+      // (adding dcz and Available-Dictionary once the shared dictionary is stored).
       Authorization: bearerHeader(token),
     },
     // The DOM lib's BodyInit does not list Uint8Array; every runtime accepts it.

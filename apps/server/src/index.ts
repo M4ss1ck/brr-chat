@@ -4,6 +4,7 @@ import { initAuth } from "./auth.ts";
 import { createServerAdminService } from "./admin.ts";
 import { isPreflight, preflightResponse, withCors } from "./cors.ts";
 import { enforceDbFilePermissions, headCursor, openDb } from "./db.ts";
+import { serveSyncDictionary } from "./dictionary.ts";
 import { handleHistory } from "./history.ts";
 import { createInviteService } from "./invites.ts";
 import { AbuseLimiters, DEFAULT_ABUSE_LIMITS, type AbuseLimitConfig } from "./limits.ts";
@@ -124,6 +125,10 @@ export async function createApp(opts: AppOptions = {}): Promise<ServerApp> {
     if (url.pathname === "/sync" && req.method === "POST") {
       return handleSync(req, db, auth, limits);
     }
+    // Before the shell: this path is public, cacheable for a year, and never a route the
+    // app shell should answer (issue #21).
+    const dictionary = serveSyncDictionary(req, url.pathname);
+    if (dictionary) return dictionary;
     if (url.pathname === "/history" && req.method === "POST") {
       return handleHistory(req, db, auth);
     }

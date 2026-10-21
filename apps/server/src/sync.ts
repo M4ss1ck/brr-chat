@@ -12,6 +12,7 @@ import {
   type SyncResponse,
 } from "@brr-chat/protocol";
 import { headCursor } from "./db.ts";
+import { DICTIONARY_VARY, DICTIONARY_VARY_BYTES, dczCompress, wantsDictionary } from "./dictionary.ts";
 import {
   actorFor,
   applyOutbox,
@@ -25,19 +26,37 @@ import type { AuthInstance } from "./index.ts";
 import type { AbuseLimiters } from "./limits.ts";
 import { isRecoveryConfirmed } from "./recovery.ts";
 
-function respondCborBrotli(res: SyncResponse): Response {
+/**
+ * The request's best encoding of one encoded response. `dcz` is only chosen when it is
+ * smaller *after* the Vary header it needs, so a dictionary never costs bytes on a small
+ * response and an unsupported client always gets brotli (issue #21, ADR 0021).
+ */
+export function respondCbor(req: Request, res: SyncResponse): Response {
   const encoded = encodeSyncResponse(res);
-  const compressed = new Uint8Array(brotliCompressSync(encoded));
-  return new Response(compressed, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/cbor",
-      "Content-Encoding": "br",
-      // The compressed size, so the client's data meter can count the bytes actually
-      // downloaded instead of the decompressed body (ADR 0018).
-      "Content-Length": String(compressed.byteLength),
-    },
-  });
+  const brotli = new Uint8Array(brotliCompressSync(encoded)) as Uint8Array<ArrayBuffer>;
+  let body: Uint8Array<ArrayBuffer> = brotli;
+  let encoding = "br";
+  let dictionary = false;
+  if (wantsDictionary(req)) {
+    const dcz = dczCompress(encoded);
+    // Vary plus the one-byte-longer "dcz" value; header names are the same either way.
+    if (dcz.byteLength + DICTIONARY_VARY_BYTES + 1 < brotli.byteLength) {
+      body = dcz;
+      encoding = "dcz";
+      dictionary = true;
+    }
+  }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/cbor",
+    "Content-Encoding": encoding,
+    // The compressed size, so the client's data meter can count the bytes actually
+    // downloaded instead of the decompressed body (ADR 0018).
+    "Content-Length": String(body.byteLength),
+  };
+  // RFC 9842 §6.2: a cacheable dictionary-compressed response must vary on both. /sync is a
+  // POST with no freshness, so the brotli branch owes no Vary and saves the header bytes.
+  if (dictionary) headers.Vary = DICTIONARY_VARY;
+  return new Response(body, { status: 200, headers });
 }
 
 export async function handleSync(
@@ -69,7 +88,7 @@ export async function handleSync(
 
   const versionError = negotiate(v, SUPPORTED);
   if (versionError !== null) {
-    return respondCborBrotli({
+    return respondCbor(req, {
       range: SUPPORTED,
       cursor: 0,
       more: false,
@@ -119,7 +138,7 @@ export async function handleSync(
     more = page.more;
   }
 
-  return respondCborBrotli({
+  return respondCbor(req, {
     range: SUPPORTED,
     cursor,
     more,

@@ -3,6 +3,7 @@
 // Bytes are money (docs/PROTOCOL.md), so assets go out brotli-compressed whenever the client
 // says it can take them; the 150 KB app shell budget is measured on exactly these bytes.
 import { brotliCompressSync } from "node:zlib";
+import { SYNC_DICTIONARY_PATH } from "./dictionary.ts";
 import { SHELL_FILES, SHELL_ROUTES, type ShellAsset } from "./pwa-assets.generated.ts";
 
 interface ShellVariant {
@@ -68,5 +69,11 @@ export function serveShell(pathname: string, method: string, acceptEncoding: str
     "Content-Length": String(variant.body.byteLength),
   };
   if (encoding === "br") headers["Content-Encoding"] = "br";
+  // RFC 9842 §3: the page that will sync points the browser at the dictionary it should
+  // fetch (at low priority, on its own schedule) for /sync. Just the document, not every
+  // asset: the header is bytes too.
+  if (file === SHELL_ROUTES["/index.html"]) {
+    headers.Link = `<${SYNC_DICTIONARY_PATH}>; rel="compression-dictionary"`;
+  }
   return new Response(method === "HEAD" ? null : variant.body, { status: 200, headers });
 }
