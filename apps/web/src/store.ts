@@ -1,17 +1,36 @@
 // Local persistence for the PWA. IndexedDB only: no localStorage, no cookies, and every
 // write is small and versioned by the object store, so a shell update cannot lose the
 // session (docs/PROTOCOL.md, app shell budget).
-import { EMOJI_PALETTE_SIZE, Role, Tag, type Event, type Media, type Op, type VersionRange } from "@brr-chat/protocol";
+import {
+  AckError,
+  EMOJI_PALETTE_SIZE,
+  Role,
+  Tag,
+  type Ack,
+  type Event,
+  type Media,
+  type Op,
+  type VersionRange,
+} from "@brr-chat/protocol";
 import { isMonthKey } from "./month.ts";
 
 const DB_NAME = "brr-chat";
 const DB_VERSION = 1;
 const STORE = "kv";
 
+/** Content events kept per scope. Posts, replies and DMs share the budget (ADR 0013). */
+const EVENT_CACHE_LIMIT = 2_000;
+/** The newest messages per scope that eviction never touches, so offline opening is instant. */
+const LATEST_PAGE_SIZE = 100;
+/** Downloaded images kept across the app; older bytes leave first (ADR 0013). */
+export const MEDIA_CACHE_LIMIT_BYTES = 50 * 1024 * 1024;
+
 const KEY_SESSION = "session";
 const KEY_RANGE = "range";
 const KEY_METER = "meter";
+const MEDIA_INDEX = "media-index";
 
+const mediaKey = (username: string, id: number): string => `media:${username}:${id}`;
 const postsKey = (username: string, scope: number): string => `posts:${username}:${scope}`;
 const membersKey = (username: string, scope: number): string => `members:${username}:${scope}`;
 const reactionsKey = (username: string, scope: number): string => `reactions:${username}:${scope}`;
@@ -423,8 +442,37 @@ async function readMap<T>(key: string, parse: (v: unknown) => T | null): Promise
   return asMap(await read(key), parse);
 }
 
+/**
+ * Removes the oldest posts above the per-scope cap. The newest `LATEST_PAGE_SIZE` rows and
+ * rows named by an unsent op (a reply's parent, a reaction's target) are never removed, so
+ * the cap can only ever make the window shorter, never the queue invalid.
+ */
+function prunePosts(map: Record<string, StoredPost>, protectedSeqs: ReadonlySet<number>): Set<number> {
+  const removed = new Set<number>();
+  const rows = Object.values(map).sort((a, b) => a.seq - b.seq);
+  let overflow = rows.length - EVENT_CACHE_LIMIT;
+  if (overflow <= 0) return removed;
+  const newestStart = Math.max(0, rows.length - LATEST_PAGE_SIZE);
+  for (let index = 0; index < newestStart && overflow > 0; index++) {
+    const row = rows[index];
+    if (!row || protectedSeqs.has(row.seq)) continue;
+    delete map[String(row.seq)];
+    removed.add(row.seq);
+    overflow -= 1;
+  }
+  return removed;
+}
+
+export interface ApplyOptions {
+  /**
+   * Events the caller is about to show (a /history page). Eviction keeps them for this batch,
+   * so a page bought on demand is never deleted by its own write.
+   */
+  protectedSeqs?: ReadonlySet<number>;
+}
+
 /** Applies a sync response's events. Safe to call with events at or below the stored cursor. */
-export async function applyEvents(username: string, events: Event[]): Promise<void> {
+export async function applyEvents(username: string, events: Event[], options: ApplyOptions = {}): Promise<void> {
   if (events.length === 0) return;
 
   const groups = await readMap(groupsKey(username), asGroup);
@@ -624,6 +672,35 @@ export async function applyEvents(username: string, events: Event[]): Promise<vo
     }
   }
 
+  // Bound the cache after applying the batch, before it is written. The newest page and
+  // events an unsent op still points at are never candidates (ADR 0013).
+  if (touchedPosts.size > 0 || touchedReactions.size > 0) {
+    const protectedSeqs = new Set<number>(options.protectedSeqs ?? []);
+    for (const op of await getPendingOps(username)) {
+      if (op.parent !== undefined && op.parent > 0) protectedSeqs.add(op.parent);
+      if (op.target !== undefined && op.target > 0) protectedSeqs.add(op.target);
+    }
+    for (const scope of new Set([...touchedPosts, ...touchedReactions])) {
+      const postMap = posts.get(scope);
+      if (!postMap) continue;
+      const removed = prunePosts(postMap, protectedSeqs);
+      if (removed.size > 0) touchedPosts.add(scope);
+      const reactionMap = reactions.get(scope);
+      if (!reactionMap) continue;
+      let changed = false;
+      // A reaction row is only useful next to its post. Once this scope has any posts, drop
+      // rows whose target is gone too; the empty-cache case keeps reactions that arrived
+      // before their post did.
+      const hasPosts = Object.keys(postMap).length > 0;
+      for (const [key, row] of Object.entries(reactionMap)) {
+        if (!removed.has(row.target) && !(hasPosts && !postMap[String(row.target)])) continue;
+        delete reactionMap[key];
+        changed = true;
+      }
+      if (changed) touchedReactions.add(scope);
+    }
+  }
+
   const writes = [write(groupsKey(username), groups), write(profilesKey(username), profiles)];
   if (touchedDms) writes.push(write(dmsKey(username), dms));
   for (const scope of touchedPosts) writes.push(write(postsKey(username, scope), posts.get(scope) ?? {}));
@@ -665,6 +742,124 @@ export async function setGaps(username: string, scope: number, gaps: readonly St
   else await write(gapsKey(username, scope), gaps);
 }
 
+// ---- media bytes ----
+//
+// Images are downloaded only on tap (ADR 0011), so they need their own bounded cache. The
+// ThumbHash placeholder already lives on the event row; the 50 MB budget covers the bytes a
+// tap actually fetched, across every group and DM on the device. Rows are scoped by an owner
+// key (account plus server origin), so a second account or server on this device never reads
+// another one's downloaded images.
+
+interface MediaEntry {
+  owner: string;
+  id: number;
+  bytes: number;
+  /** Millisecond recency; lower leaves first. */
+  used: number;
+}
+
+function asMediaEntry(value: unknown): MediaEntry | null {
+  const row = asObject(value);
+  if (typeof row.owner !== "string" || row.owner.length === 0) return null;
+  if (!isUint(row.id) || row.id === 0 || !isUint(row.bytes) || !isUint(row.used)) return null;
+  return { owner: row.owner, id: row.id, bytes: row.bytes, used: row.used };
+}
+
+async function readMediaIndex(): Promise<MediaEntry[]> {
+  const value = await read(MEDIA_INDEX);
+  if (!Array.isArray(value)) return [];
+  return value.map(asMediaEntry).filter((entry): entry is MediaEntry => entry !== null);
+}
+
+/**
+ * Writes the index after removing the least recently used rows until the cap holds, and
+ * returns the rows that survived so the caller can skip storing bytes already evicted.
+ */
+async function persistMediaIndex(entries: MediaEntry[]): Promise<MediaEntry[]> {
+  let total = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+  if (total <= MEDIA_CACHE_LIMIT_BYTES) {
+    await write(MEDIA_INDEX, entries);
+    return entries;
+  }
+  entries.sort((a, b) => a.used - b.used || a.owner.localeCompare(b.owner) || a.id - b.id);
+  while (total > MEDIA_CACHE_LIMIT_BYTES && entries.length > 0) {
+    const oldest = entries.shift();
+    if (!oldest) break;
+    await remove(mediaKey(oldest.owner, oldest.id));
+    total -= oldest.bytes;
+  }
+  await write(MEDIA_INDEX, entries);
+  return entries;
+}
+
+/** Stores downloaded image bytes and evicts the oldest images over the 50 MB cap. */
+export async function putMediaBytes(
+  owner: string,
+  id: number,
+  bytes: Uint8Array,
+  usedAt: number = Date.now(),
+): Promise<void> {
+  if (owner.length === 0) throw new RangeError("media: expected an owner key");
+  if (!isUint(id) || id === 0) throw new RangeError("media: expected a positive uint id");
+  if (!isUint(usedAt)) throw new RangeError("media: expected a safe uint timestamp");
+  const rest = (await readMediaIndex()).filter((entry) => !(entry.owner === owner && entry.id === id));
+  // A single image over the whole budget is never cached; keeping it would evict every other.
+  if (bytes.byteLength > MEDIA_CACHE_LIMIT_BYTES) {
+    await remove(mediaKey(owner, id));
+    await persistMediaIndex(rest);
+    return;
+  }
+  // Index first, bytes second: a crash between the two leaves a phantom row, which the next
+  // read removes. The reverse order would leave orphan bytes that no eviction can ever see.
+  rest.push({ owner, id, bytes: bytes.byteLength, used: usedAt });
+  const survivors = await persistMediaIndex(rest);
+  if (survivors.some((entry) => entry.owner === owner && entry.id === id)) {
+    await write(mediaKey(owner, id), bytes);
+  }
+}
+
+/** Reads cached image bytes and marks them most recently used. */
+export async function getMediaBytes(
+  owner: string,
+  id: number,
+  usedAt: number = Date.now(),
+): Promise<Uint8Array | null> {
+  const value = await read(mediaKey(owner, id));
+  if (!(value instanceof Uint8Array)) {
+    // An interrupted write can leave an index row without bytes; it must not count toward
+    // the budget forever.
+    const entries = await readMediaIndex();
+    const next = entries.filter((entry) => !(entry.owner === owner && entry.id === id));
+    if (next.length !== entries.length) await write(MEDIA_INDEX, next);
+    return null;
+  }
+  const entries = await readMediaIndex();
+  const hit = entries.find((entry) => entry.owner === owner && entry.id === id);
+  if (hit) {
+    hit.used = usedAt;
+    hit.bytes = value.byteLength;
+  } else {
+    entries.push({ owner, id, bytes: value.byteLength, used: usedAt });
+  }
+  // A recovered index entry could put the cache over budget; persist enforces it either way.
+  await persistMediaIndex(entries);
+  return value;
+}
+
+/** Drops one owner's cached image bytes, or every owner's when no key is given. */
+export async function clearMediaBytes(owner?: string): Promise<void> {
+  const entries = await readMediaIndex();
+  const dropped = owner === undefined ? entries : entries.filter((entry) => entry.owner === owner);
+  const keep = owner === undefined ? [] : entries.filter((entry) => entry.owner !== owner);
+  await Promise.all(dropped.map((entry) => remove(mediaKey(entry.owner, entry.id))));
+  await write(MEDIA_INDEX, keep);
+}
+
+/** Bytes held by the media cache across every account on this device. */
+export async function mediaCacheBytes(): Promise<number> {
+  return (await readMediaIndex()).reduce((sum, entry) => sum + entry.bytes, 0);
+}
+
 export async function getGroups(username: string): Promise<StoredGroup[]> {
   return Object.values(await readMap(groupsKey(username), asGroup)).sort((a, b) => a.seq - b.seq);
 }
@@ -693,7 +888,8 @@ export async function nextReactionOn(
     (row) => row.target === target && row.emoji === emoji && row.user === self,
   );
   let on = stored?.on === true;
-  for (const op of await getOutbox(username)) {
+  // A failed tap was never applied, so the next tap decides from the synced cache again.
+  for (const op of await getPendingOps(username)) {
     if (op.tag !== Tag.Reaction || op.scope !== scope || op.target !== target || op.emoji !== emoji) continue;
     if (typeof op.on === "boolean") on = op.on;
   }
@@ -804,6 +1000,11 @@ export interface StoredOp {
   on?: boolean;
   /** Inline image placeholder for a post, reply or DM. The upload happens before queueing. */
   media?: StoredMedia;
+  /**
+   * Set when the server refused this op for good and retrying cannot help (ADR 0013).
+   * The row stays so the UI can show the draft and offer discard; it is never resent.
+   */
+  failed?: number;
 }
 
 function asStoredOp(value: unknown): StoredOp | null {
@@ -831,6 +1032,7 @@ function asStoredOp(value: unknown): StoredOp | null {
     const media = readMedia(row.media);
     if (media) op.media = media;
   }
+  if (isUint(row.failed) && row.failed > 0) op.failed = row.failed;
   return op;
 }
 
@@ -850,16 +1052,62 @@ export async function enqueueOp(username: string, op: Omit<StoredOp, "cid">): Pr
   return stored;
 }
 
-function hex(cid: readonly number[]): string {
-  return cid.map((b) => b.toString(16).padStart(2, "0")).join("");
+/** Ops that still need a server answer, oldest first. Failed rows are deliberately left out. */
+export async function getPendingOps(username: string): Promise<StoredOp[]> {
+  return (await getOutbox(username)).filter((op) => op.failed === undefined);
 }
 
-/** Drops every op the server answered, success or nack: a nack would fail the same way again. */
-export async function removeOutbox(username: string, cids: readonly Uint8Array[]): Promise<void> {
-  if (cids.length === 0) return;
-  const done = new Set(cids.map((cid) => hex([...cid])));
+/** Ops the server refused for good, kept for the draft text and the discard action. */
+export async function getFailedOps(username: string): Promise<StoredOp[]> {
+  return (await getOutbox(username)).filter((op) => op.failed !== undefined);
+}
+
+/**
+ * Applies one sync response's acks. A success drops the row. A NotFound ack keeps it as
+ * failed with its draft, because the target was deleted while the device was offline and
+ * retrying can never succeed (ADR 0013). Other nacks drop the row, as before: resending
+ * would produce the same refusal.
+ */
+export async function settleOutbox(username: string, acks: readonly Ack[]): Promise<StoredOp[]> {
+  if (acks.length === 0) return [];
+  const byCid = new Map(acks.map((ack) => [cidHex(ack.cid), ack]));
   const outbox = await getOutbox(username);
-  await write(outboxKey(username), outbox.filter((op) => !done.has(hex(op.cid))));
+  const failed: StoredOp[] = [];
+  const kept: StoredOp[] = [];
+  for (const op of outbox) {
+    const ack = byCid.get(cidHex(op.cid));
+    if (!ack) {
+      kept.push(op);
+      continue;
+    }
+    // A successful ack and every other nack need no row: nothing sends them again.
+    if ("error" in ack && ack.error === AckError.NotFound) {
+      const row: StoredOp = { ...op, failed: ack.error };
+      failed.push(row);
+      kept.push(row);
+    }
+  }
+  await write(outboxKey(username), kept);
+  return failed;
+}
+
+/** Removes one failed op after the user has copied its text. */
+export async function discardOutbox(username: string, cid: ArrayLike<number>): Promise<void> {
+  await removeOutbox(username, [cid]);
+}
+
+function cidHex(cid: ArrayLike<number>): string {
+  let out = "";
+  for (let index = 0; index < cid.length; index++) out += (cid[index] ?? 0).toString(16).padStart(2, "0");
+  return out;
+}
+
+/** Drops every named op. Success acks use settleOutbox; discard uses this. */
+export async function removeOutbox(username: string, cids: readonly ArrayLike<number>[]): Promise<void> {
+  if (cids.length === 0) return;
+  const done = new Set(cids.map((cid) => cidHex(cid)));
+  const outbox = await getOutbox(username);
+  await write(outboxKey(username), outbox.filter((op) => !done.has(cidHex(op.cid))));
 }
 
 function toWireMedia(media: StoredMedia | undefined): Media | null {

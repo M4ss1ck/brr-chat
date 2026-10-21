@@ -93,6 +93,12 @@ dt { color: #a9a49a; }
 dd { margin: 0; overflow-wrap: anywhere; }
 #empty { color: #d8c56a; }
 .note { color: #a9a49a; font-size: .85rem; }
+#outbox-list li {
+  display: grid; gap: .25rem; padding: .55rem;
+  border: 1px solid #6d6a5e; border-radius: .4rem;
+}
+#outbox-list .outbox-label { overflow-wrap: anywhere; user-select: text; }
+#outbox-list button { justify-self: start; margin: 0; padding: .25rem .55rem; font-size: .8rem; }
 output {
   display: block; margin: .6rem 0; padding: .6rem;
   border: 1px dashed #6d6a5e; border-radius: .4rem;
@@ -198,6 +204,12 @@ input[type="file"] { padding: .35rem; }
     <h1>brr chat</h1>
     <h2 id="account"></h2>
     <p id="empty" hidden>No messages yet. This server is empty.</p>
+
+    <section id="outbox" hidden>
+      <h2>Unsent</h2>
+      <p class="note">These queued messages were not sent because something they answer was deleted. The text stays here: copy it before discarding.</p>
+      <ul id="outbox-list" class="list"></ul>
+    </section>
 
     <h2>Groups</h2>
     <ul id="groups-list" class="list"></ul>

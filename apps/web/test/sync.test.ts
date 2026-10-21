@@ -10,8 +10,16 @@ import {
   type Op,
   type SyncResponse,
 } from "@brr-chat/protocol";
-import { closeStore, getCursor, setCursor } from "../src/store.ts";
-import { syncAndPersist } from "../src/sync.ts";
+import {
+  closeStore,
+  enqueueOp,
+  getCursor,
+  getFailedOps,
+  getOutbox,
+  getPendingOps,
+  setCursor,
+} from "../src/store.ts";
+import { drainOutbox, syncAndPersist } from "../src/sync.ts";
 
 const originalFetch = globalThis.fetch;
 
@@ -123,5 +131,66 @@ describe("syncAndPersist paging", () => {
     await setCursor("alice", 0);
     await expect(syncAndPersist("http://chat.local", "token", "alice")).rejects.toThrow(/sync stalled/);
     expect(calls).toBe(1);
+  });
+
+  test("queued ops survive an offline restart and drain once the network returns", async () => {
+    await setCursor("alice", 0);
+    const queued = await enqueueOp("alice", { tag: Tag.Post, scope: 7, text: "written offline" });
+
+    globalThis.fetch = (async () => {
+      throw new TypeError("offline");
+    }) as unknown as typeof fetch;
+    await expect(drainOutbox("http://chat.local", "token", "alice")).rejects.toThrow(/offline/);
+    expect((await getPendingOps("alice")).map((op) => op.cid)).toEqual([queued.cid]);
+
+    // A closed IndexedDB handle is what a browser restart looks like to the store.
+    await closeStore();
+    expect((await getPendingOps("alice")).map((op) => op.text)).toEqual(["written offline"]);
+
+    const outboxSizes: number[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = decodeSyncRequest(await requestBody(input, init));
+      outboxSizes.push(request.outbox.length);
+      return response({
+        cursor: 9,
+        more: false,
+        events: [profile(9, 7)],
+        acks: [{ cid: new Uint8Array(queued.cid), seq: 9 }],
+      });
+    }) as unknown as typeof fetch;
+
+    const drained = await drainOutbox("http://chat.local", "token", "alice");
+    expect(drained.outcome.kind).toBe("ok");
+    expect(drained.failed).toEqual([]);
+    expect(outboxSizes).toEqual([1]);
+    expect(await getOutbox("alice")).toEqual([]);
+    expect(await getCursor("alice")).toBe(9);
+  });
+
+  test("a NotFound ack marks the draft failed and never puts it back on the wire", async () => {
+    await setCursor("alice", 0);
+    const reply = await enqueueOp("alice", { tag: Tag.Reply, scope: 7, parent: 4, text: "parent is gone" });
+    const outboxSizes: number[] = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = decodeSyncRequest(await requestBody(input, init));
+      outboxSizes.push(request.outbox.length);
+      return response({
+        cursor: 12,
+        more: false,
+        events: [],
+        acks: [{ cid: new Uint8Array(reply.cid), error: 4 }],
+      });
+    }) as unknown as typeof fetch;
+
+    const first = await drainOutbox("http://chat.local", "token", "alice");
+    expect(first.failed.map((op) => op.text)).toEqual(["parent is gone"]);
+    expect((await getFailedOps("alice")).map((op) => op.text)).toEqual(["parent is gone"]);
+
+    // The next sync still asks for events, but carries no ops: the dead reply cannot block
+    // newer posts, and it cannot be sent again either.
+    await drainOutbox("http://chat.local", "token", "alice");
+    expect(outboxSizes).toEqual([1, 0]);
+    expect(await getPendingOps("alice")).toEqual([]);
   });
 });

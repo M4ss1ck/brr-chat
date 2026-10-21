@@ -1,7 +1,9 @@
 // Issue #15 client half: the placeholder is inline, uploads are one multipart request, and
 // the image bytes are fetched only after a tap.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { IDBFactory } from "fake-indexeddb";
 import { rgbaToThumbHash } from "thumbhash";
+import { closeStore, getMediaBytes, putMediaBytes } from "../src/store.ts";
 import {
   MediaUploadError,
   clearMediaCache,
@@ -305,5 +307,61 @@ describe("tap to load", () => {
     const third = mediaView(media, options) as unknown as FakeElement;
     expect(third.children[0]!.src.startsWith("data:image/png;base64,")).toBe(true);
     expect(third.classList.contains("loaded")).toBe(false);
+  });
+
+  test("a durable hit loads without a request, and a network tap leaves bytes for next time", async () => {
+    withFakeDocument();
+    const originalIndexedDB = globalThis.indexedDB;
+    globalThis.indexedDB = new IDBFactory();
+    const owner = "alice\u0000http://chat.local";
+    try {
+      await putMediaBytes(owner, 12, new Uint8Array([7, 8, 9]), 1);
+      let calls = 0;
+      const fetchImpl = (async () => {
+        calls += 1;
+        return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      }) as unknown as typeof fetch;
+
+      const cachedView = mediaView(
+        { id: 12, w: 320, h: 200, thumbhash: thumbhash() },
+        {
+          base: "http://chat.local",
+          token: "s".repeat(32),
+          cacheKey: owner,
+          fetchImpl,
+          createObjectUrl: () => "blob:durable",
+          revokeObjectUrl: () => {},
+        },
+      ) as unknown as FakeElement;
+      cachedView.listeners.click![0]!();
+      await until(() => cachedView.classList.contains("loaded"));
+      expect(calls).toBe(0);
+      expect(cachedView.children[0]!.src).toBe("blob:durable");
+
+      const networkView = mediaView(
+        { id: 13, w: 320, h: 200, thumbhash: thumbhash() },
+        {
+          base: "http://chat.local",
+          token: "s".repeat(32),
+          cacheKey: owner,
+          fetchImpl,
+          createObjectUrl: () => "blob:network",
+          revokeObjectUrl: () => {},
+        },
+      ) as unknown as FakeElement;
+      networkView.listeners.click![0]!();
+      await until(() => networkView.classList.contains("loaded"));
+      expect(calls).toBe(1);
+
+      // The write is best effort and follows the paint; give it a moment to land.
+      for (let attempt = 0; attempt < 50; attempt++) {
+        if ((await getMediaBytes(owner, 13)) !== null) break;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      expect(Array.from((await getMediaBytes(owner, 13)) ?? [])).toEqual([1, 2, 3]);
+    } finally {
+      await closeStore();
+      globalThis.indexedDB = originalIndexedDB;
+    }
   });
 });

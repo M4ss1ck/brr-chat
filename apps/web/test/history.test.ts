@@ -68,6 +68,21 @@ describe("loadHistory", () => {
     expect(await getCursor("alice")).toBe(100);
   });
 
+  test("a page fetched into a full cache is shown, not evicted by its own write", async () => {
+    const full: Event[] = Array.from({ length: 2000 }, (_, index) => post(5_001 + index, `cached ${index + 1}`));
+    await applyEvents("alice", full);
+
+    globalThis.fetch = (async () =>
+      historyResponse({ events: [post(4_901, "older 1"), post(4_902, "older 2")], more: false })) as unknown as typeof fetch;
+    await loadHistory("http://chat.local", "token", "alice", 3, 5_001);
+
+    const rows = await getPosts("alice", 3);
+    expect(rows).toHaveLength(2000);
+    expect(rows.map((row) => row.text)).toContain("older 1");
+    expect(rows.map((row) => row.text)).toContain("older 2");
+    expect(rows.map((row) => row.text)).not.toContain("cached 1");
+  });
+
   test("a refused request surfaces the HTTP status", async () => {
     globalThis.fetch = (async () => new Response("Unauthorized", { status: 401 })) as unknown as typeof fetch;
     await expect(loadHistory("http://chat.local", "token", "alice", 3, 50)).rejects.toBeInstanceOf(HistoryHttpError);
