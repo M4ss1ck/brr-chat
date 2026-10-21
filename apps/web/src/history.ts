@@ -12,6 +12,7 @@ import {
   type VersionRange,
 } from "@brr-chat/protocol";
 import { bearerHeader } from "./auth.ts";
+import { meteredFetch } from "./meter.ts";
 import { applyEvents, type StoredGap } from "./store.ts";
 
 export const HISTORY_PATH = "/history";
@@ -39,7 +40,7 @@ export async function postHistoryRequest(
   token: string,
   body: Uint8Array,
 ): Promise<HistoryResponse> {
-  const res = await fetch(`${base}${HISTORY_PATH}`, {
+  const res = await meteredFetch(`${base}${HISTORY_PATH}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/cbor",

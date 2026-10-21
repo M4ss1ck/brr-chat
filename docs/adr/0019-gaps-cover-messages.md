@@ -1,4 +1,4 @@
-# 0018. Gaps cover messages, not control events
+# 0019. Gaps cover messages, not control events
 
 Status: accepted (2026-10-21). Amends ADR 0009.
 

@@ -81,7 +81,7 @@ Ack          = [cid: bytes .size 8, result: int]   ; result > 0: seq of the crea
   (membership, bans, deletes, profiles, group metadata) are always sent, however old they are,
   so group state never goes stale behind a gap. A `Gap`'s `after` is the cursor the catch-up
   started from and `before` is the seq of the first gap-covered event still sent, so `before`
-  is the right argument for the first `/history` call (ADR 0018).
+  is the right argument for the first `/history` call (ADR 0019).
 - **Fresh device or new join:** the server sends current state (profiles, group metadata,
   memberships, the viewer's `dm_scope` events) and a cursor at the head of the log. **No
   posts or DM messages.** Older posts load only when the user asks. A state snapshot may repeat an event at or below the device's previous cursor; the

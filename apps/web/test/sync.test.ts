@@ -32,6 +32,12 @@ function response(page: Partial<SyncResponse> & Pick<SyncResponse, "cursor" | "m
   });
 }
 
+/** Sync now goes through the data meter, which hands the mock a Request, not raw init. */
+async function requestBody(input: RequestInfo | URL, init?: RequestInit): Promise<Uint8Array> {
+  if (input instanceof Request) return new Uint8Array(await input.clone().arrayBuffer());
+  return new Uint8Array((init?.body as Uint8Array | undefined) ?? new Uint8Array());
+}
+
 describe("syncAndPersist paging", () => {
   const originalIndexedDB = globalThis.indexedDB;
 
@@ -60,8 +66,8 @@ describe("syncAndPersist paging", () => {
       bio: "",
     };
 
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const request = decodeSyncRequest(new Uint8Array(init?.body as Uint8Array));
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = decodeSyncRequest(await requestBody(input, init));
       cursors.push(request.cursor);
       outboxSizes.push(request.outbox.length);
       return request.cursor === 0

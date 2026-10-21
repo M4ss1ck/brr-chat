@@ -1,5 +1,6 @@
 // Auth over plain fetch (ADR 0014): BetterAuth endpoints called directly, with the bare
 // 32-char session token (ADR 0007). No better-auth/client bundle in the app shell.
+import { meteredFetch } from "./meter.ts";
 import { getSession, setSession, type Session } from "./store.ts";
 
 
@@ -31,7 +32,7 @@ async function postJson(
 ): Promise<{ res: Response; payload: AuthPayload | null }> {
   const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
   if (token !== undefined) headers.Authorization = bearerHeader(token);
-  const res = await fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await meteredFetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
   const payload = (await res.json().catch(() => null)) as AuthPayload | null;
   return { res, payload };
 }
@@ -93,7 +94,7 @@ export async function signIn(base: string, username: string, password: string): 
 
 /** True unless the server says otherwise; a failed check must not block signing in. */
 async function recoveryConfirmed(base: string, token: string): Promise<boolean> {
-  const res = await fetch(`${base}${STATUS_PATH}`, { headers: { Authorization: bearerHeader(token) } }).catch(() => null);
+  const res = await meteredFetch(`${base}${STATUS_PATH}`, { headers: { Authorization: bearerHeader(token) } }).catch(() => null);
   if (!res?.ok) return true;
   const payload = (await res.json().catch(() => null)) as { confirmed?: unknown } | null;
   return payload?.confirmed !== false;
@@ -131,7 +132,7 @@ export function redeemRecovery(base: string, username: string, code: string): Pr
 export async function signOut(base: string): Promise<void> {
   const session = await getSession();
   if (!session) return;
-  const res = await fetch(`${base}${SIGN_OUT_PATH}`, {
+  const res = await meteredFetch(`${base}${SIGN_OUT_PATH}`, {
     method: "POST",
     headers: { Authorization: bearerHeader(session.token) },
   });

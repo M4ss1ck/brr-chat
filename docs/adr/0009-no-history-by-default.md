@@ -1,6 +1,6 @@
 # 0009. No history by default; gaps instead of floods
 
-Status: accepted (2026-10-09). Amended by ADR 0018 (a gap covers messages and reactions, never
+Status: accepted (2026-10-09). Amended by ADR 0019 (a gap covers messages and reactions, never
 control events).
 
 ## Decision

@@ -76,7 +76,7 @@ const OP_TAGS: ReadonlySet<number> = new Set<number>([
 ]);
 
 /**
- * Tags a gap may cover (docs/PROTOCOL.md, ADR 0018): the content a user reads backwards on
+ * Tags a gap may cover (docs/PROTOCOL.md, ADR 0019): the content a user reads backwards on
  * demand. Control events are never gapped, so membership, bans and deletes cannot go stale
  * behind a marker. Shared so the server and the client agree on what a gap hid.
  */

@@ -25,6 +25,12 @@ function historyResponse(page: Partial<HistoryResponse> & Pick<HistoryResponse, 
   );
 }
 
+/** History now goes through the data meter, which hands the mock a Request, not raw init. */
+async function requestBody(input: RequestInfo | URL, init?: RequestInit): Promise<Uint8Array> {
+  if (input instanceof Request) return new Uint8Array(await input.clone().arrayBuffer());
+  return new Uint8Array((init?.body as Uint8Array | undefined) ?? new Uint8Array());
+}
+
 describe("loadHistory", () => {
   const originalIndexedDB = globalThis.indexedDB;
 
@@ -46,8 +52,8 @@ describe("loadHistory", () => {
     await setCursor("alice", 100);
 
     const requests: ReturnType<typeof decodeHistoryRequest>[] = [];
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push(decodeHistoryRequest(new Uint8Array(init?.body as Uint8Array)));
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(decodeHistoryRequest(await requestBody(input, init)));
       return historyResponse({ events: [post(40, "older")], more: true });
     }) as unknown as typeof fetch;
 

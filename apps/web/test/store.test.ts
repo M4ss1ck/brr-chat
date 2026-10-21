@@ -11,6 +11,7 @@ import {
   getDmScopes,
   getGroups,
   getMembers,
+  getMeter,
   getOutbox,
   getPosts,
   getProfiles,
@@ -22,6 +23,7 @@ import {
   nextReactionOn,
   removeOutbox,
   setCursor,
+  setMeter,
   setRange,
   setSelf,
   setSession,
@@ -421,6 +423,20 @@ describe("store (IndexedDB)", () => {
     expect(toWireOp(remove)).toMatchObject({ tag: Tag.Delete, scope: 5, target: 9 });
     expect(toWireOp(ban)).toMatchObject({ tag: Tag.Ban, scope: 5, user: 2, on: true });
     expect(new Uint8Array(toWireOp(ban).cid)).toEqual(new Uint8Array(ban.cid));
+  });
+
+  test("the month total round-trips and a corrupt row reads back as absent", async () => {
+    expect(await getMeter()).toBeNull();
+    await setMeter({ month: "2026-10", bytes: 4096 });
+    expect(await getMeter()).toEqual({ month: "2026-10", bytes: 4096 });
+
+    const store = await rawStore();
+    try {
+      await store.put("meter", { month: "October", bytes: -1 });
+    } finally {
+      store.close();
+    }
+    expect(await getMeter()).toBeNull();
   });
 
   test("a corrupt group row reads back as absent", async () => {
