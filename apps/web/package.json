@@ -11,7 +11,7 @@
     "@brr-chat/protocol": "workspace:*",
     "@simplewebauthn/browser": "13.3.0",
     "jsqr": "^1.4.0",
-    "qrcode-generator": "1.4.4",
+    "qrcode-generator": "2.0.4",
     "thumbhash": "0.1.1"
   },
   "devDependencies": {
