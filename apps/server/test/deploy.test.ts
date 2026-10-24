@@ -3,7 +3,7 @@
 // dead one, and the snapshots are whole, private, and pruned.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSnapshots, scheduleSnapshots, snapshotName, takeSnapshot } from "../src/backup.ts";
@@ -227,9 +227,13 @@ describe("snapshots", () => {
     const stopBad = scheduleSnapshots(db, { dir: blocked, keep: 8, intervalMs: 40 }, (l) => lines.push(l));
     try {
       expect(lines).toEqual([]);
-      await Bun.sleep(150);
-      expect(lines.some((l) => /^brr-chat backup .*brr-chat-\d{8}T\d{9}Z\.db \d+ B in \d+ ms$/.test(l))).toBe(true);
-      expect(lines.filter((l) => l.startsWith("brr-chat backup FAILED")).length).toBeGreaterThanOrEqual(2);
+      const ok = () => lines.some((l) => /^brr-chat backup .*brr-chat-\d{8}T\d{9}Z\.db \d+ B in \d+ ms$/.test(l));
+      const failures = () => lines.filter((l) => l.startsWith("brr-chat backup FAILED")).length;
+      // Wait for the ticks instead of a fixed sleep: a slow CI runner fits fewer 40 ms ticks.
+      const deadline = Date.now() + 5_000;
+      while ((!ok() || failures() < 2) && Date.now() < deadline) await Bun.sleep(20);
+      expect(ok()).toBe(true);
+      expect(failures()).toBeGreaterThanOrEqual(2);
     } finally {
       stopGood();
       stopBad();
@@ -253,7 +257,12 @@ describe("snapshots", () => {
       backup: { dir: join(dir, "never"), keep: 2, intervalMs: 30 },
     });
     try {
-      await Bun.sleep(120);
+      const deadline = Date.now() + 5_000;
+      // Wait for the first tick instead of a fixed sleep, then a few more so pruning runs.
+      // The directory only exists once the first snapshot has run.
+      while (!existsSync(backups) && Date.now() < deadline) await Bun.sleep(20);
+      while (listSnapshots(backups).length === 0 && Date.now() < deadline) await Bun.sleep(20);
+      await Bun.sleep(100);
       expect(listSnapshots(backups).length).toBeGreaterThan(0);
       expect(listSnapshots(backups).length).toBeLessThanOrEqual(2);
     } finally {
