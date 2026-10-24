@@ -1,0 +1,50 @@
+# Production: one brr-chat server (ADR 0022). Coolify deploys this file as a Docker Compose
+# resource; it is the single source of truth for runtime config. Runbook: docs/DEPLOY.md.
+#
+# Coolify fills the SERVICE_* variables: the domain you set in its UI becomes
+# SERVICE_URL_BRR, and SERVICE_HEX_64_AUTHSECRET is generated once and kept across deploys.
+# Outside Coolify (scripts/smoke.sh) export those two names yourself; with no secret the
+# server refuses to start.
+
+services:
+  brr:
+    image: ghcr.io/m4ss1ck/brr-chat:${BRR_IMAGE_TAG:-main}
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      # Routes the Coolify domain to port 3000 in this container (Coolify's own template form).
+      - SERVICE_URL_BRR_3000
+      # Must be the exact origin browsers use: passkeys and CORS are bound to it (ADR 0021).
+      - BASE_URL=${SERVICE_URL_BRR}
+      # Changing it signs every account out. Coolify keeps it stable across deploys.
+      - BETTER_AUTH_SECRET=${SERVICE_HEX_64_AUTHSECRET}
+      # Coolify's Traefik is the one proxy in front (client-ip.ts). Add 1 per CDN in front of it.
+      - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
+      - MEDIA_QUOTA_BYTES=${MEDIA_QUOTA_BYTES:-268435456}
+      - BACKUP_INTERVAL_HOURS=${BACKUP_INTERVAL_HOURS:-6}
+      - BACKUP_KEEP=${BACKUP_KEEP:-8}
+      # HOST, PORT, DB_PATH and BACKUP_DIR are baked into the image.
+    volumes:
+      - brr-data:/data
+      # Finished snapshots only. This is the volume Coolify's storage backup archives (ADR 0023).
+      - brr-backups:/backups
+    # The image is the binary and nothing else; the volumes are the only writable state.
+    read_only: true
+    tmpfs:
+      # SQLite's temp files for VACUUM INTO and large sorts.
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # SIGTERM drains requests and checkpoints the WAL; 30 s is the backstop before SIGKILL.
+    stop_grace_period: 30s
+    mem_limit: 512m
+    # No `ports:`: only the proxy reaches the server. The healthcheck is in the Dockerfile.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  brr-data:
+  brr-backups:

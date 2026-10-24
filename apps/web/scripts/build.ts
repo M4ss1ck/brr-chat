@@ -1,9 +1,10 @@
 // Builds the PWA shell with esbuild and hands it to the server as a generated module, so a
 // compiled binary serves the same shell with no files on disk (issue #5, ADR 0014).
-// Run from apps/web: `bun run build`.
+// Run from apps/web: `bun run build`, or `bun run build --watch` to rebuild on every save
+// (the dev compose `web` service). The server's own `--watch` then reloads the new shell.
 import { APP_SHELL_BUDGET } from "@brr-chat/protocol";
 import { brotliCompressSync } from "node:zlib";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { build } from "esbuild";
 
@@ -484,8 +485,47 @@ function report(): void {
     console.log(`  shell ${file.name}: ${body.byteLength} B raw, ${size} B brotli`);
   }
   console.log(`app shell compressed: ${compressed} B of ${APP_SHELL_BUDGET} B budget`);
+  // The gate is apps/web/test/budget.test.ts (pre-commit, CI, the Docker build). Here it is
+  // only loud, so a watch session can go over while iterating and come back under.
+  if (compressed > APP_SHELL_BUDGET) {
+    console.warn(`WARNING app shell is ${compressed - APP_SHELL_BUDGET} B over budget; the tests will fail`);
+  }
 }
 
-await bundle();
-generateServerModule();
-report();
+async function buildOnce(): Promise<void> {
+  await bundle();
+  generateServerModule();
+  report();
+}
+
+/** Sources the shell is bundled from. build.ts itself is not watched: restart to pick it up. */
+const WATCHED = [join(webRoot, "src"), join(webRoot, "..", "..", "packages", "protocol", "src")];
+/** Editors save in bursts (temp file, rename, chmod); one rebuild per burst. */
+const DEBOUNCE_MS = 100;
+
+if (process.argv.includes("--watch")) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let running = Promise.resolve();
+  const rebuild = () => {
+    running = running.then(async () => {
+      const started = performance.now();
+      try {
+        await buildOnce();
+        console.log(`rebuilt in ${Math.round(performance.now() - started)} ms`);
+      } catch (err) {
+        // A syntax error mid-edit must not end the session; the next save retries.
+        console.error(`build failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+  };
+  rebuild();
+  for (const dir of WATCHED) {
+    watch(dir, { recursive: true }, () => {
+      clearTimeout(timer);
+      timer = setTimeout(rebuild, DEBOUNCE_MS);
+    });
+  }
+  console.log(`watching ${WATCHED.join(", ")}`);
+} else {
+  await buildOnce();
+}

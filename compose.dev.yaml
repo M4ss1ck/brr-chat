@@ -1,0 +1,87 @@
+# Local development: `docker compose -f compose.dev.yaml up`, then open http://localhost:3000.
+# Edits under apps/web/src or packages/protocol/src rebuild the shell; the server reloads on
+# any change it imports, including the regenerated shell. Prod is compose.yaml (ADR 0022).
+#
+# Files the containers write into the repo (apps/web/dist, the generated shell module) are
+# owned by HOST_UID:HOST_GID, so set both if yours are not 1000:1000 (bash's UID is readonly):
+#   HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose -f compose.dev.yaml up
+name: brr-chat-dev
+
+x-bun: &bun
+  # Same Bun as .bun-version and the Dockerfile; apps/server/test/container.test.ts checks it.
+  image: oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+  working_dir: /repo
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  environment:
+    # A host UID may have no home in the image; Bun only needs somewhere writable.
+    HOME: /tmp
+  volumes:
+    - .:/repo
+    # Dependencies live in volumes, never in the bind mount, so the host's node_modules
+    # (another OS, another libc) and the container's never overwrite each other.
+    - node_modules:/repo/node_modules
+    - node_modules_protocol:/repo/packages/protocol/node_modules
+    - node_modules_server:/repo/apps/server/node_modules
+    - node_modules_web:/repo/apps/web/node_modules
+
+services:
+  # One-shot: install, then hand the dependency and data volumes to HOST_UID:HOST_GID. Root
+  # only here, because Docker creates fresh named volumes owned by root.
+  deps:
+    <<: *bun
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - >-
+        bun install --frozen-lockfile --ignore-scripts &&
+        chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} node_modules packages/protocol/node_modules
+        apps/server/node_modules apps/web/node_modules /data
+    volumes:
+      - .:/repo
+      - node_modules:/repo/node_modules
+      - node_modules_protocol:/repo/packages/protocol/node_modules
+      - node_modules_server:/repo/apps/server/node_modules
+      - node_modules_web:/repo/apps/web/node_modules
+      - bun_cache:/root/.bun/install/cache
+      - data:/data
+
+  web:
+    <<: *bun
+    command: bun run --cwd apps/web build --watch
+    depends_on:
+      deps:
+        condition: service_completed_successfully
+
+  server:
+    <<: *bun
+    command: bun --watch apps/server/src/index.ts
+    environment:
+      HOME: /tmp
+      HOST: 0.0.0.0
+      PORT: "3000"
+      BASE_URL: http://localhost:3000
+      DB_PATH: /data/brr-chat.db
+      # Dev only, and only valid against the dev volume. Production's comes from Coolify.
+      BETTER_AUTH_SECRET: dev-only-secret-never-used-in-production-0000
+    volumes:
+      - .:/repo
+      - node_modules:/repo/node_modules
+      - node_modules_protocol:/repo/packages/protocol/node_modules
+      - node_modules_server:/repo/apps/server/node_modules
+      - node_modules_web:/repo/apps/web/node_modules
+      - data:/data
+    ports:
+      # Loopback only: a dev server with a published secret must not face the network.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      deps:
+        condition: service_completed_successfully
+
+volumes:
+  node_modules:
+  node_modules_protocol:
+  node_modules_server:
+  node_modules_web:
+  bun_cache:
+  data:
