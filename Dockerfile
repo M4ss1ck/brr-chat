@@ -3,7 +3,7 @@
 # (ADR 0022). Base images are pinned by digest; Dependabot proposes bumps. The Bun tag
 # below must match .bun-version, which apps/server/test/container.test.ts enforces.
 
-FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS build
+FROM oven/bun:1.4.3@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7b48be39c598 AS build
 WORKDIR /src
 
 # Manifests first, so a source-only change reuses the dependency layer.
