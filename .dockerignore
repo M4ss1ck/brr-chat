@@ -1,0 +1,18 @@
+# Only what the Dockerfile copies matters; this keeps the build context small and keeps
+# local databases, secrets and git history out of every layer.
+**/node_modules
+**/dist
+.git
+.github
+.githooks
+docs
+apps/native
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+.env
+.env.*
+compose*.yaml
+Dockerfile
+scripts

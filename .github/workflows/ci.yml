@@ -1,19 +1,99 @@
 name: CI
 
-# Same gate as .githooks/pre-commit (ADR 0005): typecheck every workspace, then
+# check: the same gate as .githooks/pre-commit (ADR 0005): typecheck every workspace, then
 # run all tests, including the byte budgets. Bun is pinned via .bun-version.
+# image: builds the production image and runs scripts/smoke.sh against it (ADR 0022). On
+# main, the exact image that passed is pushed to GHCR and Coolify is told to deploy it.
+# Actions are pinned by commit SHA; Dependabot proposes bumps (.github/dependabot.yml).
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# On main, runs queue in order, so an older run can never push :main after a newer one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version-file: .bun-version
       - run: bun install --frozen-lockfile
       - run: bun run check:all
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/m4ss1ck/brr-chat
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # smoke.sh opens the snapshot with bun:sqlite to prove it is intact.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: brr-chat:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: SMOKE_IMAGE=brr-chat:ci timeout 600 scripts/smoke.sh --no-build
+      - name: Push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # The bytes that passed the smoke test are the bytes that ship: tag and push, no rebuild.
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          for tag in "sha-$short" main; do
+            docker tag brr-chat:ci "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          echo "pushed $IMAGE:sha-$short and $IMAGE:main" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # One deploy at a time, in push order: never cancel one halfway through.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Trigger Coolify
+        env:
+          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          if [ -z "$COOLIFY_WEBHOOK" ] || [ -z "$COOLIFY_TOKEN" ]; then
+            echo "::notice::COOLIFY_WEBHOOK / COOLIFY_TOKEN not set; image pushed, nothing deployed (docs/DEPLOY.md)"
+            exit 0
+          fi
+          curl -fsS --max-time 30 -H "Authorization: Bearer $COOLIFY_TOKEN" "$COOLIFY_WEBHOOK"

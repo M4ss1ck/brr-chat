@@ -1,0 +1,22 @@
+# Weekly update PRs for everything pinned (ADR 0022). Merge once CI is green.
+# A Bun image bump in the Dockerfile fails apps/server/test/container.test.ts until the same
+# PR also updates .bun-version and the image line in compose.dev.yaml: one Bun everywhere,
+# on purpose. compose.dev.yaml is not scanned separately, so a bump arrives as one PR.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR for routine bumps instead of one per package.
+      minor-and-patch:
+        update-types: [minor, patch]

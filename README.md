@@ -31,6 +31,16 @@ export BETTER_AUTH_SECRET=$(openssl rand -hex 32)   # signs sessions; never defa
 bun run --cwd apps/server dev         # serve /, /sync and auth + recovery on http://localhost:3000
 ```
 
+Or run it in containers, which reloads on save (prefix `HOST_UID=$(id -u) HOST_GID=$(id -g)` to
+the command if your ids are not 1000):
+
+```sh
+docker compose -f compose.dev.yaml up   # http://localhost:3000
+```
+
+`docs/DEPLOY.md` has the production runbook; `scripts/smoke.sh` builds the production image
+and tests it.
+
 Open **Add server** to paste a server address or an invite link from another server, or to scan
 its QR code with the camera or an image file. The code is decoded on the device. Each server's
 account, cursor and cached messages stay separate; **Sync** catches up every signed-in server.
@@ -61,7 +71,10 @@ One binary, no files beside it:
 
 ```sh
 bun run --cwd apps/server compile     # build the shell, then compile to apps/server/dist/brr-chat
-bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, DB_PATH, BASE_URL, BETTER_AUTH_SECRET, MEDIA_QUOTA_BYTES)
+bun run --cwd apps/server dev -- --help    # flags and env vars (PORT, HOST, DB_PATH, BASE_URL,
+                                           # BETTER_AUTH_SECRET, MEDIA_QUOTA_BYTES,
+                                           # TRUSTED_PROXY_HOPS, BACKUP_DIR, BACKUP_INTERVAL_HOURS,
+                                           # BACKUP_KEEP), plus the healthcheck and restore subcommands
 ```
 
 Photos are resized in the client to 320 px and 1280 px WebP variants with a ThumbHash

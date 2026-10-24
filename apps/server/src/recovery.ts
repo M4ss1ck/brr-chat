@@ -156,12 +156,6 @@ function confirmsLastGroup(input: string, row: RecoveryRow): boolean {
   return normalized.length === RECOVERY_GROUP_LENGTH && matchesCode(normalized, row.tail_hash);
 }
 
-function ipFrom(req: Request): string {
-  const forwarded = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  if (forwarded) return forwarded;
-  return req.headers.get("x-real-ip")?.trim() || "local";
-}
-
 async function readJson(req: Request): Promise<Record<string, unknown> | null> {
   const body = await req.json().catch(() => null);
   return typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
@@ -177,7 +171,10 @@ function usernameKey(username: string): string {
 }
 
 export interface RecoveryService {
-  /** Handles every recovery route, including the sign-up path. Null means "not mine". */
+  /**
+   * Handles every recovery route, including the sign-up path. Null means "not mine". `ip` is
+   * the client address the app already resolved (client-ip.ts); headers are never read here.
+   */
   handle(req: Request, pathname: string, ip?: string): Promise<Response | null>;
 }
 
@@ -356,7 +353,7 @@ export function createRecoveryService(
   }
 
   return {
-    async handle(req, pathname, ip = ipFrom(req)): Promise<Response | null> {
+    async handle(req, pathname, ip = "local"): Promise<Response | null> {
       if (pathname === "/api/auth/sign-up/email" && req.method === "POST") return signUp(req, ip);
       if (pathname === "/api/recovery/sign-up" && req.method === "POST") return signUp(req, ip);
       if (pathname === "/api/recovery/confirm" && req.method === "POST") return confirm(req);

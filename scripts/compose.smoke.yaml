@@ -1,0 +1,8 @@
+# Overlay for scripts/smoke.sh: the production compose.yaml, plus a loopback port and a
+# locally built image. Everything else (read-only root, volumes, env) is prod's.
+services:
+  brr:
+    image: ${SMOKE_IMAGE:?SMOKE_IMAGE is the image under test}
+    pull_policy: never
+    ports:
+      - "127.0.0.1:${SMOKE_PORT:?}:3000"

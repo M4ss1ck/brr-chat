@@ -41,8 +41,9 @@ describe("ci workflow", () => {
 
   test("checks out the repo and sets Bun up from .bun-version", () => {
     const yaml = read();
-    expect(yaml).toMatch(/actions\/checkout@v\d+/);
-    expect(yaml).toMatch(/oven-sh\/setup-bun@v\d+/);
+    // Pinned by commit SHA with the version as a comment (ADR 0022); Dependabot bumps both.
+    expect(yaml).toMatch(/actions\/checkout@[0-9a-f]{40} # v\d+/);
+    expect(yaml).toMatch(/oven-sh\/setup-bun@[0-9a-f]{40} # v\d+/);
     expect(yaml).toMatch(/bun-version-file:\s*\.bun-version/);
   });
 
