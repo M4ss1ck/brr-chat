@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@brr-chat/protocol": "workspace:*",
-    "@simplewebauthn/browser": "13.3.0",
+    "@simplewebauthn/browser": "14.0.0",
     "jsqr": "^1.4.0",
     "qrcode-generator": "1.4.4",
     "thumbhash": "0.1.1"
